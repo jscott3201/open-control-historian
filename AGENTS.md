@@ -1,6 +1,8 @@
 # Repository instructions for coding agents
 
-These instructions apply to the entire repository.
+These instructions apply to the entire repository unless the user gives a specific override.
+They are not a substitute for the applicable brief, which may contain additional instructions, constraints, and requirements.
+The brief is the authoritative source for the product's intended behavior, and the repository instructions are a secondary source for the product's implementation. The brief may also contain additional instructions for the repository, which take precedence over these instructions.
 
 ## Current authority boundary
 
@@ -16,8 +18,8 @@ registry, immutable snapshots, graceful drain/seal/join, and abort-only Drop. It
 has no persistence, durable history, query, storage, restart recovery, wire, or
 adapter behavior; published observations never imply current or held values.
 
-The ignored `_roadmap/` directory is local and unpublished. Do not read, edit,
-stage, copy, summarize, or publish it. Do not read PDF files. Preserve unrelated
+The ignored `_roadmap/` directory is local and unpublished.
+Do not commit or push the `_roadmap/` directory to github. Preserve unrelated
 work and never use reset, stash, or broad cleanup to make a task appear clean.
 
 ## Package roles and dependencies
