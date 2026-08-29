@@ -5,8 +5,9 @@
 M00 established the reviewed dependency-free canonical model. M01-PR01 added a
 separate native lifecycle root, M01-PR02 connected it inward through bounded
 volatile ingress, and M01-PR03 added bounded runtime-local latest publication.
-M00-PR04 is an explicit core successor that adds bounded canonical series
-declaration authority without wiring it into the volatile runtime:
+M00-PR04 added bounded canonical series declaration authority, and M00-PR05 adds
+bounded source/capture provenance and canonical admission without wiring either
+successor into the volatile runtime:
 
 ```text
 default workspace selection
@@ -14,7 +15,7 @@ default workspace selection
         v
   och-core (native) <---- och-runtime (native)       och-policy (tooling)
   canonical model         caller-owned executor      cargo_metadata + parsing
-  series declarations     volatile bare envelopes
+  series + admission      volatile bare envelopes
   no dependencies         one writer + 16 slots      support
                           16 published series
                                    |
@@ -29,7 +30,8 @@ default workspace selection
 identity, values/content, time, quality/status, producer ordering, collection
 modes, interval/gap/no-change evidence, bounded atomic envelopes, series
 declaration revisions and retirement, registry-issued active-declaration binding,
-and retry comparison. It retains no product dependencies. Its only executable remains a
+source/capture lineage, declaration-authorized canonical admission, and retry
+comparison. It retains no product dependencies. Its only executable remains a
 baseline example used to verify buildability and measure a native binary bound;
 that example is not a runtime or supported product command.
 
@@ -81,6 +83,8 @@ Within `och-core`, modules follow semantic ownership rather than runtime layers:
 - `observation` defines immutable series modes, observations, and raw order;
 - `series` owns immutable source binding, revisioned interpretation metadata,
   bounded declaration history, terminal tombstones, and active envelope binding;
+- `source` owns bounded schema/capture/record provenance and consumes one active
+  declaration binding into the final immutable canonical admission;
 - `collection` performs bounded atomic cross-item validation;
 - `retry` compares explicit scope, key, and external content identity;
 - `error` exposes only closed sanitized validation failures.
@@ -89,8 +93,10 @@ Invalid scalar ranges are excluded by constructors. Invariants involving series
 mode or multiple items are enforced only by `CollectionEnvelope`, whose evidence
 fields are private. Declaration lifecycle is enforced only by the non-cloneable
 `SeriesRegistry` authority;
-the constructor of `DeclaredCollectionEnvelope` is private so a bare envelope or
-historic declaration cannot self-authorize. The model does not create IDs, hash bytes, infer time or
+the constructor of `DeclaredCollectionEnvelope` is private and its value is not
+cloneable, so a bare envelope or historic declaration cannot self-authorize or
+fork the issued capability. `CanonicalAdmission` has no public bypass constructor.
+The model does not create IDs, hash bytes, infer time or
 producer order, infer held values/deltas/resets, or translate native extensions.
 See the [canonical model contract](model-contract.md).
 
@@ -156,4 +162,6 @@ the [M01-PR01 brief](implementation-brief-m01-pr01.md), bounded ingress is recor
 by [M01-PR02](continuation-m01-pr02.md), and bounded publication/read ownership is
 recorded by [M01-PR03](continuation-m01-pr03.md).
 The canonical declaration transition and its pre-M02 hard stop are recorded by
-[M00-PR04](continuation-m00-pr04.md).
+[M00-PR04](continuation-m00-pr04.md). The accepted source/capture crosswalk and
+exact future journal input boundary are recorded by
+[M00-PR05](continuation-m00-pr05.md).

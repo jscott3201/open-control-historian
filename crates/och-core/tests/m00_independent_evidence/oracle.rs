@@ -414,7 +414,7 @@ fn render_identity_and_value_rows(ledger: &mut String) {
         "case|002-identity-rejections|identity|reject|noncanonical=uppercase,shape;version=non-7;variant=non-rfc\n",
     );
     ledger.push_str(
-        "case|003-nominal-families|identity|inventory|families=5;names=store,series,producer,observation,artifact;separation=compile-fail-doctest\n",
+        "case|003-nominal-families|identity|inventory|families=6;names=store,series,producer,observation,artifact,evidence;separation=compile-fail-doctest\n",
     );
 
     let bits = [

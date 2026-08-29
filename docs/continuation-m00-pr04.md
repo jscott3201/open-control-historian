@@ -75,6 +75,10 @@ crate dependency.
 
 ## Required M00-PR05 successor and M02 hard stop
 
+This section records the gate as it stood at M00-PR04 acceptance. M00-PR05 now
+closes it; the delivered crosswalk and remaining M02 boundary are authoritative in
+[the M00-PR05 record](continuation-m00-pr05.md).
+
 M00-PR05 must define and independently evidence the canonical source/capture and
 batch provenance crosswalk against the pinned current Studio contract. It must
 classify every interpretation-critical Studio observation field as canonical,

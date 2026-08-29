@@ -50,8 +50,9 @@ The independent evidence covers the public semantics in
   observation-only/gap-only/mixed evidence, and half-open no-change/gap endpoints;
 - exact 256-observation and 64-gap maxima plus 12 one-failure atomic rejection
   builders that establish one oracle violation before actual error comparison;
-- one minimal deterministic constructor case for every one of the 24 current
-  sanitized `ModelError` variants;
+- one minimal deterministic constructor case for every one of the 24 sanitized
+  `ModelError` variants current when M00-PR03 was accepted; successor inventories
+  expand that historical count;
 - the exact Equivalent/Conflict/Distinct retry matrix, including each content and
   scope/key distinction, plus secret-sentinel absence from both Debug forms and
   the ledger.

@@ -2,8 +2,9 @@
 
 OpenControl Historian is at its canonical-model and bounded-runtime stage.
 This repository provides a small Rust workspace, an enforceable native dependency
-boundary, the dependency-free canonical Historian data model and bounded series
-declaration authority, independent deterministic contract evidence, and one caller-executor-owned Tokio writer
+boundary, the dependency-free canonical Historian data model, bounded series
+declaration authority, source/capture provenance and admission boundary,
+independent deterministic contract evidence, and one caller-executor-owned Tokio writer
 lifecycle with strict bounded volatile ingress and latest-observation snapshots
 per runtime instance. It does **not** provide storage, persistence, durable
 history, current/held-value, or query behavior.
@@ -13,7 +14,8 @@ history, current/held-value, or query behavior.
 `och-core` now defines canonical store/series identity, immutable declaration
 revisions, terminal retirement, exact value/content, timestamp, quality/status,
 producer-order, collection-mode, gap/no-change, atomic envelope, registry-issued
-declaration binding, and content-qualified retry contracts described in the
+declaration binding, declaration-authorized source/capture admission, and
+content-qualified retry contracts described in the
 [model contract](docs/model-contract.md). M00 also has an independent raw-fixture
 oracle for both the original model and series lifecycle, public-model adapter
 comparison, and checked-in schema-v1 ASCII golden
@@ -28,8 +30,8 @@ means the writer consumed the command and completed its publication decision;
 ineligible and stale commands remain handled no-ops. Published exact observations
 are not current/held values and prove no storage, persistence, durable history,
 query result, restart recovery, wire format, or adapter behavior. The volatile
-runtime deliberately does not consume the series registry or declaration-bound
-envelopes and gains no lifecycle authority from this successor.
+runtime deliberately does not consume the series registry, declaration-bound
+envelopes, or canonical admissions and gains no lifecycle or admission authority.
 
 The current workspace contains:
 
@@ -95,8 +97,11 @@ through nextest rather than being repeated with `cargo test`.
 - [M00-PR03 evidence record](docs/continuation-m00-pr03.md) inventories the
   delivered independent oracle, golden, fixture builders, and non-goals.
 - [M00-PR04 alignment and declaration-authority record](docs/continuation-m00-pr04.md)
-  records the accepted predecessor baseline, bounded lifecycle contract, required
-  pre-M02 source/capture successor, and explicit deferred ledger.
+  records the accepted predecessor baseline, bounded lifecycle contract,
+  then-required pre-M02 source/capture successor, and explicit deferred ledger.
+- [M00-PR05 source/capture crosswalk record](docs/continuation-m00-pr05.md)
+  records the pinned Studio field crosswalk, bounded canonical admission contract,
+  M02-PR01 input boundary, and remaining deferred ledger.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

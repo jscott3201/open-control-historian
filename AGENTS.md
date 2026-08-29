@@ -12,16 +12,20 @@ M01-PR02 bounded volatile ingress, and M01-PR03 volatile latest-observation
 publication. The reviewed M00-PR02/M00-PR03 `och-core` contracts remain unchanged;
 M00-PR04 is their explicit dependency-free successor for store identity, bounded
 series declaration revisions, terminal retirement, historical resolution, and
-registry-issued envelope binding. Further `och-core` changes require another
-explicitly reviewed successor. `och-core` owns identity, exact value/content,
-time, quality/status, producer ordering, declaration lifecycle, collection,
-gap/no-change, envelope, and retry-comparison semantics. `och-runtime` owns one private writer
+registry-issued envelope binding. M00-PR05 is the reviewed dependency-free
+successor for source projection, capture/batch provenance, and the final bounded
+declaration-authorized canonical admission record. Further `och-core` changes
+require another explicitly reviewed successor. `och-core` owns identity, exact
+value/content, time, quality/status, producer ordering, declaration lifecycle,
+source/capture provenance, collection, gap/no-change, envelope, canonical
+admission, and retry-comparison semantics. `och-runtime` owns one private writer
 task per instance, readiness, a fixed 16-command admission window, outstanding-only
 retry coalescing, shared terminal receipts, a separately fixed 16-series volatile
 registry, immutable snapshots, graceful drain/seal/join, and abort-only Drop. It
 has no persistence, durable history, query, storage, restart recovery, wire, or
-adapter behavior; it does not consume the M00-PR04 registry or gain declaration
-authority, and published observations never imply current or held values.
+adapter behavior; it does not consume the M00-PR04 registry, declaration-bound
+envelopes, or M00-PR05 admissions and gains no declaration or admission authority.
+Published observations never imply current or held values.
 
 The ignored `_roadmap/` directory is local and unpublished.
 Do not commit or push the `_roadmap/` directory to github. Preserve unrelated

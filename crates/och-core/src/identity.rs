@@ -137,7 +137,7 @@ identity_type!(
 );
 identity_type!(
     SeriesId,
-    "The nominal identity of one immutable collection-mode series."
+    "The nominal identity of one logical historical series."
 );
 identity_type!(
     ProducerId,
@@ -145,3 +145,7 @@ identity_type!(
 );
 identity_type!(ObservationId, "The nominal identity of one observation.");
 identity_type!(ArtifactId, "The nominal identity of an external artifact.");
+identity_type!(
+    EvidenceId,
+    "The nominal identity shared by source and capture evidence roles."
+);

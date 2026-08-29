@@ -71,27 +71,87 @@ impl fmt::Display for DeclarationReference {
     }
 }
 
-/// The immutable provider and source-locator identity of one logical point.
+/// An opaque bounded source-projection reference.
 ///
-/// A correction that changes either component is a logical rebind. It requires
+/// Projection vocabularies belong to adapters. Core preserves the exact bounded
+/// reference without freezing the currently known projection variants.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SourceProjection(DeclarationReference);
+
+impl SourceProjection {
+    /// Validates and retains an exact source-projection reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::InvalidDeclarationReference`] under the shared
+    /// bounded-reference grammar.
+    pub fn new(value: String) -> Result<Self, ModelError> {
+        DeclarationReference::new(value).map(Self)
+    }
+
+    /// Borrows the exact projection reference.
+    #[must_use]
+    pub const fn as_reference(&self) -> &DeclarationReference {
+        &self.0
+    }
+
+    /// Borrows the exact projection text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// The immutable provider, optional projection, and source locator of one logical point.
+///
+/// A correction that changes any component is a logical rebind. It requires
 /// retirement of the old series and registration under a new [`SeriesId`].
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SourceReference {
     provider: DeclarationReference,
+    projection: Option<SourceProjection>,
     locator: DeclarationReference,
 }
 
 impl SourceReference {
     /// Constructs one exact provider/source-locator pair.
+    ///
+    /// This compatibility constructor omits projection. Projection-absent
+    /// bindings remain valid declaration history but cannot authorize canonical
+    /// source admission.
     #[must_use]
     pub const fn new(provider: DeclarationReference, locator: DeclarationReference) -> Self {
-        Self { provider, locator }
+        Self {
+            provider,
+            projection: None,
+            locator,
+        }
+    }
+
+    /// Constructs one exact provider/projection/source-locator tuple.
+    #[must_use]
+    pub const fn with_projection(
+        provider: DeclarationReference,
+        projection: SourceProjection,
+        locator: DeclarationReference,
+    ) -> Self {
+        Self {
+            provider,
+            projection: Some(projection),
+            locator,
+        }
     }
 
     /// Returns the exact external provider reference.
     #[must_use]
     pub const fn provider(&self) -> &DeclarationReference {
         &self.provider
+    }
+
+    /// Returns the optional opaque source projection.
+    #[must_use]
+    pub const fn projection(&self) -> Option<&SourceProjection> {
+        self.projection.as_ref()
     }
 
     /// Returns the exact provider-scoped source locator.
@@ -114,7 +174,7 @@ impl SeriesBinding {
         Self { source }
     }
 
-    /// Returns the immutable provider/source-locator binding.
+    /// Returns the immutable provider/projection/source-locator binding.
     #[must_use]
     pub const fn source(&self) -> &SourceReference {
         &self.source
@@ -868,7 +928,17 @@ impl SeriesRegistry {
 ///
 /// There is intentionally no public constructor. Possessing a bare envelope or
 /// historic declaration is insufficient to construct this active binding.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The capability is deliberately not cloneable, so consuming it cannot leave
+/// a second authorization token for the same envelope.
+///
+/// ```compile_fail
+/// use och_core::DeclaredCollectionEnvelope;
+///
+/// fn fork(binding: DeclaredCollectionEnvelope) {
+///     let _second_authority = binding.clone();
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
 pub struct DeclaredCollectionEnvelope {
     store_id: StoreId,
     declaration: SeriesDeclaration,
@@ -898,6 +968,10 @@ impl DeclaredCollectionEnvelope {
     #[must_use]
     pub fn into_envelope(self) -> CollectionEnvelope {
         self.envelope
+    }
+
+    pub(crate) fn into_parts(self) -> (StoreId, SeriesDeclaration, CollectionEnvelope) {
+        (self.store_id, self.declaration, self.envelope)
     }
 }
 

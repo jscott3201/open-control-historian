@@ -7,20 +7,27 @@ mod fixtures;
 mod oracle;
 #[path = "m00_independent_evidence/series_oracle.rs"]
 mod series_oracle;
+#[path = "m00_independent_evidence/source_oracle.rs"]
+mod source_oracle;
 
 use fixtures::{
     ConstructorCase, RawEnvelope, RawError, RawEvidence, RawGap, RawMode, RawObservation, RawRetry,
     RawTimestamp,
 };
 use och_core::{
-    ArtifactId, ArtifactReference, CollectionEnvelope, CollectionMode, ContentFormat,
-    ContentIdentity, ContentVersion, DeclarationEvidence, DeclarationReference,
-    DeclarationRevision, EvidenceKind, ExactText, ExactValue, Gap, GapReason, ModelError,
-    NativeStatus, NativeStatusToken, NoChange, Observation, ObservationId, ObservationTimes,
-    ProducerEpoch, ProducerId, ProducerPosition, ProducerSequence, Quality, QualityFlags,
-    QualityLevel, QuantityEvidence, RealBits, RetryClassification, RetryKey, RetryQualification,
-    SeriesBinding, SeriesDeclarationPayload, SeriesId, SeriesMetadata, SeriesRegistry,
-    SeriesRegistryLimits, SourceReference, StateClass, StateMember, StateValue, StoreId,
+    ArtifactId, ArtifactReference, CanonicalAdmission, CaptureLifecycle, CaptureRunEvidence,
+    CollectionEnvelope, CollectionMode, ContentFormat, ContentIdentity, ContentVersion,
+    DeclarationEvidence, DeclarationReference, DeclarationRevision, EvidenceId, EvidenceKind,
+    ExactText, ExactValue, Gap, GapReason, ModelError, NativeStatus, NativeStatusToken, NoChange,
+    NormalizedRecordEvidence, Observation, ObservationId, ObservationTimes, ProducerEpoch,
+    ProducerId, ProducerPosition, ProducerSequence, Quality, QualityFlags, QualityLevel,
+    QuantityEvidence, RawRecordEvidence, RealBits, RetryClassification, RetryKey,
+    RetryQualification, SeriesBinding, SeriesDeclarationPayload, SeriesId, SeriesMetadata,
+    SeriesRegistry, SeriesRegistryLimits, SourceBatchMetadata, SourceEndpointEvidence,
+    SourceGapEvidence, SourceGapReason, SourceIdempotency, SourceInterpretation,
+    SourceIntervalKind, SourceObservationContext, SourceObservationEvidence, SourceProjection,
+    SourceReference, SourceSchemaIdentity, SourceSchemaVersion, SourceSnapshotEvidence,
+    SourceSystemEvidence, SourceTransport, StateClass, StateMember, StateValue, StoreId,
     TimeInterval, Timestamp, Unavailable, UnavailableReason, UnitEvidence, ValueFamily,
 };
 use std::collections::BTreeSet;
@@ -28,6 +35,7 @@ use std::collections::BTreeSet;
 const FIXTURE_SOURCE: &str = include_str!("m00_independent_evidence/fixtures.rs");
 const ORACLE_SOURCE: &str = include_str!("m00_independent_evidence/oracle.rs");
 const SERIES_ORACLE_SOURCE: &str = include_str!("m00_independent_evidence/series_oracle.rs");
+const SOURCE_ORACLE_SOURCE: &str = include_str!("m00_independent_evidence/source_oracle.rs");
 const IDENTITY_SOURCE: &str = include_str!("../src/identity.rs");
 const GOLDEN: &str = include_str!("fixtures/m00-pr03-evidence-v1.txt");
 
@@ -127,6 +135,368 @@ fn actual_constructor(case: &ConstructorCase) -> Result<(), ModelError> {
     }
 }
 
+const fn actual_source_model_errors() -> [ModelError; 21] {
+    [
+        ModelError::InvalidSourceSchemaVersion,
+        ModelError::CaptureRunTimeOrder,
+        ModelError::SourceEndpointSystemMismatch,
+        ModelError::CaptureRunEndpointMismatch,
+        ModelError::SourceSnapshotRunMismatch,
+        ModelError::SourceProjectionRequired,
+        ModelError::SourceIntervalMismatch,
+        ModelError::SourceLifecycleBindingMismatch,
+        ModelError::AdmissionRetryScopeMismatch,
+        ModelError::TooManySourceObservationContexts,
+        ModelError::SourceObservationCountMismatch,
+        ModelError::TooManySourceGapContexts,
+        ModelError::SourceGapCountMismatch,
+        ModelError::MisorderedSourceRecordOrdinals,
+        ModelError::DuplicateSourceEvidenceId,
+        ModelError::SourceRawSnapshotMismatch,
+        ModelError::SourceNormalizedRawMismatch,
+        ModelError::SourceNormalizedObservationMismatch,
+        ModelError::SourceRawIdempotencyMismatch,
+        ModelError::SourceInterpretationMismatch,
+        ModelError::SourceGapMismatch,
+    ]
+}
+
+fn source_evidence_id(number: u16) -> EvidenceId {
+    EvidenceId::from_bytes(fixtures::uuid_bytes(u64::from(number)))
+        .expect("valid raw source evidence UUIDv7")
+}
+
+fn source_content(format: &str, digest: [u8; 32]) -> ContentIdentity {
+    ContentIdentity::new(
+        ContentFormat::new(format.to_owned()).expect("valid raw source content format"),
+        ContentVersion::new(1),
+        digest,
+    )
+}
+
+fn source_artifact(number: u16, format: &str, digest: [u8; 32]) -> ArtifactReference {
+    ArtifactReference::new(
+        ArtifactId::from_bytes(fixtures::uuid_bytes(u64::from(number)))
+            .expect("valid raw source artifact UUIDv7"),
+        source_content(format, digest),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn actual_source_admission() -> CanonicalAdmission {
+    let store = StoreId::from_bytes(fixtures::uuid_bytes(100)).expect("valid raw store UUIDv7");
+    let series = actual_series_id(1);
+    let producer = actual_producer_id(2);
+    let source = SourceReference::with_projection(
+        actual_declaration_reference("provider".to_owned()),
+        SourceProjection::new("Mqtt".to_owned()).expect("valid raw projection"),
+        actual_declaration_reference("locator".to_owned()),
+    );
+    let payload = SeriesDeclarationPayload::new(
+        producer,
+        CollectionMode::Sampled,
+        ValueFamily::Boolean,
+        QuantityEvidence::Resolved(actual_declaration_reference("temperature".to_owned())),
+        UnitEvidence::Resolved(actual_declaration_reference("deg-c".to_owned())),
+        Some(actual_declaration_reference("application".to_owned())),
+    );
+    let mut registry = SeriesRegistry::new(store, SeriesRegistryLimits::new(1, 1));
+    registry
+        .register(
+            series,
+            SeriesBinding::new(source.clone()),
+            payload,
+            DeclarationEvidence::new(Timestamp::from_unix_milliseconds(-1), None),
+        )
+        .expect("valid raw source declaration");
+
+    let observation_time = Timestamp::from_unix_milliseconds(0);
+    let observation = Observation::new(
+        ObservationId::from_bytes(fixtures::uuid_bytes(60)).expect("valid raw observation UUIDv7"),
+        ExactValue::Boolean(true),
+        ObservationTimes::new(None, observation_time, observation_time),
+        Quality::new(QualityLevel::Unknown, QualityFlags::none()),
+        NativeStatus::absent(),
+        None,
+        None,
+    );
+    let gap = Gap::new(
+        ProducerEpoch::new(1),
+        ProducerSequence::new(4),
+        ProducerSequence::new(5),
+        GapReason::Unknown,
+    )
+    .expect("valid raw canonical gap");
+    let envelope = CollectionEnvelope::observed(
+        SeriesMetadata::new(series, producer, CollectionMode::Sampled),
+        vec![observation],
+        vec![gap],
+    )
+    .expect("valid raw source envelope");
+    let declared = registry
+        .bind(envelope)
+        .expect("active raw declaration binding");
+
+    let lifecycle = CaptureLifecycle::new(
+        SourceSystemEvidence::new(
+            source_evidence_id(10),
+            actual_declaration_reference("provider".to_owned()),
+            SourceProjection::new("Mqtt".to_owned()).expect("valid raw projection"),
+        ),
+        SourceEndpointEvidence::new(
+            source_evidence_id(11),
+            source_evidence_id(10),
+            actual_declaration_reference("locator".to_owned()),
+        ),
+        CaptureRunEvidence::new(
+            source_evidence_id(12),
+            source_evidence_id(11),
+            Timestamp::from_unix_milliseconds(-1),
+            Some(Timestamp::from_unix_milliseconds(1)),
+        )
+        .expect("ordered raw capture run"),
+        SourceSnapshotEvidence::new(
+            source_evidence_id(13),
+            source_evidence_id(12),
+            source_artifact(20, "application/json", [6; 32]),
+        ),
+    )
+    .expect("linked raw capture lifecycle");
+    let source_observation = SourceObservationEvidence::new(
+        source_evidence_id(30),
+        Some(source_artifact(21, "application/octet-stream", [5; 32])),
+        SourceTransport::Redelivered,
+        Some(SourceIdempotency::new(
+            RetryKey::new("observation-key".to_owned()).expect("valid source retry key"),
+            source_content("application/octet-stream", [4; 32]),
+        )),
+    );
+    let raw = RawRecordEvidence::new(
+        source_evidence_id(31),
+        source_evidence_id(13),
+        source_artifact(22, "application/octet-stream", [7; 32]),
+        Some(SourceIdempotency::new(
+            RetryKey::new("raw-key".to_owned()).expect("valid raw retry key"),
+            source_content("application/octet-stream", [7; 32]),
+        )),
+    );
+    let normalized = NormalizedRecordEvidence::new(
+        source_evidence_id(32),
+        source_evidence_id(31),
+        source_content("application/octet-stream", [8; 32]),
+        source_evidence_id(30),
+    );
+    let context = SourceObservationContext::new(
+        0,
+        SourceInterpretation::new(
+            source,
+            Some(actual_declaration_reference("application".to_owned())),
+            QuantityEvidence::Resolved(actual_declaration_reference("temperature".to_owned())),
+            UnitEvidence::Resolved(actual_declaration_reference("deg-c".to_owned())),
+        ),
+        source_observation,
+        raw,
+        normalized,
+    );
+    let retry = RetryQualification::new(
+        series,
+        producer,
+        RetryKey::new("historian-key".to_owned()).expect("valid Historian retry key"),
+        source_content("application/octet-stream", [9; 32]),
+    );
+    CanonicalAdmission::observed(
+        declared,
+        retry,
+        SourceBatchMetadata::new(
+            SourceSchemaIdentity::new("studio.source-batch".to_owned())
+                .expect("valid raw source schema"),
+            SourceSchemaVersion::new(1).expect("valid raw source schema version"),
+            SourceIntervalKind::Observed,
+        ),
+        lifecycle,
+        vec![context],
+        vec![
+            SourceGapEvidence::new(
+                ProducerEpoch::new(1),
+                ProducerSequence::new(4),
+                ProducerSequence::new(5),
+                SourceGapReason::CommunicationFailure,
+            )
+            .expect("valid raw source gap"),
+        ],
+    )
+    .expect("valid declaration-authorized raw source admission")
+}
+
+fn identity_number(bytes: [u8; 16]) -> u16 {
+    u16::from_be_bytes([bytes[14], bytes[15]])
+}
+
+fn normalized_content(content: &ContentIdentity) -> source_oracle::NormalizedContent {
+    source_oracle::NormalizedContent {
+        format: content.format().as_str().to_owned(),
+        version: content.version().get(),
+        digest: *content.sha256(),
+    }
+}
+
+fn normalized_artifact(artifact: &ArtifactReference) -> source_oracle::NormalizedArtifact {
+    source_oracle::NormalizedArtifact {
+        id: identity_number(artifact.artifact_id().into_bytes()),
+        content: normalized_content(artifact.content()),
+    }
+}
+
+fn normalized_idempotency(idempotency: &SourceIdempotency) -> source_oracle::NormalizedIdempotency {
+    source_oracle::NormalizedIdempotency {
+        key: idempotency.key().as_str().to_owned(),
+        content: normalized_content(idempotency.content()),
+    }
+}
+
+fn normalized_quantity(evidence: &QuantityEvidence) -> String {
+    match evidence {
+        QuantityEvidence::Absent => "absent".to_owned(),
+        QuantityEvidence::Resolved(reference) => format!("resolved:{}", reference.as_str()),
+        QuantityEvidence::Unresolved(reference) => format!("unresolved:{}", reference.as_str()),
+    }
+}
+
+fn normalized_unit(evidence: &UnitEvidence) -> String {
+    match evidence {
+        UnitEvidence::Absent => "absent".to_owned(),
+        UnitEvidence::Resolved(reference) => format!("resolved:{}", reference.as_str()),
+        UnitEvidence::Unresolved(reference) => format!("unresolved:{}", reference.as_str()),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn normalize_source_admission(
+    admission: &CanonicalAdmission,
+) -> source_oracle::NormalizedAdmission {
+    let declaration = admission.declaration();
+    let payload = declaration.payload();
+    let source = declaration.binding().source();
+    let lifecycle = admission.lifecycle();
+    source_oracle::NormalizedAdmission {
+        store: identity_number(admission.store_id().into_bytes()),
+        declaration_revision: declaration.revision().get(),
+        series: identity_number(declaration.series_id().into_bytes()),
+        producer: identity_number(payload.producer_id().into_bytes()),
+        mode: match payload.collection_mode() {
+            CollectionMode::Sampled => "sampled",
+            CollectionMode::ChangeOnly => "change-only",
+            CollectionMode::Cumulative => "cumulative",
+            CollectionMode::Interval => "interval",
+            CollectionMode::Event => "event",
+        }
+        .to_owned(),
+        family: match payload.value_family() {
+            ValueFamily::Real => "real",
+            ValueFamily::Signed => "signed",
+            ValueFamily::Unsigned => "unsigned",
+            ValueFamily::Boolean => "boolean",
+            ValueFamily::State => "state",
+            ValueFamily::Text => "text",
+            ValueFamily::Artifact => "artifact",
+        }
+        .to_owned(),
+        provider: source.provider().as_str().to_owned(),
+        projection: source
+            .projection()
+            .expect("admission has projection")
+            .as_str()
+            .to_owned(),
+        locator: source.locator().as_str().to_owned(),
+        application: payload
+            .application()
+            .map(|reference| reference.as_str().to_owned()),
+        quantity: normalized_quantity(payload.quantity()),
+        unit: normalized_unit(payload.unit()),
+        schema: admission.batch().schema().as_str().to_owned(),
+        schema_version: admission.batch().version().get(),
+        observed: admission.evidence_kind() == SourceIntervalKind::Observed,
+        lifecycle: source_oracle::NormalizedLifecycle {
+            ids: [
+                identity_number(lifecycle.system().evidence_id().into_bytes()),
+                identity_number(lifecycle.endpoint().evidence_id().into_bytes()),
+                identity_number(lifecycle.run().evidence_id().into_bytes()),
+                identity_number(lifecycle.snapshot().evidence_id().into_bytes()),
+            ],
+            provider: lifecycle.system().provider().as_str().to_owned(),
+            projection: lifecycle.system().projection().as_str().to_owned(),
+            locator: lifecycle.endpoint().locator().as_str().to_owned(),
+            started_ms: lifecycle
+                .run()
+                .started_at()
+                .to_unix_milliseconds()
+                .expect("millisecond fixture"),
+            completed_ms: lifecycle
+                .run()
+                .completed_at()
+                .map(|time| time.to_unix_milliseconds().expect("millisecond fixture")),
+            snapshot: normalized_artifact(lifecycle.snapshot().artifact()),
+        },
+        retry_series: identity_number(admission.retry().series_id().into_bytes()),
+        retry_producer: identity_number(admission.retry().producer_id().into_bytes()),
+        retry_key: admission.retry().key().as_str().to_owned(),
+        retry_content: normalized_content(admission.retry().content()),
+        envelope_observation_count: admission.envelope().observations().len(),
+        canonical_gaps: admission
+            .envelope()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.epoch().get(), gap.start().get(), gap.end().get()))
+            .collect(),
+        lineages: admission
+            .observations()
+            .iter()
+            .map(|lineage| source_oracle::NormalizedLineage {
+                ordinal: lineage.ordinal(),
+                source_observation: identity_number(
+                    lineage.observation().evidence_id().into_bytes(),
+                ),
+                provenance_artifact: lineage
+                    .observation()
+                    .provenance_artifact()
+                    .map(normalized_artifact),
+                redelivered: lineage.observation().transport() == SourceTransport::Redelivered,
+                observation_idempotency: lineage
+                    .observation()
+                    .idempotency()
+                    .map(normalized_idempotency),
+                raw: identity_number(lineage.raw().evidence_id().into_bytes()),
+                raw_snapshot: identity_number(lineage.raw().snapshot_id().into_bytes()),
+                raw_artifact: normalized_artifact(lineage.raw().artifact()),
+                raw_idempotency: lineage.raw().idempotency().map(normalized_idempotency),
+                normalized: identity_number(lineage.normalized().evidence_id().into_bytes()),
+                normalized_raw: identity_number(lineage.normalized().raw_record_id().into_bytes()),
+                normalized_content: normalized_content(lineage.normalized().content()),
+                normalized_observation: identity_number(
+                    lineage.normalized().observation_evidence_id().into_bytes(),
+                ),
+            })
+            .collect(),
+        gaps: admission
+            .gaps()
+            .iter()
+            .map(|gap| source_oracle::NormalizedGap {
+                epoch: gap.epoch().get(),
+                start: gap.start().get(),
+                end: gap.end().get(),
+                reason: match gap.reason() {
+                    SourceGapReason::CommunicationFailure => "communication-failure",
+                    SourceGapReason::SourceUnavailable => "source-unavailable",
+                    SourceGapReason::ProducerReset => "producer-reset",
+                    SourceGapReason::Filtered => "filtered",
+                    SourceGapReason::Unknown => "unknown",
+                }
+                .to_owned(),
+            })
+            .collect(),
+    }
+}
+
 const fn error_code(error: ModelError) -> RawError {
     match error {
         ModelError::InvalidIdentity => RawError::InvalidIdentity,
@@ -164,6 +534,29 @@ const fn error_code(error: ModelError) -> RawError {
         ModelError::DeclarationUnchanged => RawError::DeclarationUnchanged,
         ModelError::SeriesMetadataMismatch => RawError::SeriesMetadataMismatch,
         ModelError::ObservationValueFamilyMismatch => RawError::ObservationValueFamilyMismatch,
+        ModelError::InvalidSourceSchemaVersion => RawError::InvalidSourceSchemaVersion,
+        ModelError::CaptureRunTimeOrder => RawError::CaptureRunTimeOrder,
+        ModelError::SourceEndpointSystemMismatch => RawError::SourceEndpointSystemMismatch,
+        ModelError::CaptureRunEndpointMismatch => RawError::CaptureRunEndpointMismatch,
+        ModelError::SourceSnapshotRunMismatch => RawError::SourceSnapshotRunMismatch,
+        ModelError::SourceProjectionRequired => RawError::SourceProjectionRequired,
+        ModelError::SourceIntervalMismatch => RawError::SourceIntervalMismatch,
+        ModelError::SourceLifecycleBindingMismatch => RawError::SourceLifecycleBindingMismatch,
+        ModelError::AdmissionRetryScopeMismatch => RawError::AdmissionRetryScopeMismatch,
+        ModelError::TooManySourceObservationContexts => RawError::TooManySourceObservationContexts,
+        ModelError::SourceObservationCountMismatch => RawError::SourceObservationCountMismatch,
+        ModelError::TooManySourceGapContexts => RawError::TooManySourceGapContexts,
+        ModelError::SourceGapCountMismatch => RawError::SourceGapCountMismatch,
+        ModelError::MisorderedSourceRecordOrdinals => RawError::MisorderedSourceRecordOrdinals,
+        ModelError::DuplicateSourceEvidenceId => RawError::DuplicateSourceEvidenceId,
+        ModelError::SourceRawSnapshotMismatch => RawError::SourceRawSnapshotMismatch,
+        ModelError::SourceNormalizedRawMismatch => RawError::SourceNormalizedRawMismatch,
+        ModelError::SourceNormalizedObservationMismatch => {
+            RawError::SourceNormalizedObservationMismatch
+        }
+        ModelError::SourceRawIdempotencyMismatch => RawError::SourceRawIdempotencyMismatch,
+        ModelError::SourceInterpretationMismatch => RawError::SourceInterpretationMismatch,
+        ModelError::SourceGapMismatch => RawError::SourceGapMismatch,
     }
 }
 
@@ -697,11 +1090,13 @@ fn identities_match_independent_uuid_text_and_byte_facts() {
     let observation =
         ObservationId::parse(fixtures::OBSERVATION_TEXT).expect("actual observation UUIDv7");
     let artifact = ArtifactId::parse(fixtures::ARTIFACT_TEXT).expect("actual artifact UUIDv7");
+    let evidence = EvidenceId::parse(fixtures::ARTIFACT_TEXT).expect("actual evidence UUIDv7");
     assert_eq!(store.into_bytes(), store_bytes);
     assert_eq!(series.into_bytes(), series_bytes);
     assert_eq!(producer.into_bytes(), producer_bytes);
     assert_eq!(observation.into_bytes(), observation_bytes);
     assert_eq!(artifact.into_bytes(), artifact_bytes);
+    assert_eq!(evidence.into_bytes(), artifact_bytes);
     assert_eq!(store.to_string(), oracle::render_uuid(store_bytes));
     assert_eq!(series.to_string(), oracle::render_uuid(series_bytes));
     assert_eq!(producer.to_string(), oracle::render_uuid(producer_bytes));
@@ -710,6 +1105,7 @@ fn identities_match_independent_uuid_text_and_byte_facts() {
         oracle::render_uuid(observation_bytes)
     );
     assert_eq!(artifact.to_string(), oracle::render_uuid(artifact_bytes));
+    assert_eq!(evidence.to_string(), oracle::render_uuid(artifact_bytes));
     assert_eq!(
         SeriesId::from_bytes(series_bytes).expect("actual valid bytes"),
         series
@@ -1145,6 +1541,106 @@ fn collection_modes_shapes_bounds_and_half_open_endpoints_match_oracle() {
 }
 
 #[test]
+fn source_capture_crosswalk_matches_a_primitive_only_oracle() {
+    assert!(!SOURCE_ORACLE_SOURCE.contains("use och_core"));
+    let valid = source_oracle::valid_observed();
+    assert!(source_oracle::violations(&valid).is_empty());
+    assert_eq!(
+        normalize_source_admission(&actual_source_admission()),
+        source_oracle::expected_retained(&valid)
+    );
+    assert_eq!(valid.lifecycle.snapshot_artifact.1, "application/json");
+    assert_eq!(valid.lifecycle.snapshot_artifact.2, 1);
+    assert_eq!(
+        valid.lineages[0].provenance_artifact,
+        Some((21, "application/octet-stream", 1, [5; 32]))
+    );
+    assert_eq!(
+        valid.lineages[0].observation_idempotency,
+        Some(("observation-key", "application/octet-stream", 1, [4; 32]))
+    );
+    assert_eq!(
+        valid.lineages[0].normalized_content,
+        ("application/octet-stream", 1, [8; 32])
+    );
+    assert_eq!(valid.gaps[0].reason, 0);
+
+    let mut cases = Vec::new();
+    let mut case = valid.clone();
+    case.schema_version = 0;
+    cases.push((case, RawError::InvalidSourceSchemaVersion));
+    let mut case = valid.clone();
+    case.lifecycle.completed_ms = Some(-2);
+    cases.push((case, RawError::CaptureRunTimeOrder));
+    let mut case = valid.clone();
+    case.lifecycle.endpoint_system = 99;
+    cases.push((case, RawError::SourceEndpointSystemMismatch));
+    let mut case = valid.clone();
+    case.lifecycle.run_endpoint = 99;
+    cases.push((case, RawError::CaptureRunEndpointMismatch));
+    let mut case = valid.clone();
+    case.lifecycle.snapshot_run = 99;
+    cases.push((case, RawError::SourceSnapshotRunMismatch));
+    let mut case = valid.clone();
+    case.declaration_projection = None;
+    case.lifecycle.projection = None;
+    cases.push((case, RawError::SourceProjectionRequired));
+    let mut case = valid.clone();
+    case.interval_observed = false;
+    cases.push((case, RawError::SourceIntervalMismatch));
+    let mut case = valid.clone();
+    case.lifecycle.provider = "other";
+    cases.push((case, RawError::SourceLifecycleBindingMismatch));
+    let mut case = valid.clone();
+    case.retry_series = 99;
+    cases.push((case, RawError::AdmissionRetryScopeMismatch));
+    let mut case = valid.clone();
+    case.lineages = vec![valid.lineages[0].clone(); 257];
+    cases.push((case, RawError::TooManySourceObservationContexts));
+    let mut case = valid.clone();
+    case.envelope_observation_count = 2;
+    cases.push((case, RawError::SourceObservationCountMismatch));
+    let mut case = valid.clone();
+    case.gaps = vec![valid.gaps[0]; 65];
+    cases.push((case, RawError::TooManySourceGapContexts));
+    let mut case = valid.clone();
+    case.canonical_gaps.push((1, 6, 7));
+    cases.push((case, RawError::SourceGapCountMismatch));
+    let mut case = valid.clone();
+    case.lineages[0].ordinal = 256;
+    cases.push((case, RawError::MisorderedSourceRecordOrdinals));
+    let mut case = valid.clone();
+    case.lineages[0].raw = 10;
+    case.lineages[0].normalized_raw = 10;
+    cases.push((case, RawError::DuplicateSourceEvidenceId));
+    let mut case = valid.clone();
+    case.lineages[0].raw_snapshot = 99;
+    cases.push((case, RawError::SourceRawSnapshotMismatch));
+    let mut case = valid.clone();
+    case.lineages[0].normalized_raw = 99;
+    cases.push((case, RawError::SourceNormalizedRawMismatch));
+    let mut case = valid.clone();
+    case.lineages[0].normalized_observation = 99;
+    cases.push((case, RawError::SourceNormalizedObservationMismatch));
+    let mut case = valid.clone();
+    case.lineages[0].raw_idempotency = Some(("raw-key", "application/octet-stream", 1, [9; 32]));
+    cases.push((case, RawError::SourceRawIdempotencyMismatch));
+    let mut case = valid.clone();
+    case.lineages[0].locator = "other";
+    cases.push((case, RawError::SourceInterpretationMismatch));
+    let mut case = valid;
+    case.gaps[0].end = 6;
+    cases.push((case, RawError::SourceGapMismatch));
+    for (case, expected) in cases {
+        assert!(
+            source_oracle::violations(&case).contains(&expected),
+            "{}",
+            expected.name()
+        );
+    }
+}
+
+#[test]
 fn every_negative_fixture_has_one_oracle_violation_and_one_sanitized_model_error() {
     let mut covered = BTreeSet::new();
     for fixture in fixtures::constructor_failures() {
@@ -1183,6 +1679,16 @@ fn every_negative_fixture_has_one_oracle_violation_and_one_sanitized_model_error
     for (actual, expected) in series_errors
         .into_iter()
         .zip(series_oracle::SERIES_ERROR_INVENTORY)
+    {
+        assert_eq!(error_code(actual), expected);
+        assert!(!actual.to_string().contains(fixtures::SECRET_SENTINEL));
+        assert!(!format!("{actual:?}").contains(fixtures::SECRET_SENTINEL));
+        assert!(covered.insert(expected));
+    }
+
+    for (actual, expected) in actual_source_model_errors()
+        .into_iter()
+        .zip(source_oracle::SOURCE_ERROR_INVENTORY)
     {
         assert_eq!(error_code(actual), expected);
         assert!(!actual.to_string().contains(fixtures::SECRET_SENTINEL));

@@ -19,6 +19,7 @@ pub mod position;
 pub mod quality;
 pub mod retry;
 pub mod series;
+pub mod source;
 pub mod time;
 pub mod value;
 
@@ -28,7 +29,7 @@ pub use bounded::{
 };
 pub use collection::{CollectionEnvelope, EvidenceKind, Gap, GapReason, NoChange};
 pub use error::ModelError;
-pub use identity::{ArtifactId, ObservationId, ProducerId, SeriesId, StoreId};
+pub use identity::{ArtifactId, EvidenceId, ObservationId, ProducerId, SeriesId, StoreId};
 pub use observation::{CollectionMode, Observation, RawObservationOrderKey, SeriesMetadata};
 pub use position::{ProducerEpoch, ProducerPosition, ProducerSequence};
 pub use quality::{NativeStatus, Quality, QualityFlags, QualityLevel};
@@ -37,7 +38,15 @@ pub use series::{
     DeclarationEvidence, DeclarationReference, DeclarationRevision, DeclaredCollectionEnvelope,
     QuantityEvidence, SeriesBinding, SeriesDeclaration, SeriesDeclarationPayload, SeriesHistory,
     SeriesLifecycle, SeriesRegistry, SeriesRegistryLimits, SeriesRegistrySnapshot,
-    SeriesRetirement, SourceReference, UnitEvidence, ValueFamily,
+    SeriesRetirement, SourceProjection, SourceReference, UnitEvidence, ValueFamily,
+};
+pub use source::{
+    CanonicalAdmission, CaptureLifecycle, CaptureRunEvidence, MAX_SOURCE_GAP_CONTEXTS,
+    MAX_SOURCE_OBSERVATION_CONTEXTS, NormalizedRecordEvidence, RawRecordEvidence,
+    SourceBatchMetadata, SourceEndpointEvidence, SourceGapEvidence, SourceGapReason,
+    SourceIdempotency, SourceInterpretation, SourceIntervalKind, SourceObservationContext,
+    SourceObservationEvidence, SourceObservationLineage, SourceSchemaIdentity, SourceSchemaVersion,
+    SourceSnapshotEvidence, SourceSystemEvidence, SourceTransport,
 };
 pub use time::{ObservationTimes, TimeInterval, Timestamp};
 pub use value::{
