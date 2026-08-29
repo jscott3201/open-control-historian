@@ -2,7 +2,8 @@
 
 ## Authority and boundary
 
-M00-PR02 defines the dependency-free public model in `och-core`. It is native
+M00-PR02 defines the dependency-free public model in `och-core`, and M00-PR03
+supplies independent evidence for that frozen contract. The model is native
 Historian authority rather than a serialization of a Studio, Engine, transport,
 or persistence schema. Future adapters must preserve supported values exactly and
 reject or report unsupported unsigned, unavailable, or collection-mode extensions
@@ -127,6 +128,23 @@ or treat transport redelivery as idempotency.
 ## Evidence ownership
 
 M00-PR02 tests constructor boundaries, exact retention, ordering tuples, and
-cross-item invariants. They are implementation tests, not an independent oracle.
-The [M00-PR03 continuation](continuation-m00-pr03.md) owns independent oracle,
-golden, and fixture-builder evidence without adding runtime or wire authority.
+cross-item invariants. Retained-capacity behavior remains owned by those
+implementation tests; it is not an oracle or wire fact.
+
+M00-PR03 adds one dependency-free integration-test target at
+`crates/och-core/tests/m00_independent_evidence.rs`. Its raw fixture builders and
+contract-literal oracle are separate modules that do not import `och_core`; only
+the top-level adapter constructs and calls the public model. The adapter compares
+actual accessors, ordering, validation errors, and retry classifications with
+primitive expected facts computed by the oracle. Twelve atomic negative builders
+each prove exactly one independent violation before comparison, and a complete
+24-variant constructor inventory covers every current sanitized `ModelError`.
+
+The checked-in `crates/och-core/tests/fixtures/m00-pr03-evidence-v1.txt` ledger has
+22 stable case rows, ASCII/LF schema 1, deterministic order, canonical decimal
+and lowercase hex facts, and no update or bless mechanism. Its header explicitly
+denies wire, persistence, and API-compatibility authority. A freshness test
+renders it from the pure oracle, while separate actual-versus-oracle tests prevent
+a golden-only self-assertion. The
+[M00-PR03 evidence record](continuation-m00-pr03.md) inventories the coverage and
+unchanged next boundary.
