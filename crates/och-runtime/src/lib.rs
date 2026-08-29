@@ -1,21 +1,26 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
-//! Caller-executor lifecycle and bounded volatile ingress for the `OpenControl`
-//! Historian writer.
+//! Caller-executor lifecycle, bounded volatile ingress, and latest-observation
+//! snapshots for the `OpenControl` Historian writer.
 //!
 //! Each [`HistorianRuntime`] owns exactly one private writer task and a fixed
-//! 16-command admission window on the caller's active Tokio executor. Handling
-//! means only that this volatile writer consumed a command; this crate exposes no
-//! persistence, state observation, publication, query, or restart mechanism.
+//! 16-command admission window on the caller's active Tokio executor. Eligible
+//! positioned observations publish into a separate fixed 16-series volatile
+//! registry. Neither handling nor publication implies persistence, current/held
+//! value, query, or restart semantics.
 
 mod ingress;
+mod latest;
 
 pub use ingress::{
     HistorianIngress, IngressCommand, MAX_OUTSTANDING_COMMANDS, Receipt, ReceiptOutcome,
     ScopeMismatchError, Submission, SubmissionDisposition, TrySubmitError, TrySubmitErrorKind,
 };
+pub use latest::{
+    LatestReadError, LatestReadHandle, LatestSnapshot, MAX_PUBLISHED_SERIES, PublishedObservation,
+};
 
-use ingress::{IngressShared, NextWork};
+use ingress::{CompletionFaultInjection, IngressShared, NextWork};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -36,6 +41,7 @@ use tokio::task::{JoinError, JoinHandle};
 pub struct HistorianRuntime {
     ingress: HistorianIngress,
     writer: Option<JoinHandle<WriterExit>>,
+    shutdown_complete: bool,
 }
 
 impl fmt::Debug for HistorianRuntime {
@@ -80,6 +86,7 @@ impl HistorianRuntime {
             Ok(Self {
                 ingress,
                 writer: Some(startup.transfer()),
+                shutdown_complete: false,
             })
         } else {
             let result = startup.join().await;
@@ -100,13 +107,24 @@ impl HistorianRuntime {
         self.ingress.clone()
     }
 
+    /// Returns a cloneable synchronous reader for this runtime's latest registry.
+    ///
+    /// The handle is available only after writer readiness, contains no Tokio
+    /// type, and never keeps the writer task alive. It may outlive graceful
+    /// shutdown and continue to capture the sealed final immutable snapshot.
+    #[must_use]
+    pub fn read_handle(&self) -> LatestReadHandle {
+        LatestReadHandle::new(self.ingress.shared())
+    }
+
     /// Gracefully stops and joins this instance's private writer task.
     ///
     /// Admission closes synchronously when this future is first polled. Commands
-    /// accepted before that close are drained FIFO, their receipts resolve as
-    /// [`ReceiptOutcome::WriterHandled`], and then the retained task is joined.
-    /// `Ok(())` proves volatile handling and join only; it is not persistence,
-    /// durability, publication, queryability, or restart evidence.
+    /// accepted before that close are drained FIFO, each publication decision is
+    /// completed before its receipt resolves as [`ReceiptOutcome::WriterHandled`],
+    /// the final registry is sealed, and then the retained task is joined.
+    /// `Ok(())` proves volatile handling, publication decision, and join only; it
+    /// is not persistence, durability, queryability, or restart evidence.
     ///
     /// # Errors
     ///
@@ -123,7 +141,10 @@ impl HistorianRuntime {
         self.writer = None;
 
         match result {
-            Ok(WriterExit::Shutdown) => Ok(()),
+            Ok(WriterExit::Shutdown) => {
+                self.shutdown_complete = true;
+                Ok(())
+            }
             Ok(_) => Err(ShutdownError::WriterExitedBeforeShutdown),
             Err(error) => Err(classify_shutdown_join_error(&error)),
         }
@@ -137,6 +158,9 @@ impl HistorianRuntime {
 
 impl Drop for HistorianRuntime {
     fn drop(&mut self) {
+        if self.shutdown_complete {
+            return;
+        }
         // Resolve receipts before aborting so cancellation cannot strand work if
         // the caller's executor never polls the writer again.
         self.ingress.stop();
@@ -253,6 +277,7 @@ enum WriterExit {
     Shutdown,
     StartupReceiverClosed,
     IngressFailed,
+    PublicationFault,
     #[cfg(test)]
     BeforeReadiness,
     #[cfg(test)]
@@ -296,6 +321,8 @@ struct WriterOptions {
     #[cfg(test)]
     command_gate: Option<oneshot::Receiver<()>>,
     #[cfg(test)]
+    publication_gate: Option<oneshot::Receiver<()>>,
+    #[cfg(test)]
     behavior: TestBehavior,
     #[cfg(test)]
     probe: Option<Arc<LifecycleProbe>>,
@@ -310,6 +337,8 @@ impl WriterOptions {
             shutdown_gate: None,
             #[cfg(test)]
             command_gate: None,
+            #[cfg(test)]
+            publication_gate: None,
             #[cfg(test)]
             behavior: TestBehavior::Normal,
             #[cfg(test)]
@@ -347,7 +376,9 @@ async fn run_writer(
         | TestBehavior::ExitBeforeShutdown
         | TestBehavior::PanicBeforeShutdown
         | TestBehavior::ExitWhileHandling
-        | TestBehavior::PanicWhileHandling => {}
+        | TestBehavior::PanicWhileHandling
+        | TestBehavior::FaultBeforePublicationSwap
+        | TestBehavior::FaultAfterPublicationSwap => {}
     }
 
     let _state = WriterState::initialize(&options);
@@ -364,7 +395,9 @@ async fn run_writer(
         | TestBehavior::ExitBeforeReadiness
         | TestBehavior::PanicBeforeReadiness
         | TestBehavior::ExitWhileHandling
-        | TestBehavior::PanicWhileHandling => {}
+        | TestBehavior::PanicWhileHandling
+        | TestBehavior::FaultBeforePublicationSwap
+        | TestBehavior::FaultAfterPublicationSwap => {}
     }
 
     writer_loop(options, ingress, &mut failure_guard).await
@@ -405,7 +438,9 @@ async fn writer_loop(
                     | TestBehavior::ExitBeforeReadiness
                     | TestBehavior::ExitBeforeShutdown
                     | TestBehavior::PanicBeforeReadiness
-                    | TestBehavior::PanicBeforeShutdown => {}
+                    | TestBehavior::PanicBeforeShutdown
+                    | TestBehavior::FaultBeforePublicationSwap
+                    | TestBehavior::FaultAfterPublicationSwap => {}
                 }
                 #[cfg(test)]
                 if let Some(probe) = &options.probe {
@@ -415,7 +450,28 @@ async fn writer_loop(
                         .expect("test handled-order probe should not be poisoned")
                         .push(work.test_tag());
                 }
-                (*work).finish_handled();
+                let Ok(preparation) = work.prepare_publication() else {
+                    return WriterExit::PublicationFault;
+                };
+                #[cfg(test)]
+                if let Some(publication_gate) = options.publication_gate.take()
+                    && publication_gate.await.is_err()
+                {
+                    return WriterExit::BeforeShutdown;
+                }
+                #[cfg(test)]
+                let fault_injection = match options.behavior {
+                    TestBehavior::FaultBeforePublicationSwap => {
+                        CompletionFaultInjection::BeforeSwap
+                    }
+                    TestBehavior::FaultAfterPublicationSwap => CompletionFaultInjection::AfterSwap,
+                    _ => CompletionFaultInjection::None,
+                };
+                #[cfg(not(test))]
+                let fault_injection = CompletionFaultInjection::None;
+                if !(*work).finish_handled(preparation, fault_injection) {
+                    return WriterExit::PublicationFault;
+                }
             }
             NextWork::Empty => notified.await,
             NextWork::Drained => {
@@ -535,19 +591,23 @@ enum TestBehavior {
     PanicBeforeShutdown,
     ExitWhileHandling,
     PanicWhileHandling,
+    FaultBeforePublicationSwap,
+    FaultAfterPublicationSwap,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        HistorianIngress, HistorianRuntime, IngressCommand, LifecycleProbe,
-        MAX_OUTSTANDING_COMMANDS, ReceiptOutcome, ShutdownError, StartError, SubmissionDisposition,
-        TestBehavior, TrySubmitErrorKind, WriterOptions,
+        HistorianIngress, HistorianRuntime, IngressCommand, LatestReadError, LifecycleProbe,
+        MAX_OUTSTANDING_COMMANDS, MAX_PUBLISHED_SERIES, ReceiptOutcome, ShutdownError, StartError,
+        SubmissionDisposition, TestBehavior, TrySubmitErrorKind, WriterOptions,
     };
     use och_core::{
-        CollectionEnvelope, CollectionMode, ContentFormat, ContentIdentity, ContentVersion, Gap,
-        GapReason, ProducerEpoch, ProducerId, ProducerSequence, RetryKey, RetryQualification,
-        SeriesId, SeriesMetadata,
+        CollectionEnvelope, CollectionMode, ContentFormat, ContentIdentity, ContentVersion,
+        ExactValue, Gap, GapReason, NativeStatus, NoChange, Observation, ObservationId,
+        ObservationTimes, ProducerEpoch, ProducerId, ProducerPosition, ProducerSequence, Quality,
+        QualityFlags, QualityLevel, RetryKey, RetryQualification, SeriesId, SeriesMetadata,
+        TimeInterval, Timestamp,
     };
     use std::future::{Future, poll_fn};
     use std::pin::Pin;
@@ -571,6 +631,7 @@ mod tests {
             initialization_gate: None,
             shutdown_gate: None,
             command_gate: None,
+            publication_gate: None,
             behavior,
             probe: Some(Arc::clone(probe)),
         }
@@ -590,6 +651,100 @@ mod tests {
 
     fn producer_id(tag: u8) -> ProducerId {
         ProducerId::from_bytes(uuid_bytes(tag)).expect("test producer identity should be UUIDv7")
+    }
+
+    fn observation_id(tag: u8) -> ObservationId {
+        ObservationId::from_bytes(uuid_bytes(tag))
+            .expect("test observation identity should be UUIDv7")
+    }
+
+    fn timestamp(seconds: i64) -> Timestamp {
+        Timestamp::new(seconds, 0).expect("test timestamp should be normalized")
+    }
+
+    fn position(epoch: u128, sequence: u128) -> ProducerPosition {
+        ProducerPosition::new(ProducerEpoch::new(epoch), ProducerSequence::new(sequence))
+    }
+
+    fn observation(
+        mode: CollectionMode,
+        tag: u8,
+        value: u64,
+        producer_position: Option<ProducerPosition>,
+        receive_seconds: i64,
+        effective_seconds: i64,
+    ) -> Observation {
+        let interval = (mode == CollectionMode::Interval).then(|| {
+            TimeInterval::new(
+                timestamp(effective_seconds),
+                timestamp(effective_seconds + 1),
+            )
+            .expect("test interval should be nonempty")
+        });
+        Observation::new(
+            observation_id(tag),
+            ExactValue::Unsigned(value),
+            ObservationTimes::new(
+                Some(timestamp(effective_seconds + 10)),
+                timestamp(receive_seconds),
+                timestamp(effective_seconds),
+            ),
+            Quality::new(QualityLevel::Unknown, QualityFlags::none()),
+            NativeStatus::absent(),
+            producer_position,
+            interval,
+        )
+    }
+
+    fn retry(series: &SeriesMetadata, key: &str, digest_tag: u8) -> RetryQualification {
+        RetryQualification::new(
+            series.series_id(),
+            series.producer_id(),
+            RetryKey::new(key.to_owned()).expect("test retry key should be valid"),
+            ContentIdentity::new(
+                ContentFormat::new("application/x-och-test".to_owned())
+                    .expect("test content format should be valid"),
+                ContentVersion::new(1),
+                [digest_tag; 32],
+            ),
+        )
+    }
+
+    fn envelope_command(envelope: CollectionEnvelope, key: &str, digest_tag: u8) -> IngressCommand {
+        let qualification = retry(envelope.series(), key, digest_tag);
+        IngressCommand::new(envelope, qualification).expect("test command scope should match")
+    }
+
+    fn observed_command(
+        series: SeriesMetadata,
+        observations: Vec<Observation>,
+        key: &str,
+        digest_tag: u8,
+    ) -> IngressCommand {
+        let envelope = CollectionEnvelope::observed(series, observations, Vec::new())
+            .expect("test observed envelope should be valid");
+        envelope_command(envelope, key, digest_tag)
+    }
+
+    fn positioned_command(
+        series_tag: u8,
+        producer_tag: u8,
+        mode: CollectionMode,
+        observation_tag: u8,
+        sequence: u128,
+        value: u64,
+        key: &str,
+    ) -> IngressCommand {
+        let series = SeriesMetadata::new(series_id(series_tag), producer_id(producer_tag), mode);
+        let observation = observation(
+            mode,
+            observation_tag,
+            value,
+            Some(position(1, sequence)),
+            i64::from(observation_tag),
+            i64::from(observation_tag),
+        );
+        observed_command(series, vec![observation], key, observation_tag)
     }
 
     fn model_parts(
@@ -752,14 +907,20 @@ mod tests {
             let runtime = complete_bounded(HistorianRuntime::start_with_options(writer_options))
                 .await
                 .expect("writer should start");
+            let read = runtime.read_handle();
             let mut shutdown = Box::pin(runtime.shutdown());
 
             assert!(poll_once(shutdown.as_mut()).await.is_pending());
             wait_until(|| probe.shutdown_received.load(Ordering::SeqCst) == 1).await;
+            let sealed_before_cancel = read
+                .snapshot()
+                .expect("drained registry is sealed while join remains gated");
             drop(shutdown);
             wait_until(|| probe.task_dropped.load(Ordering::SeqCst) == 1).await;
             assert_eq!(probe.normal_exits.load(Ordering::SeqCst), 0);
             assert_eq!(probe.state_dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(read.snapshot(), Err(LatestReadError::unavailable()));
+            assert!(sealed_before_cancel.is_empty());
         });
     }
 
@@ -773,8 +934,10 @@ mod tests {
             )))
             .await
             .expect("writer should start");
+            let read = runtime.read_handle();
 
             drop(runtime);
+            assert_eq!(read.snapshot(), Err(LatestReadError::unavailable()));
             wait_until(|| probe.task_dropped.load(Ordering::SeqCst) == 1).await;
             assert_eq!(probe.normal_exits.load(Ordering::SeqCst), 0);
             assert_eq!(probe.state_dropped.load(Ordering::SeqCst), 1);
@@ -800,10 +963,12 @@ mod tests {
             )))
             .await
             .expect("readiness should precede the injected exit");
+            let read = runtime.read_handle();
             let shutdown_error = complete_bounded(runtime.shutdown())
                 .await
                 .expect_err("premature writer exit must fail shutdown");
             assert_eq!(shutdown_error, ShutdownError::WriterExitedBeforeShutdown);
+            assert_eq!(read.snapshot(), Err(LatestReadError::unavailable()));
         });
     }
 
@@ -826,6 +991,7 @@ mod tests {
             )))
             .await
             .expect("writer should start");
+            let read = runtime.read_handle();
             runtime
                 .writer
                 .as_ref()
@@ -835,6 +1001,7 @@ mod tests {
                 .await
                 .expect_err("aborted writer must fail shutdown");
             assert_eq!(shutdown_error, ShutdownError::WriterTaskCancelled);
+            assert_eq!(read.snapshot(), Err(LatestReadError::unavailable()));
         });
     }
 
@@ -858,11 +1025,13 @@ mod tests {
             )))
             .await
             .expect("readiness should precede the injected panic");
+            let read = runtime.read_handle();
             let shutdown_error = complete_bounded(runtime.shutdown())
                 .await
                 .expect_err("writer panic must fail shutdown");
             assert_eq!(shutdown_error, ShutdownError::WriterTaskPanicked);
             assert!(!shutdown_error.to_string().contains("hostile"));
+            assert_eq!(read.snapshot(), Err(LatestReadError::unavailable()));
         });
     }
 
@@ -1384,6 +1553,7 @@ mod tests {
             )))
             .await
             .expect("early-exit writer should start");
+            let exit_read = exit_runtime.read_handle();
             let exit_receipt = exit_runtime
                 .ingress()
                 .try_submit(command("exit-hostile", 1, 0))
@@ -1397,6 +1567,7 @@ mod tests {
                 complete_bounded(exit_runtime.shutdown()).await,
                 Err(ShutdownError::WriterExitedBeforeShutdown)
             );
+            assert_eq!(exit_read.snapshot(), Err(LatestReadError::unavailable()));
 
             let panic_probe = Arc::new(LifecycleProbe::default());
             let panic_runtime = complete_bounded(HistorianRuntime::start_with_options(options(
@@ -1405,6 +1576,7 @@ mod tests {
             )))
             .await
             .expect("panic writer should report readiness first");
+            let panic_read = panic_runtime.read_handle();
             let panic_receipt = panic_runtime
                 .ingress()
                 .try_submit(command("panic-hostile", 2, 0))
@@ -1419,6 +1591,7 @@ mod tests {
                 .expect_err("writer panic must fail shutdown");
             assert_eq!(panic_error, ShutdownError::WriterTaskPanicked);
             assert!(!panic_error.to_string().contains("hostile"));
+            assert_eq!(panic_read.snapshot(), Err(LatestReadError::unavailable()));
         });
     }
 
@@ -1433,6 +1606,7 @@ mod tests {
                 complete_bounded(HistorianRuntime::start_with_options(cancel_options))
                     .await
                     .expect("cancel writer should start");
+            let cancel_read = cancel_runtime.read_handle();
             let cancel_receipt = cancel_runtime
                 .ingress()
                 .try_submit(command("cancel-hostile", 3, 0))
@@ -1452,6 +1626,7 @@ mod tests {
                 complete_bounded(cancel_runtime.shutdown()).await,
                 Err(ShutdownError::WriterTaskCancelled)
             );
+            assert_eq!(cancel_read.snapshot(), Err(LatestReadError::unavailable()));
         });
     }
 
@@ -1467,6 +1642,10 @@ mod tests {
                     .await
                     .expect("poison writer should start");
             let poison_ingress = poison_runtime.ingress();
+            let poison_read = poison_runtime.read_handle();
+            let old_snapshot = poison_read
+                .snapshot()
+                .expect("pre-poison snapshot should be available");
             let poison_receipt = poison_ingress
                 .try_submit(command("poison-hostile", 4, 0))
                 .expect("poison work should be accepted")
@@ -1478,6 +1657,8 @@ mod tests {
                 .expect_err("poison recovery must close admission");
             assert_eq!(poison_rejection.kind(), TrySubmitErrorKind::Closed);
             assert!(!format!("{poison_rejection:?}").contains("hostile"));
+            assert_eq!(poison_read.snapshot(), Err(LatestReadError::unavailable()));
+            assert!(old_snapshot.is_empty());
             assert_eq!(
                 complete_bounded(poison_receipt.wait()).await,
                 ReceiptOutcome::WriterStopped
@@ -1600,6 +1781,781 @@ mod tests {
                         .expect_err("stopped repeated ingress must stay closed")
                         .kind(),
                     TrySubmitErrorKind::Closed
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn readiness_exposes_empty_isolated_snapshots_and_drop_closes_reads() {
+        harness().block_on(async {
+            let first_probe = Arc::new(LifecycleProbe::default());
+            let second_probe = Arc::new(LifecycleProbe::default());
+            let first = complete_bounded(HistorianRuntime::start_with_options(options(
+                &first_probe,
+                TestBehavior::Normal,
+            )))
+            .await
+            .expect("first writer should start");
+            let second = complete_bounded(HistorianRuntime::start_with_options(options(
+                &second_probe,
+                TestBehavior::Normal,
+            )))
+            .await
+            .expect("second writer should start");
+            let first_read = first.read_handle();
+            let first_read_clone = first_read.clone();
+            let second_read = second.read_handle();
+
+            let first_empty = first_read
+                .snapshot()
+                .expect("ready registry should be available");
+            assert!(first_empty.is_empty());
+            assert_eq!(first_empty.len(), 0);
+            assert_eq!(first_empty.as_slice(), &[]);
+            assert_eq!(first_empty.iter().count(), 0);
+            assert!(second_read.snapshot().expect("second registry").is_empty());
+            assert_eq!(format!("{first_read:?}"), "LatestReadHandle { .. }");
+
+            let receipt = first
+                .ingress()
+                .try_submit(positioned_command(
+                    30,
+                    31,
+                    CollectionMode::Sampled,
+                    32,
+                    1,
+                    100,
+                    "isolated-latest",
+                ))
+                .expect("positioned command should queue")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(receipt.wait()).await,
+                ReceiptOutcome::WriterHandled
+            );
+            let published = first_read
+                .snapshot()
+                .expect("first snapshot should advance");
+            assert_eq!(published.len(), 1);
+            assert!(second_read.snapshot().expect("second snapshot").is_empty());
+
+            drop(first);
+            assert_eq!(first_read.snapshot(), Err(LatestReadError::unavailable()));
+            assert_eq!(
+                first_read_clone.snapshot(),
+                Err(LatestReadError::unavailable())
+            );
+            assert_eq!(published.len(), 1, "an acquired snapshot stays usable");
+            assert!(
+                first_empty.is_empty(),
+                "the old empty snapshot stays immutable"
+            );
+
+            complete_bounded(second.shutdown())
+                .await
+                .expect("second writer should seal independently");
+            assert!(second_read.snapshot().expect("sealed snapshot").is_empty());
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn producer_position_alone_selects_exact_observations_for_all_modes() {
+        harness().block_on(async {
+            let probe = Arc::new(LifecycleProbe::default());
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
+                &probe,
+                TestBehavior::Normal,
+            )))
+            .await
+            .expect("writer should start");
+            let ingress = runtime.ingress();
+            let read = runtime.read_handle();
+            let metadata =
+                SeriesMetadata::new(series_id(40), producer_id(41), CollectionMode::Sampled);
+            let timestamp_and_id_later = observation(
+                CollectionMode::Sampled,
+                250,
+                1,
+                Some(position(7, 10)),
+                20_000,
+                20_000,
+            );
+            let greatest_position = observation(
+                CollectionMode::Sampled,
+                1,
+                2,
+                Some(position(7, 11)),
+                -20_000,
+                -20_000,
+            );
+            let receipt = ingress
+                .try_submit(observed_command(
+                    metadata.clone(),
+                    vec![timestamp_and_id_later, greatest_position.clone()],
+                    "multi-position",
+                    1,
+                ))
+                .expect("multi-observation command should queue")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(receipt.wait()).await,
+                ReceiptOutcome::WriterHandled
+            );
+            let after_multi = read.snapshot().expect("multi snapshot should be readable");
+            let published = after_multi
+                .get(&metadata.series_id())
+                .expect("series should be published");
+            assert_eq!(published.series_metadata(), &metadata);
+            assert_eq!(published.observation(), &greatest_position);
+            assert_eq!(published.producer_position(), position(7, 11));
+            assert!(!format!("{published:?}").contains(&metadata.series_id().to_string()));
+
+            let equal = ingress
+                .try_submit(observed_command(
+                    metadata.clone(),
+                    vec![greatest_position.clone()],
+                    "equal-identical",
+                    2,
+                ))
+                .expect("equal-identical command should queue")
+                .into_receipt();
+            let stale = observation(
+                CollectionMode::Sampled,
+                255,
+                99,
+                Some(position(1, 1)),
+                30_000,
+                30_000,
+            );
+            let stale_receipt = ingress
+                .try_submit(observed_command(
+                    metadata.clone(),
+                    vec![stale],
+                    "stale-adversarial",
+                    3,
+                ))
+                .expect("stale command should queue")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(equal.wait()).await,
+                ReceiptOutcome::WriterHandled
+            );
+            assert_eq!(
+                complete_bounded(stale_receipt.wait()).await,
+                ReceiptOutcome::WriterHandled
+            );
+            assert_eq!(
+                read.snapshot()
+                    .expect("no-op snapshot")
+                    .get(&metadata.series_id())
+                    .expect("series should remain")
+                    .observation(),
+                &greatest_position
+            );
+
+            let old_snapshot = read.snapshot().expect("old snapshot should capture");
+            let greater = observation(
+                CollectionMode::Sampled,
+                0,
+                3,
+                Some(position(7, 12)),
+                -30_000,
+                -30_000,
+            );
+            let greater_receipt = ingress
+                .try_submit(observed_command(
+                    metadata.clone(),
+                    vec![greater.clone()],
+                    "greater-adversarial",
+                    4,
+                ))
+                .expect("greater command should queue")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(greater_receipt.wait()).await,
+                ReceiptOutcome::WriterHandled
+            );
+            assert_eq!(
+                read.snapshot()
+                    .expect("advance must be visible after receipt")
+                    .get(&metadata.series_id())
+                    .expect("series should remain")
+                    .observation(),
+                &greater
+            );
+            assert_eq!(
+                old_snapshot
+                    .get(&metadata.series_id())
+                    .expect("old snapshot should retain series")
+                    .observation(),
+                &greatest_position,
+                "held snapshots never change"
+            );
+
+            let modes = [
+                CollectionMode::Sampled,
+                CollectionMode::ChangeOnly,
+                CollectionMode::Cumulative,
+                CollectionMode::Interval,
+                CollectionMode::Event,
+            ];
+            for (index, mode) in modes.into_iter().enumerate() {
+                let tag = u8::try_from(50 + index).expect("mode tag should fit");
+                let receipt = ingress
+                    .try_submit(positioned_command(
+                        tag,
+                        tag + 10,
+                        mode,
+                        tag + 20,
+                        1,
+                        u64::from(tag),
+                        &format!("mode-{index}"),
+                    ))
+                    .expect("each mode should queue")
+                    .into_receipt();
+                assert_eq!(
+                    complete_bounded(receipt.wait()).await,
+                    ReceiptOutcome::WriterHandled
+                );
+                let snapshot = read.snapshot().expect("mode snapshot should be available");
+                let entry = snapshot
+                    .get(&series_id(tag))
+                    .expect("positioned mode should publish");
+                assert_eq!(entry.series_metadata().collection_mode(), mode);
+                assert_eq!(
+                    entry.observation().producer_position(),
+                    Some(position(1, 1))
+                );
+            }
+
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("mode runtime should shut down");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ineligible_evidence_neither_binds_metadata_nor_consumes_capacity() {
+        harness().block_on(async {
+            let probe = Arc::new(LifecycleProbe::default());
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
+                &probe,
+                TestBehavior::Normal,
+            )))
+            .await
+            .expect("writer should start");
+            let ingress = runtime.ingress();
+            let read = runtime.read_handle();
+            let nominal = series_id(70);
+
+            let gap_metadata =
+                SeriesMetadata::new(nominal, producer_id(71), CollectionMode::Sampled);
+            let gap = Gap::new(
+                ProducerEpoch::new(0),
+                ProducerSequence::new(1),
+                ProducerSequence::new(2),
+                GapReason::Unknown,
+            )
+            .expect("test gap should be nonempty");
+            let gap_only = CollectionEnvelope::observed(gap_metadata, Vec::new(), vec![gap])
+                .expect("gap-only envelope should be valid");
+            let unpositioned_metadata =
+                SeriesMetadata::new(nominal, producer_id(72), CollectionMode::Event);
+            let unpositioned = CollectionEnvelope::observed(
+                unpositioned_metadata,
+                vec![observation(CollectionMode::Event, 73, 1, None, 1, 1)],
+                Vec::new(),
+            )
+            .expect("unpositioned envelope should be valid");
+            let no_change_metadata =
+                SeriesMetadata::new(nominal, producer_id(74), CollectionMode::ChangeOnly);
+            let no_change = CollectionEnvelope::no_change(
+                no_change_metadata,
+                NoChange::new(
+                    TimeInterval::new(timestamp(0), timestamp(1))
+                        .expect("no-change interval should be nonempty"),
+                ),
+            )
+            .expect("no-change envelope should be valid");
+
+            for (index, envelope) in [gap_only, unpositioned, no_change].into_iter().enumerate() {
+                let receipt = ingress
+                    .try_submit(envelope_command(
+                        envelope,
+                        &format!("ineligible-{index}"),
+                        u8::try_from(index).expect("index should fit"),
+                    ))
+                    .expect("ineligible evidence should queue")
+                    .into_receipt();
+                assert_eq!(
+                    complete_bounded(receipt.wait()).await,
+                    ReceiptOutcome::WriterHandled
+                );
+                assert!(
+                    read.snapshot()
+                        .expect("snapshot should stay available")
+                        .is_empty()
+                );
+            }
+
+            let bound_metadata =
+                SeriesMetadata::new(nominal, producer_id(75), CollectionMode::Cumulative);
+            let bound_observation = observation(
+                CollectionMode::Cumulative,
+                76,
+                10,
+                Some(position(3, 1)),
+                1,
+                1,
+            );
+            let bind = ingress
+                .try_submit(observed_command(
+                    bound_metadata.clone(),
+                    vec![bound_observation.clone()],
+                    "bind-after-ineligible",
+                    10,
+                ))
+                .expect("first eligible metadata should bind")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(bind.wait()).await,
+                ReceiptOutcome::WriterHandled
+            );
+
+            let later_mismatch =
+                SeriesMetadata::new(nominal, producer_id(77), CollectionMode::Event);
+            let later_gap = Gap::new(
+                ProducerEpoch::new(0),
+                ProducerSequence::new(5),
+                ProducerSequence::new(6),
+                GapReason::Unknown,
+            )
+            .expect("later gap should be nonempty");
+            let mismatch_noop =
+                CollectionEnvelope::observed(later_mismatch, Vec::new(), vec![later_gap])
+                    .expect("mismatched gap-only evidence should be valid");
+            let mismatch_receipt = ingress
+                .try_submit(envelope_command(mismatch_noop, "mismatch-noop", 11))
+                .expect("ineligible mismatch should queue")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(mismatch_receipt.wait()).await,
+                ReceiptOutcome::WriterHandled
+            );
+            let snapshot = read
+                .snapshot()
+                .expect("bound snapshot should remain available");
+            assert_eq!(snapshot.len(), 1);
+            let entry = snapshot
+                .get(&nominal)
+                .expect("eligible metadata should bind");
+            assert_eq!(entry.series_metadata(), &bound_metadata);
+            assert_eq!(entry.observation(), &bound_observation);
+
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("ineligible runtime should shut down");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn equal_conflict_and_each_metadata_mismatch_fail_closed() {
+        harness().block_on(async {
+            let equal_probe = Arc::new(LifecycleProbe::default());
+            let equal_runtime = complete_bounded(HistorianRuntime::start_with_options(options(
+                &equal_probe,
+                TestBehavior::Normal,
+            )))
+            .await
+            .expect("equal-conflict writer should start");
+            let equal_ingress = equal_runtime.ingress();
+            let equal_read = equal_runtime.read_handle();
+            let metadata =
+                SeriesMetadata::new(series_id(80), producer_id(81), CollectionMode::Sampled);
+            let original = observation(CollectionMode::Sampled, 82, 1, Some(position(1, 9)), 1, 1);
+            let seed = equal_ingress
+                .try_submit(observed_command(
+                    metadata.clone(),
+                    vec![original.clone()],
+                    "equal-seed",
+                    1,
+                ))
+                .expect("seed should queue")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(seed.wait()).await,
+                ReceiptOutcome::WriterHandled
+            );
+            let old = equal_read
+                .snapshot()
+                .expect("seed snapshot should be readable");
+            let different = observation(CollectionMode::Sampled, 83, 2, Some(position(1, 9)), 2, 2);
+            let conflict = equal_ingress
+                .try_submit(observed_command(
+                    metadata.clone(),
+                    vec![different],
+                    "equal-conflict",
+                    2,
+                ))
+                .expect("conflict reaches publication decision")
+                .into_receipt();
+            let unresolved = equal_ingress
+                .try_submit(positioned_command(
+                    84,
+                    85,
+                    CollectionMode::Event,
+                    86,
+                    1,
+                    3,
+                    "after-conflict",
+                ))
+                .expect("work queued behind the fault should be accepted")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(conflict.wait()).await,
+                ReceiptOutcome::WriterStopped
+            );
+            assert_eq!(
+                complete_bounded(unresolved.wait()).await,
+                ReceiptOutcome::WriterStopped
+            );
+            assert_eq!(equal_read.snapshot(), Err(LatestReadError::unavailable()));
+            assert_eq!(
+                old.get(&metadata.series_id())
+                    .expect("old snapshot remains valid")
+                    .observation(),
+                &original
+            );
+            assert_eq!(
+                complete_bounded(equal_runtime.shutdown()).await,
+                Err(ShutdownError::WriterExitedBeforeShutdown)
+            );
+
+            for (index, conflicting_metadata) in [
+                SeriesMetadata::new(series_id(90), producer_id(92), CollectionMode::Sampled),
+                SeriesMetadata::new(series_id(90), producer_id(91), CollectionMode::Event),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let probe = Arc::new(LifecycleProbe::default());
+                let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
+                    &probe,
+                    TestBehavior::Normal,
+                )))
+                .await
+                .expect("metadata-conflict writer should start");
+                let ingress = runtime.ingress();
+                let read = runtime.read_handle();
+                let bound =
+                    SeriesMetadata::new(series_id(90), producer_id(91), CollectionMode::Sampled);
+                let seed = ingress
+                    .try_submit(observed_command(
+                        bound,
+                        vec![observation(
+                            CollectionMode::Sampled,
+                            93,
+                            1,
+                            Some(position(1, 1)),
+                            1,
+                            1,
+                        )],
+                        &format!("metadata-seed-{index}"),
+                        3,
+                    ))
+                    .expect("metadata seed should queue")
+                    .into_receipt();
+                assert_eq!(
+                    complete_bounded(seed.wait()).await,
+                    ReceiptOutcome::WriterHandled
+                );
+                let mode = conflicting_metadata.collection_mode();
+                let fault = ingress
+                    .try_submit(observed_command(
+                        conflicting_metadata,
+                        vec![observation(mode, 94, 2, Some(position(1, 2)), 2, 2)],
+                        &format!("metadata-conflict-{index}"),
+                        4,
+                    ))
+                    .expect("eligible mismatch should reach publication")
+                    .into_receipt();
+                assert_eq!(
+                    complete_bounded(fault.wait()).await,
+                    ReceiptOutcome::WriterStopped
+                );
+                assert_eq!(read.snapshot(), Err(LatestReadError::unavailable()));
+                assert_eq!(
+                    complete_bounded(runtime.shutdown()).await,
+                    Err(ShutdownError::WriterExitedBeforeShutdown)
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fixed_series_capacity_allows_existing_and_ineligible_work_then_faults() {
+        harness().block_on(async {
+            let probe = Arc::new(LifecycleProbe::default());
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
+                &probe,
+                TestBehavior::Normal,
+            )))
+            .await
+            .expect("capacity writer should start");
+            let ingress = runtime.ingress();
+            let read = runtime.read_handle();
+            assert_eq!(MAX_PUBLISHED_SERIES, 16);
+            assert_eq!(MAX_OUTSTANDING_COMMANDS, 16);
+
+            for index in 0..MAX_PUBLISHED_SERIES {
+                let tag = u8::try_from(index + 1).expect("series index should fit");
+                let receipt = ingress
+                    .try_submit(positioned_command(
+                        tag,
+                        tag + 32,
+                        CollectionMode::Sampled,
+                        tag + 64,
+                        1,
+                        u64::from(tag),
+                        &format!("capacity-{index}"),
+                    ))
+                    .expect("bounded series should queue")
+                    .into_receipt();
+                assert_eq!(
+                    complete_bounded(receipt.wait()).await,
+                    ReceiptOutcome::WriterHandled
+                );
+            }
+            assert_eq!(read.snapshot().expect("full snapshot").len(), 16);
+
+            let update = ingress
+                .try_submit(positioned_command(
+                    1,
+                    33,
+                    CollectionMode::Sampled,
+                    100,
+                    2,
+                    999,
+                    "capacity-update",
+                ))
+                .expect("existing series may update at capacity")
+                .into_receipt();
+            let stale = ingress
+                .try_submit(positioned_command(
+                    2,
+                    34,
+                    CollectionMode::Sampled,
+                    101,
+                    0,
+                    888,
+                    "capacity-stale",
+                ))
+                .expect("existing stale series may no-op at capacity")
+                .into_receipt();
+            let new_metadata =
+                SeriesMetadata::new(series_id(17), producer_id(49), CollectionMode::Sampled);
+            let ineligible_gap = Gap::new(
+                ProducerEpoch::new(0),
+                ProducerSequence::new(5),
+                ProducerSequence::new(6),
+                GapReason::Unknown,
+            )
+            .expect("capacity gap should be nonempty");
+            let ineligible = ingress
+                .try_submit(envelope_command(
+                    CollectionEnvelope::observed(new_metadata, Vec::new(), vec![ineligible_gap])
+                        .expect("capacity gap-only envelope should be valid"),
+                    "capacity-ineligible",
+                    5,
+                ))
+                .expect("new ineligible series remains valid at capacity")
+                .into_receipt();
+            for receipt in [update, stale, ineligible] {
+                assert_eq!(
+                    complete_bounded(receipt.wait()).await,
+                    ReceiptOutcome::WriterHandled
+                );
+            }
+            let before_fault = read.snapshot().expect("capacity view should be readable");
+            assert_eq!(before_fault.len(), 16);
+            assert_eq!(
+                before_fault
+                    .get(&series_id(1))
+                    .expect("updated series remains")
+                    .producer_position(),
+                position(1, 2)
+            );
+            assert!(before_fault.get(&series_id(17)).is_none());
+
+            let overflow = ingress
+                .try_submit(positioned_command(
+                    17,
+                    49,
+                    CollectionMode::Sampled,
+                    102,
+                    1,
+                    17,
+                    "capacity-overflow",
+                ))
+                .expect("seventeenth eligible command is admitted before publication")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(overflow.wait()).await,
+                ReceiptOutcome::WriterStopped
+            );
+            assert_eq!(read.snapshot(), Err(LatestReadError::unavailable()));
+            assert_eq!(before_fault.len(), 16);
+            assert!(before_fault.get(&series_id(17)).is_none());
+            assert_eq!(
+                ingress
+                    .try_submit(command("closed-after-capacity", 9, 0))
+                    .expect_err("publication fault closes ingress")
+                    .kind(),
+                TrySubmitErrorKind::Closed
+            );
+            assert_eq!(
+                complete_bounded(runtime.shutdown()).await,
+                Err(ShutdownError::WriterExitedBeforeShutdown)
+            );
+        });
+    }
+
+    #[test]
+    fn publication_gate_coalescing_and_graceful_seal_preserve_atomic_ordering() {
+        harness().block_on(async {
+            let probe = Arc::new(LifecycleProbe::default());
+            let (open_publication, publication_gate) = oneshot::channel();
+            let mut writer_options = options(&probe, TestBehavior::Normal);
+            writer_options.publication_gate = Some(publication_gate);
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(writer_options))
+                .await
+                .expect("gated writer should start");
+            let ingress = runtime.ingress();
+            let read = runtime.read_handle();
+            let dropped_read_clone = read.clone();
+            let metadata =
+                SeriesMetadata::new(series_id(110), producer_id(111), CollectionMode::Event);
+            let admitted = observation(CollectionMode::Event, 112, 1, Some(position(2, 1)), 1, 1);
+            let first = ingress
+                .try_submit(observed_command(
+                    metadata.clone(),
+                    vec![admitted.clone()],
+                    "publication-storm",
+                    7,
+                ))
+                .expect("first positioned command should queue");
+            assert_eq!(first.disposition(), SubmissionDisposition::Queued);
+            let first_receipt = first.into_receipt();
+            for index in 0..1_024_u64 {
+                let tag = u8::try_from(index % 100 + 120).expect("storm tag should fit");
+                let duplicate = ingress
+                    .try_submit(observed_command(
+                        metadata.clone(),
+                        vec![observation(
+                            CollectionMode::Event,
+                            tag,
+                            index + 10,
+                            Some(position(9, u128::from(index) + 10)),
+                            9,
+                            9,
+                        )],
+                        "publication-storm",
+                        7,
+                    ))
+                    .expect("equivalent retry should coalesce");
+                assert_eq!(duplicate.disposition(), SubmissionDisposition::Coalesced);
+                assert!(first_receipt.shares_state_with(&duplicate.into_receipt()));
+            }
+            assert_eq!(ingress.test_counts(), (1, 1, 0));
+            wait_until(|| probe.commands_started.load(Ordering::SeqCst) == 1).await;
+            assert_eq!(ingress.test_counts(), (1, 0, 1));
+
+            let old = read.snapshot().expect("old view should be available");
+            assert!(old.is_empty(), "publication gate precedes atomic swap");
+            let mut pending = Box::pin(first_receipt.clone().wait());
+            assert!(poll_once(pending.as_mut()).await.is_pending());
+            drop(dropped_read_clone);
+            open_publication
+                .send(())
+                .expect("publication gate should open");
+            assert_eq!(
+                complete_bounded(pending).await,
+                ReceiptOutcome::WriterHandled
+            );
+            let after_receipt = read
+                .snapshot()
+                .expect("advance must precede handled receipt visibility");
+            assert_eq!(after_receipt.len(), 1);
+            let entry = after_receipt
+                .get(&metadata.series_id())
+                .expect("first admitted observation should publish");
+            assert_eq!(entry.observation(), &admitted);
+            assert_eq!(entry.producer_position(), position(2, 1));
+            assert!(old.is_empty(), "old snapshot remains immutable");
+
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("graceful shutdown should seal the final view");
+            let sealed = read
+                .snapshot()
+                .expect("read handle should outlive shutdown");
+            assert_eq!(sealed, after_receipt);
+        });
+    }
+
+    #[test]
+    fn injected_pre_and_post_swap_faults_never_expose_candidate_snapshots() {
+        harness().block_on(async {
+            for behavior in [
+                TestBehavior::FaultBeforePublicationSwap,
+                TestBehavior::FaultAfterPublicationSwap,
+            ] {
+                let probe = Arc::new(LifecycleProbe::default());
+                let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
+                    &probe, behavior,
+                )))
+                .await
+                .expect("fault-injected writer should start");
+                let read = runtime.read_handle();
+                let old = read
+                    .snapshot()
+                    .expect("pre-fault snapshot should be available");
+                let receipt = runtime
+                    .ingress()
+                    .try_submit(positioned_command(
+                        200,
+                        201,
+                        CollectionMode::Cumulative,
+                        202,
+                        1,
+                        1,
+                        "injected-publication-fault",
+                    ))
+                    .expect("faulting command should queue")
+                    .into_receipt();
+                assert_eq!(
+                    complete_bounded(receipt.wait()).await,
+                    ReceiptOutcome::WriterStopped
+                );
+                let error = read
+                    .snapshot()
+                    .expect_err("future snapshots must be unavailable");
+                assert_eq!(error, LatestReadError::unavailable());
+                assert_eq!(format!("{error:?}"), "LatestReadError");
+                assert_eq!(
+                    error.to_string(),
+                    "latest observation snapshot is unavailable"
+                );
+                assert!(!error.to_string().contains("injected"));
+                assert!(old.is_empty(), "old snapshots remain valid after faults");
+                assert_eq!(
+                    complete_bounded(runtime.shutdown()).await,
+                    Err(ShutdownError::WriterExitedBeforeShutdown)
                 );
             }
         });

@@ -5,14 +5,16 @@ These instructions apply to the entire repository.
 ## Current authority boundary
 
 This workspace proves the M00 foundation, dependency-free canonical Historian
-model, independent M00-PR03 evidence, the M01-PR01 caller-executor lifecycle, and
-the M01-PR02 bounded volatile ingress. `och-core` remains frozen and owns reviewed
-identity, exact value/content, time, quality/status, producer ordering, collection,
-gap/no-change, envelope, and retry-comparison semantics. `och-runtime` owns one
-private writer task per instance, readiness, a fixed 16-command admission window,
-outstanding-only retry coalescing, shared terminal receipts, graceful drain/join,
-and abort-only Drop. It has no persistence, registry/latest publication, snapshot,
-query, storage, restart recovery, wire, or adapter behavior.
+model, independent M00-PR03 evidence, the M01-PR01 caller-executor lifecycle,
+M01-PR02 bounded volatile ingress, and M01-PR03 volatile latest-observation
+publication. `och-core` remains frozen and owns reviewed identity, exact
+value/content, time, quality/status, producer ordering, collection, gap/no-change,
+envelope, and retry-comparison semantics. `och-runtime` owns one private writer
+task per instance, readiness, a fixed 16-command admission window, outstanding-only
+retry coalescing, shared terminal receipts, a separately fixed 16-series volatile
+registry, immutable snapshots, graceful drain/seal/join, and abort-only Drop. It
+has no persistence, durable history, query, storage, restart recovery, wire, or
+adapter behavior; published observations never imply current or held values.
 
 The ignored `_roadmap/` directory is local and unpublished. Do not read, edit,
 stage, copy, summarize, or publish it. Do not read PDF files. Preserve unrelated

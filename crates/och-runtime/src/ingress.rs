@@ -1,3 +1,7 @@
+use crate::latest::{
+    LatestReadError, LatestSnapshot, LatestState, PreparedPublication, PublicationFault,
+    PublishedObservation,
+};
 use och_core::{CollectionEnvelope, RetryClassification, RetryQualification};
 use std::error::Error;
 use std::fmt;
@@ -43,6 +47,16 @@ impl IngressCommand {
     #[must_use]
     pub fn into_parts(self) -> (CollectionEnvelope, RetryQualification) {
         (self.envelope, self.retry)
+    }
+
+    fn publication_candidate(&self) -> Option<PublishedObservation> {
+        let observation = self.envelope.observations().last()?;
+        let position = observation.producer_position()?;
+        Some(PublishedObservation::new(
+            self.envelope.series().clone(),
+            observation.clone(),
+            position,
+        ))
     }
 }
 
@@ -252,9 +266,10 @@ impl Error for TrySubmitError {}
 /// The terminal result shared by all receipts for one accepted work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiptOutcome {
-    /// The private writer consumed and dropped the volatile command.
+    /// The private writer consumed the command and completed publication decision.
     ///
-    /// This does not mean persisted, durable, published, queryable, or restart-safe.
+    /// Some handled commands are ineligible or stale no-ops. This outcome does not
+    /// mean persisted, durable, still retained, queryable, or restart-safe.
     WriterHandled,
     /// The writer stopped before handling the command.
     WriterStopped,
@@ -531,7 +546,11 @@ impl IngressShared {
 
         if state.closed {
             if state.active_count() == 0 {
-                NextWork::Drained
+                if state.latest.seal() {
+                    NextWork::Drained
+                } else {
+                    NextWork::Failed
+                }
             } else {
                 let notifications = state.stop_all();
                 drop(state);
@@ -544,12 +563,70 @@ impl IngressShared {
         }
     }
 
-    fn complete(
+    pub(crate) fn latest_snapshot(&self) -> Result<LatestSnapshot, LatestReadError> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                let notifications = state.stop_all();
+                drop(state);
+                notifications.wake();
+                self.notify.notify_one();
+                return Err(LatestReadError::unavailable());
+            }
+        };
+        let snapshot = state.latest.snapshot();
+        drop(state);
+        snapshot.ok_or_else(LatestReadError::unavailable)
+    }
+
+    fn prepare_publication(
         &self,
         slot_index: usize,
-        outcome: ReceiptOutcome,
+        candidate: Option<PublishedObservation>,
+    ) -> Result<PreparedPublication, PublicationFault> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                let notifications = state.stop_all();
+                drop(state);
+                notifications.wake();
+                self.notify.notify_one();
+                return Err(PublicationFault);
+            }
+        };
+        let slot_is_in_flight = state
+            .slots
+            .get(slot_index)
+            .and_then(Option::as_ref)
+            .is_some_and(|slot| slot.phase == SlotPhase::InFlight);
+        let plan = if slot_is_in_flight {
+            state.latest.plan(candidate)
+        } else {
+            Err(PublicationFault)
+        };
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(fault) => {
+                let notifications = state.stop_all();
+                drop(state);
+                notifications.wake();
+                self.notify.notify_one();
+                return Err(fault);
+            }
+        };
+        drop(state);
+        Ok(plan.stage())
+    }
+
+    fn complete_handled(
+        &self,
+        slot_index: usize,
         mut command: Option<IngressCommand>,
-    ) {
+        preparation: PreparedPublication,
+        fault_injection: CompletionFaultInjection,
+    ) -> bool {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
@@ -559,29 +636,48 @@ impl IngressShared {
                 drop(command.take());
                 notifications.wake();
                 self.notify.notify_one();
-                return;
+                return false;
             }
         };
-        let Some(slot) = state.slots.get_mut(slot_index).and_then(Option::take) else {
-            drop(state);
-            drop(command.take());
-            return;
-        };
-        if slot.phase != SlotPhase::InFlight {
-            state.slots[slot_index] = Some(slot);
+        let slot_is_in_flight = state
+            .slots
+            .get(slot_index)
+            .and_then(Option::as_ref)
+            .is_some_and(|slot| slot.phase == SlotPhase::InFlight);
+        if !slot_is_in_flight
+            || !state.latest.can_complete(&preparation)
+            || fault_injection == CompletionFaultInjection::BeforeSwap
+        {
             let notifications = state.stop_all();
             drop(state);
             drop(command.take());
             notifications.wake();
             self.notify.notify_one();
-            return;
+            return false;
         }
-        // Destroy the volatile command while its slot is still protected, then
-        // single-assign terminal state and release the key in the same critical
-        // section. Runtime stop therefore linearizes wholly before or after
-        // handling; it cannot turn already-handled work into WriterStopped.
+
+        // The candidate snapshot was built outside this critical section. Drop
+        // the command, swap the whole immutable view, assign the receipt, and
+        // release its retry key under the one state authority. A reader can
+        // therefore observe neither a partial view nor handled-before-published.
         drop(command.take());
-        if !slot.terminal.resolve(outcome) {
+        state.latest.commit(preparation);
+        if fault_injection == CompletionFaultInjection::AfterSwap {
+            let notifications = state.stop_all();
+            drop(state);
+            notifications.wake();
+            self.notify.notify_one();
+            return false;
+        }
+
+        let Some(slot) = state.slots.get_mut(slot_index).and_then(Option::take) else {
+            let notifications = state.stop_all();
+            drop(state);
+            notifications.wake();
+            self.notify.notify_one();
+            return false;
+        };
+        if !slot.terminal.resolve(ReceiptOutcome::WriterHandled) {
             let terminal = Arc::clone(&slot.terminal);
             state.slots[slot_index] = Some(slot);
             let notifications = state.stop_all();
@@ -589,11 +685,12 @@ impl IngressShared {
             notifications.wake();
             terminal.notify.notify_waiters();
             self.notify.notify_one();
-            return;
+            return false;
         }
         let terminal = slot.terminal;
         drop(state);
         terminal.notify.notify_waiters();
+        true
     }
 
     #[cfg(test)]
@@ -639,14 +736,30 @@ pub(crate) struct InFlightCommand {
 }
 
 impl InFlightCommand {
-    pub(crate) fn finish_handled(mut self) {
-        if let Some(shared) = self.shared.take() {
-            shared.complete(
+    pub(crate) fn prepare_publication(&self) -> Result<PreparedPublication, PublicationFault> {
+        let candidate = self
+            .command
+            .as_ref()
+            .and_then(IngressCommand::publication_candidate);
+        self.shared
+            .as_ref()
+            .ok_or(PublicationFault)?
+            .prepare_publication(self.slot_index, candidate)
+    }
+
+    pub(crate) fn finish_handled(
+        mut self,
+        preparation: PreparedPublication,
+        fault_injection: CompletionFaultInjection,
+    ) -> bool {
+        self.shared.take().is_some_and(|shared| {
+            shared.complete_handled(
                 self.slot_index,
-                ReceiptOutcome::WriterHandled,
                 self.command.take(),
-            );
-        }
+                preparation,
+                fault_injection,
+            )
+        })
     }
 
     #[cfg(test)]
@@ -663,13 +776,17 @@ impl InFlightCommand {
 impl Drop for InFlightCommand {
     fn drop(&mut self) {
         if let Some(shared) = self.shared.take() {
-            shared.complete(
-                self.slot_index,
-                ReceiptOutcome::WriterStopped,
-                self.command.take(),
-            );
+            drop(self.command.take());
+            shared.stop();
         }
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum CompletionFaultInjection {
+    None,
+    BeforeSwap,
+    AfterSwap,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -689,6 +806,7 @@ struct IngressState {
     closed: bool,
     slots: Vec<Option<Slot>>,
     queue: FixedQueue,
+    latest: LatestState,
 }
 
 impl IngressState {
@@ -699,6 +817,7 @@ impl IngressState {
             closed: false,
             slots,
             queue: FixedQueue::new(),
+            latest: LatestState::new(),
         }
     }
 
@@ -708,6 +827,7 @@ impl IngressState {
 
     fn stop_all(&mut self) -> TerminalNotifications {
         self.closed = true;
+        self.latest.make_unavailable();
         self.queue.clear();
         let mut notifications = TerminalNotifications::new();
         for slot in &mut self.slots {
