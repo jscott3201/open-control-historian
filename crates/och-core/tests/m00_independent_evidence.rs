@@ -5,6 +5,8 @@
 mod fixtures;
 #[path = "m00_independent_evidence/oracle.rs"]
 mod oracle;
+#[path = "m00_independent_evidence/series_oracle.rs"]
+mod series_oracle;
 
 use fixtures::{
     ConstructorCase, RawEnvelope, RawError, RawEvidence, RawGap, RawMode, RawObservation, RawRetry,
@@ -12,17 +14,20 @@ use fixtures::{
 };
 use och_core::{
     ArtifactId, ArtifactReference, CollectionEnvelope, CollectionMode, ContentFormat,
-    ContentIdentity, ContentVersion, EvidenceKind, ExactText, ExactValue, Gap, GapReason,
-    ModelError, NativeStatus, NativeStatusToken, NoChange, Observation, ObservationId,
-    ObservationTimes, ProducerEpoch, ProducerId, ProducerPosition, ProducerSequence, Quality,
-    QualityFlags, QualityLevel, RealBits, RetryClassification, RetryKey, RetryQualification,
-    SeriesId, SeriesMetadata, StateClass, StateMember, StateValue, TimeInterval, Timestamp,
-    Unavailable, UnavailableReason,
+    ContentIdentity, ContentVersion, DeclarationEvidence, DeclarationReference,
+    DeclarationRevision, EvidenceKind, ExactText, ExactValue, Gap, GapReason, ModelError,
+    NativeStatus, NativeStatusToken, NoChange, Observation, ObservationId, ObservationTimes,
+    ProducerEpoch, ProducerId, ProducerPosition, ProducerSequence, Quality, QualityFlags,
+    QualityLevel, QuantityEvidence, RealBits, RetryClassification, RetryKey, RetryQualification,
+    SeriesBinding, SeriesDeclarationPayload, SeriesId, SeriesMetadata, SeriesRegistry,
+    SeriesRegistryLimits, SourceReference, StateClass, StateMember, StateValue, StoreId,
+    TimeInterval, Timestamp, Unavailable, UnavailableReason, UnitEvidence, ValueFamily,
 };
 use std::collections::BTreeSet;
 
 const FIXTURE_SOURCE: &str = include_str!("m00_independent_evidence/fixtures.rs");
 const ORACLE_SOURCE: &str = include_str!("m00_independent_evidence/oracle.rs");
+const SERIES_ORACLE_SOURCE: &str = include_str!("m00_independent_evidence/series_oracle.rs");
 const IDENTITY_SOURCE: &str = include_str!("../src/identity.rs");
 const GOLDEN: &str = include_str!("fixtures/m00-pr03-evidence-v1.txt");
 
@@ -148,7 +153,441 @@ const fn error_code(error: ModelError) -> RawError {
         ModelError::MissingObservationInterval => RawError::MissingObservationInterval,
         ModelError::UnexpectedObservationInterval => RawError::UnexpectedObservationInterval,
         ModelError::InvalidNoChangeMode => RawError::InvalidNoChangeMode,
+        ModelError::InvalidDeclarationReference => RawError::InvalidDeclarationReference,
+        ModelError::InvalidDeclarationRevision => RawError::InvalidDeclarationRevision,
+        ModelError::RegistrySeriesCapacityExceeded => RawError::RegistrySeriesCapacityExceeded,
+        ModelError::RegistryRevisionCapacityExceeded => RawError::RegistryRevisionCapacityExceeded,
+        ModelError::SeriesAlreadyRegistered => RawError::SeriesAlreadyRegistered,
+        ModelError::SeriesNotFound => RawError::SeriesNotFound,
+        ModelError::SeriesRetired => RawError::SeriesRetired,
+        ModelError::StaleDeclarationRevision => RawError::StaleDeclarationRevision,
+        ModelError::DeclarationUnchanged => RawError::DeclarationUnchanged,
+        ModelError::SeriesMetadataMismatch => RawError::SeriesMetadataMismatch,
+        ModelError::ObservationValueFamilyMismatch => RawError::ObservationValueFamilyMismatch,
     }
+}
+
+fn series_number(series_id: SeriesId) -> u8 {
+    series_id.into_bytes()[15]
+}
+
+fn producer_number(producer_id: ProducerId) -> u8 {
+    producer_id.into_bytes()[15]
+}
+
+fn actual_store() -> StoreId {
+    StoreId::from_bytes(fixtures::uuid_bytes(100)).expect("valid raw store UUIDv7")
+}
+
+fn actual_series_id(number: u8) -> SeriesId {
+    SeriesId::from_bytes(fixtures::uuid_bytes(u64::from(number))).expect("valid raw series UUIDv7")
+}
+
+fn actual_producer_id(number: u8) -> ProducerId {
+    ProducerId::from_bytes(fixtures::uuid_bytes(u64::from(number)))
+        .expect("valid raw producer UUIDv7")
+}
+
+fn actual_declaration_reference(value: String) -> DeclarationReference {
+    DeclarationReference::new(value).expect("valid raw declaration reference")
+}
+
+fn actual_series_binding(code: u8) -> SeriesBinding {
+    SeriesBinding::new(SourceReference::new(
+        actual_declaration_reference("provider".to_owned()),
+        actual_declaration_reference(format!("binding-{code}")),
+    ))
+}
+
+const fn actual_series_mode(code: u8) -> CollectionMode {
+    match code {
+        1 => CollectionMode::Sampled,
+        2 => CollectionMode::ChangeOnly,
+        3 => CollectionMode::Event,
+        _ => panic!("raw fixture uses a closed collection-mode code"),
+    }
+}
+
+const fn actual_value_family(code: u8) -> ValueFamily {
+    match code {
+        1 => ValueFamily::Boolean,
+        2 => ValueFamily::Signed,
+        3 => ValueFamily::Text,
+        _ => panic!("raw fixture uses a closed value-family code"),
+    }
+}
+
+fn actual_series_payload(raw: series_oracle::RawPayload) -> SeriesDeclarationPayload {
+    SeriesDeclarationPayload::new(
+        actual_producer_id(raw.producer),
+        actual_series_mode(raw.mode),
+        actual_value_family(raw.family),
+        QuantityEvidence::Absent,
+        UnitEvidence::Absent,
+        Some(actual_declaration_reference(format!(
+            "metadata-{}",
+            raw.metadata
+        ))),
+    )
+}
+
+fn actual_declaration_evidence(code: u8) -> DeclarationEvidence {
+    DeclarationEvidence::new(
+        Timestamp::new(i64::from(code), 0).expect("normalized raw evidence time"),
+        None,
+    )
+}
+
+fn actual_series_value(value: series_oracle::RawValue) -> ExactValue {
+    match value {
+        series_oracle::RawValue::Family(1) => ExactValue::Boolean(true),
+        series_oracle::RawValue::Family(2) => ExactValue::Signed(2),
+        series_oracle::RawValue::Family(3) => {
+            ExactValue::Text(ExactText::new("value".to_owned()).expect("bounded raw exact text"))
+        }
+        series_oracle::RawValue::Family(_) => panic!("raw fixture uses a closed value code"),
+        series_oracle::RawValue::Unavailable => {
+            ExactValue::Unavailable(Unavailable::without_reason())
+        }
+    }
+}
+
+fn actual_series_envelope(
+    series: u8,
+    producer: u8,
+    mode: u8,
+    value: series_oracle::RawValue,
+) -> CollectionEnvelope {
+    let timestamp = Timestamp::new(50, 0).expect("normalized raw observation time");
+    let observation = Observation::new(
+        ObservationId::from_bytes(fixtures::uuid_bytes(500)).expect("valid raw observation UUIDv7"),
+        actual_series_value(value),
+        ObservationTimes::new(None, timestamp, timestamp),
+        Quality::new(QualityLevel::Unknown, QualityFlags::none()),
+        NativeStatus::absent(),
+        None,
+        None,
+    );
+    CollectionEnvelope::observed(
+        SeriesMetadata::new(
+            actual_series_id(series),
+            actual_producer_id(producer),
+            actual_series_mode(mode),
+        ),
+        vec![observation],
+        Vec::new(),
+    )
+    .expect("raw series envelope is structurally valid")
+}
+
+fn actual_series_apply(
+    registry: &mut SeriesRegistry,
+    request: series_oracle::RawRequest,
+) -> Result<series_oracle::RawOutcome, RawError> {
+    use series_oracle::{RawOutcome, RawRequest};
+    match request {
+        RawRequest::Register {
+            series,
+            binding,
+            payload,
+            evidence,
+        } => registry
+            .register(
+                actual_series_id(series),
+                actual_series_binding(binding),
+                actual_series_payload(payload),
+                actual_declaration_evidence(evidence),
+            )
+            .map(|declaration| RawOutcome::Declaration(declaration.revision().get())),
+        RawRequest::Revise {
+            series,
+            expected,
+            payload,
+            evidence,
+        } => registry
+            .revise(
+                actual_series_id(series),
+                DeclarationRevision::new(expected).expect("nonzero raw expected revision"),
+                actual_series_payload(payload),
+                actual_declaration_evidence(evidence),
+            )
+            .map(|declaration| RawOutcome::Declaration(declaration.revision().get())),
+        RawRequest::Retire {
+            series,
+            expected,
+            evidence,
+        } => registry
+            .retire(
+                actual_series_id(series),
+                DeclarationRevision::new(expected).expect("nonzero raw expected revision"),
+                actual_declaration_evidence(evidence),
+            )
+            .map(|retirement| RawOutcome::Retirement(retirement.declaration_revision().get())),
+        RawRequest::Bind {
+            series,
+            producer,
+            mode,
+            value,
+        } => registry
+            .bind(actual_series_envelope(series, producer, mode, value))
+            .map(|bound| RawOutcome::Binding(bound.declaration().revision().get())),
+    }
+    .map_err(error_code)
+}
+
+fn raw_reference_code(reference: &DeclarationReference, prefix: &str) -> u8 {
+    reference
+        .as_str()
+        .strip_prefix(prefix)
+        .expect("actual adapter retains the raw prefix")
+        .parse()
+        .expect("actual adapter retains a raw numeric code")
+}
+
+const fn raw_mode_code(mode: CollectionMode) -> u8 {
+    match mode {
+        CollectionMode::Sampled => 1,
+        CollectionMode::ChangeOnly => 2,
+        CollectionMode::Event => 3,
+        CollectionMode::Cumulative | CollectionMode::Interval => {
+            panic!("actual adapter only emits scripted modes")
+        }
+    }
+}
+
+const fn raw_family_code(family: ValueFamily) -> u8 {
+    match family {
+        ValueFamily::Boolean => 1,
+        ValueFamily::Signed => 2,
+        ValueFamily::Text => 3,
+        ValueFamily::Real | ValueFamily::Unsigned | ValueFamily::State | ValueFamily::Artifact => {
+            panic!("actual adapter only emits scripted families")
+        }
+    }
+}
+
+fn actual_series_snapshot(registry: &SeriesRegistry) -> series_oracle::RawSnapshot {
+    let snapshot = registry.snapshot();
+    series_oracle::RawSnapshot {
+        revision_count: snapshot.declaration_revision_count(),
+        series: snapshot
+            .series()
+            .iter()
+            .map(|history| series_oracle::RawHistorySnapshot {
+                series: series_number(history.series_id()),
+                binding: raw_reference_code(history.binding().source().locator(), "binding-"),
+                revisions: history
+                    .declarations()
+                    .iter()
+                    .map(|declaration| {
+                        let payload = declaration.payload();
+                        (
+                            declaration.revision().get(),
+                            declaration
+                                .previous_revision()
+                                .map(DeclarationRevision::get),
+                            series_oracle::RawPayload::new(
+                                producer_number(payload.producer_id()),
+                                raw_mode_code(payload.collection_mode()),
+                                raw_family_code(payload.value_family()),
+                                raw_reference_code(
+                                    payload
+                                        .application()
+                                        .expect("scripted application reference"),
+                                    "metadata-",
+                                ),
+                            ),
+                            u8::try_from(declaration.evidence().effective_at().unix_seconds())
+                                .expect("scripted evidence code"),
+                        )
+                    })
+                    .collect(),
+                retirement: history.retirement().map(|retirement| {
+                    (
+                        retirement.declaration_revision().get(),
+                        u8::try_from(retirement.evidence().effective_at().unix_seconds())
+                            .expect("scripted retirement code"),
+                    )
+                }),
+            })
+            .collect(),
+    }
+}
+
+fn actual_series_parts() -> (
+    SeriesId,
+    SeriesBinding,
+    SeriesDeclarationPayload,
+    DeclarationEvidence,
+) {
+    let series_id = actual_series_id(1);
+    let binding = actual_series_binding(1);
+    let payload = actual_series_payload(series_oracle::RawPayload::new(10, 1, 1, 1));
+    let evidence = actual_declaration_evidence(1);
+    (series_id, binding, payload, evidence)
+}
+
+fn actual_series_constructor_capacity_errors() -> Vec<ModelError> {
+    let (series_id, binding, payload, evidence) = actual_series_parts();
+    let mut errors = vec![
+        DeclarationReference::new(format!("{}\n", fixtures::SECRET_SENTINEL))
+            .expect_err("control character is invalid"),
+        DeclarationRevision::new(0).expect_err("revision zero is invalid"),
+    ];
+
+    let mut zero_series = SeriesRegistry::new(actual_store(), SeriesRegistryLimits::new(0, 1));
+    errors.push(
+        zero_series
+            .register(
+                series_id,
+                binding.clone(),
+                payload.clone(),
+                evidence.clone(),
+            )
+            .expect_err("zero series capacity"),
+    );
+    let mut zero_revisions = SeriesRegistry::new(actual_store(), SeriesRegistryLimits::new(1, 0));
+    errors.push(
+        zero_revisions
+            .register(
+                series_id,
+                binding.clone(),
+                payload.clone(),
+                evidence.clone(),
+            )
+            .expect_err("zero revision capacity"),
+    );
+    errors
+}
+
+fn actual_series_registration_errors() -> Vec<ModelError> {
+    let (series_id, binding, payload, evidence) = actual_series_parts();
+    let mut already = SeriesRegistry::new(actual_store(), SeriesRegistryLimits::new(1, 1));
+    already
+        .register(
+            series_id,
+            binding.clone(),
+            payload.clone(),
+            evidence.clone(),
+        )
+        .expect("initial declaration");
+    let already_error = already
+        .register(
+            series_id,
+            actual_series_binding(2),
+            payload.clone(),
+            evidence.clone(),
+        )
+        .expect_err("different repeated registration");
+
+    let mut missing = SeriesRegistry::new(actual_store(), SeriesRegistryLimits::new(1, 2));
+    let missing_error = missing
+        .revise(
+            series_id,
+            DeclarationRevision::FIRST,
+            payload.clone(),
+            evidence.clone(),
+        )
+        .expect_err("missing series");
+
+    let mut retired = SeriesRegistry::new(actual_store(), SeriesRegistryLimits::new(1, 1));
+    retired
+        .register(
+            series_id,
+            binding.clone(),
+            payload.clone(),
+            evidence.clone(),
+        )
+        .expect("initial declaration");
+    retired
+        .retire(
+            series_id,
+            DeclarationRevision::FIRST,
+            actual_declaration_evidence(2),
+        )
+        .expect("retirement");
+    let retired_error = retired
+        .bind(actual_series_envelope(
+            1,
+            10,
+            1,
+            series_oracle::RawValue::Family(1),
+        ))
+        .expect_err("retired bind");
+    vec![already_error, missing_error, retired_error]
+}
+
+fn actual_series_revision_errors() -> Vec<ModelError> {
+    let (series_id, binding, payload, evidence) = actual_series_parts();
+    let mut stale = SeriesRegistry::new(actual_store(), SeriesRegistryLimits::new(1, 2));
+    stale
+        .register(
+            series_id,
+            binding.clone(),
+            payload.clone(),
+            evidence.clone(),
+        )
+        .expect("initial declaration");
+    let stale_error = stale
+        .revise(
+            series_id,
+            DeclarationRevision::new(2).expect("valid comparison revision"),
+            actual_series_payload(series_oracle::RawPayload::new(11, 2, 2, 2)),
+            actual_declaration_evidence(2),
+        )
+        .expect_err("stale revision");
+
+    let mut unchanged = SeriesRegistry::new(actual_store(), SeriesRegistryLimits::new(1, 2));
+    unchanged
+        .register(
+            series_id,
+            binding.clone(),
+            payload.clone(),
+            evidence.clone(),
+        )
+        .expect("initial declaration");
+    let unchanged_error = unchanged
+        .revise(
+            series_id,
+            DeclarationRevision::FIRST,
+            payload.clone(),
+            actual_declaration_evidence(2),
+        )
+        .expect_err("unchanged payload");
+    vec![stale_error, unchanged_error]
+}
+
+fn actual_series_binding_errors() -> Vec<ModelError> {
+    let (series_id, binding, payload, evidence) = actual_series_parts();
+    let mut bound = SeriesRegistry::new(actual_store(), SeriesRegistryLimits::new(1, 1));
+    bound
+        .register(series_id, binding, payload, evidence)
+        .expect("initial declaration");
+    let metadata_error = bound
+        .bind(actual_series_envelope(
+            1,
+            11,
+            1,
+            series_oracle::RawValue::Family(1),
+        ))
+        .expect_err("metadata mismatch");
+    let family_error = bound
+        .bind(actual_series_envelope(
+            1,
+            10,
+            1,
+            series_oracle::RawValue::Family(2),
+        ))
+        .expect_err("value-family mismatch");
+    vec![metadata_error, family_error]
+}
+
+fn actual_series_model_errors() -> Vec<ModelError> {
+    let mut errors = actual_series_constructor_capacity_errors();
+    errors.extend(actual_series_registration_errors());
+    errors.extend(actual_series_revision_errors());
+    errors.extend(actual_series_binding_errors());
+    errors
 }
 
 fn actual_content(raw: &fixtures::RawContent) -> ContentIdentity {
@@ -201,6 +640,7 @@ const fn flag_values(flags: QualityFlags) -> [bool; 6] {
 fn golden_ledger_is_fresh_ascii_and_independent() {
     assert!(!FIXTURE_SOURCE.contains("och_core"));
     assert!(!ORACLE_SOURCE.contains("och_core"));
+    assert!(!SERIES_ORACLE_SOURCE.contains("och_core"));
     let checked_in = GOLDEN.replace("\r\n", "\n");
     assert!(checked_in.is_ascii());
     assert!(!checked_in.contains('\r'));
@@ -223,7 +663,26 @@ fn golden_ledger_is_fresh_ascii_and_independent() {
 }
 
 #[test]
+fn series_lifecycle_matches_the_independent_bounded_primitive_oracle() {
+    let mut expected = series_oracle::RawRegistry::new(2, 3);
+    let mut actual = SeriesRegistry::new(actual_store(), SeriesRegistryLimits::new(2, 3));
+    for request in series_oracle::lifecycle_script() {
+        let before_expected = expected.clone();
+        let before_actual = actual.snapshot();
+        let expected_result = expected.apply(request);
+        let actual_result = actual_series_apply(&mut actual, request);
+        assert_eq!(actual_result, expected_result, "{request:?}");
+        assert_eq!(actual_series_snapshot(&actual), expected.snapshot());
+        if expected_result.is_err() {
+            assert_eq!(expected, before_expected);
+            assert_eq!(actual.snapshot(), before_actual);
+        }
+    }
+}
+
+#[test]
 fn identities_match_independent_uuid_text_and_byte_facts() {
+    let store_bytes = oracle::parse_uuid_v7(fixtures::STORE_TEXT).expect("oracle store UUIDv7");
     let series_bytes = oracle::parse_uuid_v7(fixtures::SERIES_TEXT).expect("oracle series UUIDv7");
     let producer_bytes =
         oracle::parse_uuid_v7(fixtures::PRODUCER_TEXT).expect("oracle producer UUIDv7");
@@ -232,15 +691,18 @@ fn identities_match_independent_uuid_text_and_byte_facts() {
     let artifact_bytes =
         oracle::parse_uuid_v7(fixtures::ARTIFACT_TEXT).expect("oracle artifact UUIDv7");
 
+    let store = StoreId::parse(fixtures::STORE_TEXT).expect("actual store UUIDv7");
     let series = SeriesId::parse(fixtures::SERIES_TEXT).expect("actual series UUIDv7");
     let producer = ProducerId::parse(fixtures::PRODUCER_TEXT).expect("actual producer UUIDv7");
     let observation =
         ObservationId::parse(fixtures::OBSERVATION_TEXT).expect("actual observation UUIDv7");
     let artifact = ArtifactId::parse(fixtures::ARTIFACT_TEXT).expect("actual artifact UUIDv7");
+    assert_eq!(store.into_bytes(), store_bytes);
     assert_eq!(series.into_bytes(), series_bytes);
     assert_eq!(producer.into_bytes(), producer_bytes);
     assert_eq!(observation.into_bytes(), observation_bytes);
     assert_eq!(artifact.into_bytes(), artifact_bytes);
+    assert_eq!(store.to_string(), oracle::render_uuid(store_bytes));
     assert_eq!(series.to_string(), oracle::render_uuid(series_bytes));
     assert_eq!(producer.to_string(), oracle::render_uuid(producer_bytes));
     assert_eq!(
@@ -711,6 +1173,21 @@ fn every_negative_fixture_has_one_oracle_violation_and_one_sanitized_model_error
             fixture.stable_id
         );
         assert!(covered.insert(fixture.expected));
+    }
+
+    let series_errors = actual_series_model_errors();
+    assert_eq!(
+        series_errors.len(),
+        series_oracle::SERIES_ERROR_INVENTORY.len()
+    );
+    for (actual, expected) in series_errors
+        .into_iter()
+        .zip(series_oracle::SERIES_ERROR_INVENTORY)
+    {
+        assert_eq!(error_code(actual), expected);
+        assert!(!actual.to_string().contains(fixtures::SECRET_SENTINEL));
+        assert!(!format!("{actual:?}").contains(fixtures::SECRET_SENTINEL));
+        assert!(covered.insert(expected));
     }
 
     assert_eq!(covered.len(), fixtures::ALL_ERROR_CODES.len());

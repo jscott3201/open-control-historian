@@ -4,6 +4,7 @@
 //! inputs to both the contract-literal oracle and the public-model adapter.
 
 pub const SERIES_TEXT: &str = "01941f29-7c00-7000-8000-000000000001";
+pub const STORE_TEXT: &str = "01941f29-7c00-7000-8000-000000000064";
 pub const PRODUCER_TEXT: &str = "01941f29-7c00-7000-8000-000000000010";
 pub const OBSERVATION_TEXT: &str = "01941f29-7c00-7000-8000-000000000020";
 pub const ARTIFACT_TEXT: &str = "01941f29-7c00-7000-8000-000000000030";
@@ -159,6 +160,17 @@ pub enum RawError {
     MissingObservationInterval,
     UnexpectedObservationInterval,
     InvalidNoChangeMode,
+    InvalidDeclarationReference,
+    InvalidDeclarationRevision,
+    RegistrySeriesCapacityExceeded,
+    RegistryRevisionCapacityExceeded,
+    SeriesAlreadyRegistered,
+    SeriesNotFound,
+    SeriesRetired,
+    StaleDeclarationRevision,
+    DeclarationUnchanged,
+    SeriesMetadataMismatch,
+    ObservationValueFamilyMismatch,
 }
 
 impl RawError {
@@ -188,11 +200,22 @@ impl RawError {
             Self::MissingObservationInterval => "MissingObservationInterval",
             Self::UnexpectedObservationInterval => "UnexpectedObservationInterval",
             Self::InvalidNoChangeMode => "InvalidNoChangeMode",
+            Self::InvalidDeclarationReference => "InvalidDeclarationReference",
+            Self::InvalidDeclarationRevision => "InvalidDeclarationRevision",
+            Self::RegistrySeriesCapacityExceeded => "RegistrySeriesCapacityExceeded",
+            Self::RegistryRevisionCapacityExceeded => "RegistryRevisionCapacityExceeded",
+            Self::SeriesAlreadyRegistered => "SeriesAlreadyRegistered",
+            Self::SeriesNotFound => "SeriesNotFound",
+            Self::SeriesRetired => "SeriesRetired",
+            Self::StaleDeclarationRevision => "StaleDeclarationRevision",
+            Self::DeclarationUnchanged => "DeclarationUnchanged",
+            Self::SeriesMetadataMismatch => "SeriesMetadataMismatch",
+            Self::ObservationValueFamilyMismatch => "ObservationValueFamilyMismatch",
         }
     }
 }
 
-pub const ALL_ERROR_CODES: [RawError; 24] = [
+pub const ALL_ERROR_CODES: [RawError; 35] = [
     RawError::InvalidIdentity,
     RawError::InvalidExactText,
     RawError::InvalidPortableToken,
@@ -217,6 +240,17 @@ pub const ALL_ERROR_CODES: [RawError; 24] = [
     RawError::MissingObservationInterval,
     RawError::UnexpectedObservationInterval,
     RawError::InvalidNoChangeMode,
+    RawError::InvalidDeclarationReference,
+    RawError::InvalidDeclarationRevision,
+    RawError::RegistrySeriesCapacityExceeded,
+    RawError::RegistryRevisionCapacityExceeded,
+    RawError::SeriesAlreadyRegistered,
+    RawError::SeriesNotFound,
+    RawError::SeriesRetired,
+    RawError::StaleDeclarationRevision,
+    RawError::DeclarationUnchanged,
+    RawError::SeriesMetadataMismatch,
+    RawError::ObservationValueFamilyMismatch,
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]

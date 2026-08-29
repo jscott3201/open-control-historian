@@ -2,19 +2,21 @@
 
 OpenControl Historian is at its canonical-model and bounded-runtime stage.
 This repository provides a small Rust workspace, an enforceable native dependency
-boundary, the dependency-free canonical Historian data model, independent
-deterministic contract evidence, and one caller-executor-owned Tokio writer
+boundary, the dependency-free canonical Historian data model and bounded series
+declaration authority, independent deterministic contract evidence, and one caller-executor-owned Tokio writer
 lifecycle with strict bounded volatile ingress and latest-observation snapshots
 per runtime instance. It does **not** provide storage, persistence, durable
 history, current/held-value, or query behavior.
 
 ## Current status
 
-`och-core` now defines the canonical identity, exact value/content, timestamp,
-quality/status, producer-order, collection-mode, gap/no-change, atomic envelope,
-and content-qualified retry contracts described in the
+`och-core` now defines canonical store/series identity, immutable declaration
+revisions, terminal retirement, exact value/content, timestamp, quality/status,
+producer-order, collection-mode, gap/no-change, atomic envelope, registry-issued
+declaration binding, and content-qualified retry contracts described in the
 [model contract](docs/model-contract.md). M00 also has an independent raw-fixture
-oracle, public-model adapter comparison, and checked-in schema-v1 ASCII golden
+oracle for both the original model and series lifecycle, public-model adapter
+comparison, and checked-in schema-v1 ASCII golden
 ledger under [`crates/och-core/tests/`](crates/och-core/tests/).
 `och-runtime` adds async startup-after-readiness, one private writer, a synchronous
 fixed 16-command ingress, outstanding-only retry coalescing/conflict rejection,
@@ -25,13 +27,15 @@ nonblocking and abort-only on the caller's active Tokio executor. `WriterHandled
 means the writer consumed the command and completed its publication decision;
 ineligible and stale commands remain handled no-ops. Published exact observations
 are not current/held values and prove no storage, persistence, durable history,
-query result, restart recovery, wire format, or adapter behavior.
+query result, restart recovery, wire format, or adapter behavior. The volatile
+runtime deliberately does not consume the series registry or declaration-bound
+envelopes and gains no lifecycle authority from this successor.
 
 The current workspace contains:
 
 | Package | Role | Purpose |
 | --- | --- | --- |
-| [`och-core`](crates/och-core/) | native | Dependency-free canonical model and a measurement-only example |
+| [`och-core`](crates/och-core/) | native | Dependency-free canonical model, bounded series declaration authority, and a measurement-only example |
 | [`och-runtime`](crates/och-runtime/) | native | Caller-executor writer, bounded ingress, and volatile immutable latest snapshots |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
@@ -90,6 +94,9 @@ through nextest rather than being repeated with `cargo test`.
   evidence without inventing runtime measurements.
 - [M00-PR03 evidence record](docs/continuation-m00-pr03.md) inventories the
   delivered independent oracle, golden, fixture builders, and non-goals.
+- [M00-PR04 alignment and declaration-authority record](docs/continuation-m00-pr04.md)
+  records the accepted predecessor baseline, bounded lifecycle contract, required
+  pre-M02 source/capture successor, and explicit deferred ledger.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

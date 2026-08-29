@@ -9,14 +9,19 @@ The brief is the authoritative source for the product's intended behavior, and t
 This workspace proves the M00 foundation, dependency-free canonical Historian
 model, independent M00-PR03 evidence, the M01-PR01 caller-executor lifecycle,
 M01-PR02 bounded volatile ingress, and M01-PR03 volatile latest-observation
-publication. `och-core` remains frozen and owns reviewed identity, exact
-value/content, time, quality/status, producer ordering, collection, gap/no-change,
-envelope, and retry-comparison semantics. `och-runtime` owns one private writer
+publication. The reviewed M00-PR02/M00-PR03 `och-core` contracts remain unchanged;
+M00-PR04 is their explicit dependency-free successor for store identity, bounded
+series declaration revisions, terminal retirement, historical resolution, and
+registry-issued envelope binding. Further `och-core` changes require another
+explicitly reviewed successor. `och-core` owns identity, exact value/content,
+time, quality/status, producer ordering, declaration lifecycle, collection,
+gap/no-change, envelope, and retry-comparison semantics. `och-runtime` owns one private writer
 task per instance, readiness, a fixed 16-command admission window, outstanding-only
 retry coalescing, shared terminal receipts, a separately fixed 16-series volatile
 registry, immutable snapshots, graceful drain/seal/join, and abort-only Drop. It
 has no persistence, durable history, query, storage, restart recovery, wire, or
-adapter behavior; published observations never imply current or held values.
+adapter behavior; it does not consume the M00-PR04 registry or gain declaration
+authority, and published observations never imply current or held values.
 
 The ignored `_roadmap/` directory is local and unpublished.
 Do not commit or push the `_roadmap/` directory to github. Preserve unrelated
