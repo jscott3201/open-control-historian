@@ -3,8 +3,9 @@
 ## Present topology
 
 M00 established the reviewed dependency-free canonical model. M01-PR01 added a
-separate native lifecycle root, and M01-PR02 connects it inward to the still-frozen
-model through bounded volatile ingress:
+separate native lifecycle root, M01-PR02 connected it inward through bounded
+volatile ingress, and M01-PR03 adds bounded runtime-local latest publication while
+the model remains frozen:
 
 ```text
 default workspace selection
@@ -13,6 +14,7 @@ default workspace selection
   och-core (native) <---- och-runtime (native)       och-policy (tooling)
   canonical model         caller-owned executor      cargo_metadata + parsing
   no dependencies         one writer + 16 slots      support
+                          16 published series
                                    |
                                    v
                            tokio rt + sync only
@@ -28,16 +30,18 @@ comparison. It retains no product dependencies. Its only executable remains a
 baseline example used to verify buildability and measure a native binary bound;
 that example is not a runtime or supported product command.
 
-[`och-runtime`](../crates/och-runtime/) owns async writer lifecycle and one fixed
-volatile admission window per instance. Its public runtime starts one private task
-on the caller's active Tokio executor and returns after private state and ingress
-readiness. A custom cloneable ingress synchronously admits at most 16 outstanding
-distinct commands, including in-flight work, and exposes no Tokio type. Exact
-core retry classification coalesces only equivalent outstanding work; conflicts,
-full capacity, and closure recover the incoming command. Multiple runtimes are
-independent; there is no global singleton, restart path, latest registry, or
-exposed writer state. Tokio remains admitted only on the direct runtime edge with
-default features disabled and `rt` plus `sync` enabled.
+[`och-runtime`](../crates/och-runtime/) owns async writer lifecycle, one fixed
+volatile admission window, and one fixed volatile latest registry per instance.
+Its public runtime starts one private task on the caller's active Tokio executor
+and returns after private state, ingress, and an empty latest view are ready. A
+custom cloneable ingress synchronously admits at most 16 outstanding distinct
+commands, including in-flight work, and exposes no Tokio type. Exact core retry
+classification coalesces only equivalent outstanding work; conflicts, full
+capacity, and closure recover the incoming command. A separate synchronous read
+handle captures immutable snapshots of at most 16 nominal series. Multiple
+runtimes are independent; there is no global singleton, restart path, or exposed
+writer state. Tokio remains admitted only on the direct runtime edge with default
+features disabled and `rt` plus `sync` enabled.
 
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`
@@ -85,33 +89,53 @@ promises completion. Closed errors sanitize early exit, cancellation, and panic;
 the release profile's `panic=abort` means panic classification is test/debug
 evidence, not a release recovery guarantee.
 
-One short private synchronous mutex linearizes submission with shutdown; no guard
-crosses an await. A fixed slot table and FIFO index ring bound queued plus in-flight
-distinct work at 16. Equivalent retries share one fixed terminal state and do not
-retain the duplicate envelope. Retry comparison precedes the full check, but
-closure takes precedence once graceful shutdown has atomically closed admission.
-The retry window ends at terminal completion and has no durable horizon.
+One short private synchronous mutex linearizes submission, snapshot capture,
+publication swap, terminal receipt assignment, slot release, stop, and shutdown;
+no guard crosses an await. A fixed slot table and FIFO index ring bound queued plus
+in-flight distinct work at 16. Equivalent retries share one fixed terminal state
+and do not retain the duplicate envelope. Retry comparison precedes the full
+check, but closure takes precedence once graceful shutdown has atomically closed
+admission. The retry window ends at terminal completion and has no durable horizon.
 
-The private writer is the sole queue consumer. Graceful shutdown closes admission,
-drains accepted work FIFO, resolves receipts, and joins. `WriterHandled` means the
-volatile command was consumed and dropped only. Runtime Drop, cancelled shutdown,
-task cancellation/panic/early exit, and admission-lock poison close admission and
-single-assign every unresolved receipt to `WriterStopped`; handled state cannot be
-overwritten. Caller-supplied content identity is trusted only for core retry
-classification and is never recomputed from envelope content.
+Only an envelope with at least one observation and explicit positions on all its
+observations is publication-eligible. Core validation makes the final observation
+the greatest positioned candidate. `ProducerPosition` alone selects replacement;
+arrival, timestamp, UUID, raw-order, retry, quality, and value never do. The first
+eligible candidate binds exact `SeriesMetadata` by `SeriesId`. Greater position
+replaces, lower and equal-identical candidates are no-ops, while metadata mismatch,
+equal-position/different-observation conflict, and a seventeenth new eligible
+series fail closed without eviction or partial visibility. All five collection
+modes may publish exact observation evidence without implying hold, current value,
+freshness, interpolation, delta/reset, or interval extension.
+
+The private writer is the sole queue consumer. It stages one bounded candidate
+snapshot outside the final critical section, then swaps a complete immutable view
+before assigning `WriterHandled` for an advance. Readers see only a complete old
+or complete new view. Runtime state retains only the current snapshot; caller-held
+old snapshots account for caller-owned volatile memory, not runtime history.
+
+Graceful shutdown closes admission, drains accepted work FIFO, resolves each
+publication decision, seals the final registry, and joins. Outliving read handles
+continue to capture that sealed view. `WriterHandled` includes ineligible and stale
+no-ops and proves no durability or query result. Runtime Drop, cancelled shutdown,
+task cancellation/panic/early exit, publication fault, and admission-lock poison
+close admission, single-assign every unresolved receipt to `WriterStopped`, and
+make future snapshot capture unavailable; snapshots acquired earlier remain
+immutable. Handled state cannot be overwritten. Caller-supplied content identity
+is trusted only for core retry classification and is never recomputed from
+envelope content.
 
 ## Intentionally absent
 
 There is currently no async/blocking admission wait, configurable capacity,
-same-series evidence replacement, public queue status, latest-value publication,
-registry, snapshot/read handle, journal, segment, store, persistence or wire
-format, query engine, network service, SQL layer, cloud/object provider, embedded
-database, memory mapping, Studio/Engine link, adapter, or donor-code compatibility
-layer.
+eviction, public queue status, subscription/wait API, mutable read guard, journal,
+segment, store, persistence or wire format, durable history, restart recovery,
+query engine, network service, SQL layer, cloud/object provider, embedded database,
+memory mapping, Studio/Engine link, adapter, or donor-code compatibility layer.
 
 Those omissions keep the reviewed canonical model independent of lifecycle and
 platform choices and prevent large implementation dependencies from becoming
 architectural facts before their contracts are reviewed. Lifecycle history is in
 the [M01-PR01 brief](implementation-brief-m01-pr01.md), bounded ingress is recorded
-by [M01-PR02](continuation-m01-pr02.md), and publication/read ownership remains in
-the [M01-PR03 continuation](continuation-m01-pr03.md).
+by [M01-PR02](continuation-m01-pr02.md), and bounded publication/read ownership is
+recorded by [M01-PR03](continuation-m01-pr03.md).

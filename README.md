@@ -4,8 +4,9 @@ OpenControl Historian is at its canonical-model and bounded-runtime stage.
 This repository provides a small Rust workspace, an enforceable native dependency
 boundary, the dependency-free canonical Historian data model, independent
 deterministic contract evidence, and one caller-executor-owned Tokio writer
-lifecycle with strict bounded volatile ingress per runtime instance. It does
-**not** provide storage, persistence, publication, or query behavior.
+lifecycle with strict bounded volatile ingress and latest-observation snapshots
+per runtime instance. It does **not** provide storage, persistence, durable
+history, current/held-value, or query behavior.
 
 ## Current status
 
@@ -17,19 +18,21 @@ oracle, public-model adapter comparison, and checked-in schema-v1 ASCII golden
 ledger under [`crates/och-core/tests/`](crates/och-core/tests/).
 `och-runtime` adds async startup-after-readiness, one private writer, a synchronous
 fixed 16-command ingress, outstanding-only retry coalescing/conflict rejection,
-shared terminal receipts, draining graceful shutdown and join, and nonblocking
-abort-only Drop on the caller's active Tokio executor. `WriterHandled` means only
-that the private volatile writer consumed the command. There is still no latest
-publication or registry, snapshot/read handle, storage engine, persistence or
-wire format, query layer, or adapter. Those absent capabilities must not be
-inferred from lifecycle or receipt success, the model, tests, ledger, or baseline.
+shared terminal receipts, and a separately fixed 16-series runtime-local volatile
+latest registry. Cloneable synchronous read handles capture immutable snapshots;
+graceful shutdown drains, seals the final registry, and joins, while Drop remains
+nonblocking and abort-only on the caller's active Tokio executor. `WriterHandled`
+means the writer consumed the command and completed its publication decision;
+ineligible and stale commands remain handled no-ops. Published exact observations
+are not current/held values and prove no storage, persistence, durable history,
+query result, restart recovery, wire format, or adapter behavior.
 
 The current workspace contains:
 
 | Package | Role | Purpose |
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model and a measurement-only example |
-| [`och-runtime`](crates/och-runtime/) | native | Caller-executor writer lifecycle and bounded volatile envelope ingress |
+| [`och-runtime`](crates/och-runtime/) | native | Caller-executor writer, bounded ingress, and volatile immutable latest snapshots |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
 `och-core` has no dependencies. `och-runtime` depends inward on `och-core`; the
@@ -76,8 +79,9 @@ through nextest rather than being repeated with `cargo test`.
   records startup, shutdown, cancellation, error, and non-goal semantics.
 - [M01-PR02 bounded-ingress delivery record](docs/continuation-m01-pr02.md)
   records admission, retry, receipt, drain, failure, bound, and non-goal evidence.
-- [M01-PR03 continuation](docs/continuation-m01-pr03.md) reserves latest
-  publication, registry, snapshots, and read-handle ownership for separate review.
+- [M01-PR03 latest-publication delivery record](docs/continuation-m01-pr03.md)
+  records eligibility, producer-position ordering, registry bounds, immutable
+  snapshots, and normal-seal/abnormal-unavailable behavior.
 - [M00-PR02 implementation brief](docs/implementation-brief-m00-pr02.md) records
   this model slice's scope and acceptance evidence.
 - [Foundation implementation brief](docs/implementation-brief.md) remains the
