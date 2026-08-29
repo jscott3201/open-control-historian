@@ -116,13 +116,13 @@
       "native": ["och-core", "och-runtime"],
       "dependency_free_native": ["och-core"],
       "forbidden": ["tokio"],
-      "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio" }]
+      "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }]
     },
     "default_members": ["och-core", "och-runtime"],
     "packages": [
       { "id": "core", "name": "och-core", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny" },
-      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "executor-alias" }] },
-      { "id": "tokio", "name": "tokio", "external": true }
+      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "executor-alias", "declarations": [{ "kind": "normal", "optional": false, "unconditional": true, "uses_default_features": false, "features": ["rt", "sync"] }] }] },
+      { "id": "tokio", "name": "tokio", "external": true, "resolved_features": ["rt", "sync"] }
     ],
     "expected": { "pass": true, "closure_packages": 3 }
   },
@@ -132,13 +132,13 @@
       "native": ["och-core", "och-runtime"],
       "dependency_free_native": ["och-core"],
       "forbidden": ["tokio"],
-      "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio" }]
+      "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }]
     },
     "default_members": ["och-core", "och-runtime"],
     "packages": [
       { "id": "core", "name": "och-core", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio" }] },
-      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio" }] },
-      { "id": "tokio", "name": "tokio", "external": true }
+      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio", "declarations": [{ "kind": "normal", "optional": false, "unconditional": true, "uses_default_features": false, "features": ["rt", "sync"] }] }] },
+      { "id": "tokio", "name": "tokio", "external": true, "resolved_features": ["rt", "sync"] }
     ],
     "expected": { "pass": false, "message": "och-core -> tokio" }
   },
@@ -148,14 +148,14 @@
       "native": ["och-core", "och-runtime", "other-native"],
       "dependency_free_native": ["och-core"],
       "forbidden": ["tokio"],
-      "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio" }]
+      "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }]
     },
     "default_members": ["och-core", "och-runtime", "other-native"],
     "packages": [
       { "id": "core", "name": "och-core", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny" },
-      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio" }] },
+      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio", "declarations": [{ "kind": "normal", "optional": false, "unconditional": true, "uses_default_features": false, "features": ["rt", "sync"] }] }] },
       { "id": "other", "name": "other-native", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio" }] },
-      { "id": "tokio", "name": "tokio", "external": true }
+      { "id": "tokio", "name": "tokio", "external": true, "resolved_features": ["rt", "sync"] }
     ],
     "expected": { "pass": false, "message": "other-native -> tokio" }
   },
@@ -165,7 +165,7 @@
       "native": ["och-core", "och-runtime"],
       "dependency_free_native": ["och-core"],
       "forbidden": ["tokio"],
-      "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio" }]
+      "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }]
     },
     "default_members": ["och-core", "och-runtime"],
     "packages": [
@@ -182,7 +182,7 @@
       "native": ["och-core", "och-runtime"],
       "dependency_free_native": ["och-core"],
       "forbidden": ["tokio"],
-      "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio" }]
+      "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }]
     },
     "default_members": ["och-core", "och-runtime"],
     "packages": [
@@ -199,7 +199,7 @@
       "adapters": ["adapter"],
       "dependency_free_native": ["och-core"],
       "forbidden": ["tokio"],
-      "forbidden_exceptions": [{ "source": "adapter", "target": "tokio" }]
+      "forbidden_exceptions": [{ "source": "adapter", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }]
     },
     "default_members": ["och-core"],
     "packages": [
@@ -215,7 +215,7 @@
       "native": ["och-core", "och-runtime"],
       "dependency_free_native": ["och-core"],
       "forbidden": ["tokio"],
-      "forbidden_exceptions": [{ "source": "och-runtime", "target": "helper" }]
+      "forbidden_exceptions": [{ "source": "och-runtime", "target": "helper", "default_features": false, "features": ["rt", "sync"] }]
     },
     "default_members": ["och-core", "och-runtime"],
     "packages": [
@@ -224,6 +224,94 @@
       { "id": "helper", "name": "helper", "external": true }
     ],
     "expected": { "pass": false, "message": "exception target `helper` is not forbidden" }
+  },
+  {
+    "name": "forbidden exception rejects manifest default features",
+    "policy": { "native": ["och-core", "och-runtime"], "dependency_free_native": ["och-core"], "forbidden": ["tokio"], "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }] },
+    "default_members": ["och-core", "och-runtime"],
+    "packages": [
+      { "id": "core", "name": "och-core", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny" },
+      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio", "declarations": [{ "kind": "normal", "optional": false, "unconditional": true, "uses_default_features": true, "features": ["rt", "sync"] }] }] },
+      { "id": "tokio", "name": "tokio", "external": true, "resolved_features": ["rt", "sync"] }
+    ],
+    "expected": { "pass": false, "message": "requires manifest `default-features = false`" }
+  },
+  {
+    "name": "forbidden exception rejects manifest time feature",
+    "policy": { "native": ["och-core", "och-runtime"], "dependency_free_native": ["och-core"], "forbidden": ["tokio"], "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }] },
+    "default_members": ["och-core", "och-runtime"],
+    "packages": [
+      { "id": "core", "name": "och-core", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny" },
+      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio", "declarations": [{ "kind": "normal", "optional": false, "unconditional": true, "uses_default_features": false, "features": ["rt", "sync", "time"] }] }] },
+      { "id": "tokio", "name": "tokio", "external": true, "resolved_features": ["rt", "sync", "time"] }
+    ],
+    "expected": { "pass": false, "message": "manifest features are [`rt`, `sync`, `time`]; expected exactly [`rt`, `sync`]" }
+  },
+  {
+    "name": "forbidden exception rejects manifest multi-thread feature",
+    "policy": { "native": ["och-core", "och-runtime"], "dependency_free_native": ["och-core"], "forbidden": ["tokio"], "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }] },
+    "default_members": ["och-core", "och-runtime"],
+    "packages": [
+      { "id": "core", "name": "och-core", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny" },
+      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio", "declarations": [{ "kind": "normal", "optional": false, "unconditional": true, "uses_default_features": false, "features": ["rt", "rt-multi-thread", "sync"] }] }] },
+      { "id": "tokio", "name": "tokio", "external": true, "resolved_features": ["rt", "rt-multi-thread", "sync"] }
+    ],
+    "expected": { "pass": false, "message": "manifest features are [`rt`, `rt-multi-thread`, `sync`]; expected exactly [`rt`, `sync`]" }
+  },
+  {
+    "name": "forbidden exception rejects missing required manifest feature",
+    "policy": { "native": ["och-core", "och-runtime"], "dependency_free_native": ["och-core"], "forbidden": ["tokio"], "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }] },
+    "default_members": ["och-core", "och-runtime"],
+    "packages": [
+      { "id": "core", "name": "och-core", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny" },
+      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio", "declarations": [{ "kind": "normal", "optional": false, "unconditional": true, "uses_default_features": false, "features": ["rt"] }] }] },
+      { "id": "tokio", "name": "tokio", "external": true, "resolved_features": ["rt"] }
+    ],
+    "expected": { "pass": false, "message": "manifest features are [`rt`]; expected exactly [`rt`, `sync`]" }
+  },
+  {
+    "name": "forbidden exception rejects resolved feature unification",
+    "policy": { "native": ["och-core", "och-runtime"], "dependency_free_native": ["och-core"], "forbidden": ["tokio"], "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }] },
+    "default_members": ["och-core", "och-runtime"],
+    "packages": [
+      { "id": "core", "name": "och-core", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny" },
+      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio", "declarations": [{ "kind": "normal", "optional": false, "unconditional": true, "uses_default_features": false, "features": ["rt", "sync"] }] }] },
+      { "id": "tokio", "name": "tokio", "external": true, "resolved_features": ["rt", "sync", "time"] }
+    ],
+    "expected": { "pass": false, "message": "resolved package identity `tokio` enables features [`rt`, `sync`, `time`]; exception `och-runtime -> tokio` permits exactly [`rt`, `sync`]" }
+  },
+  {
+    "name": "forbidden exception requires normal manifest dependency",
+    "policy": { "native": ["och-core", "och-runtime"], "dependency_free_native": ["och-core"], "forbidden": ["tokio"], "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }] },
+    "default_members": ["och-core", "och-runtime"],
+    "packages": [
+      { "id": "core", "name": "och-core", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny" },
+      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio", "declarations": [{ "kind": "development", "optional": false, "unconditional": true, "uses_default_features": false, "features": ["rt", "sync"] }] }] },
+      { "id": "tokio", "name": "tokio", "external": true, "resolved_features": ["rt", "sync"] }
+    ],
+    "expected": { "pass": false, "message": "requires a normal manifest dependency" }
+  },
+  {
+    "name": "forbidden exception requires non-optional manifest dependency",
+    "policy": { "native": ["och-core", "och-runtime"], "dependency_free_native": ["och-core"], "forbidden": ["tokio"], "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }] },
+    "default_members": ["och-core", "och-runtime"],
+    "packages": [
+      { "id": "core", "name": "och-core", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny" },
+      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio", "declarations": [{ "kind": "normal", "optional": true, "unconditional": true, "uses_default_features": false, "features": ["rt", "sync"] }] }] },
+      { "id": "tokio", "name": "tokio", "external": true, "resolved_features": ["rt", "sync"] }
+    ],
+    "expected": { "pass": false, "message": "requires a non-optional manifest dependency" }
+  },
+  {
+    "name": "forbidden exception requires unconditional manifest dependency",
+    "policy": { "native": ["och-core", "och-runtime"], "dependency_free_native": ["och-core"], "forbidden": ["tokio"], "forbidden_exceptions": [{ "source": "och-runtime", "target": "tokio", "default_features": false, "features": ["rt", "sync"] }] },
+    "default_members": ["och-core", "och-runtime"],
+    "packages": [
+      { "id": "core", "name": "och-core", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny" },
+      { "id": "runtime", "name": "och-runtime", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tokio", "name": "tokio", "declarations": [{ "kind": "normal", "optional": false, "unconditional": false, "uses_default_features": false, "features": ["rt", "sync"] }] }] },
+      { "id": "tokio", "name": "tokio", "external": true, "resolved_features": ["rt", "sync"] }
+    ],
+    "expected": { "pass": false, "message": "requires an unconditional manifest dependency" }
   },
   {
     "name": "named dependency-free native root must be empty",

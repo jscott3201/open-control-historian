@@ -46,19 +46,29 @@ package identity `tokio` only when it is the immediate dependency of the
 
 ```toml
 forbidden-dependency-exceptions = [
-    { source = "och-runtime", target = "tokio" },
+    { source = "och-runtime", target = "tokio", default-features = false, features = ["rt", "sync"] },
 ]
 ```
 
-The `och-runtime` manifest separately disables Tokio default features and enables
-only `rt` and `sync`. The graph checker compares the resolved target identity, so
-an alias cannot conceal or broaden the edge. The exception does not apply to
-`och-core -> tokio`, another native root, a transitive
-`och-runtime -> helper -> tokio` path, or a path entering `och-runtime` from a
-different root. Exceptions with malformed or extra fields, duplicate entries,
-non-native sources, non-forbidden targets, or no matching direct traversal fail
-closed. Removing the direct edge therefore requires removing the exception in
-the same change.
+The graph checker resolves the edge to package identity before correlating it
+with the workspace manifest declaration, so an alias cannot conceal or broaden
+the target. A usable exception requires exactly one unconditional, normal,
+non-optional direct declaration, `default-features = false`, and declared features
+exactly `rt` plus `sync`. It also compares the resolved Tokio node's enabled
+feature set with that exact set, catching feature unification from any other
+edge. Cargo metadata 1 for the checked-in manifest reports declaration features
+`["rt", "sync"]` and resolved Tokio node features `["rt", "sync"]`; no implicit
+feature is omitted from the executable comparison.
+
+The exception does not apply to `och-core -> tokio`, another native root, a
+transitive `och-runtime -> helper -> tokio` path, or a path entering
+`och-runtime` from a different root. Exceptions with missing, malformed, or extra
+fields, empty/duplicate feature entries, duplicate source/target pairs,
+non-native sources, non-forbidden targets, mismatched declaration settings,
+broadened resolved features, or no matching direct traversal fail closed. An
+exception is counted as used only after all identity, declaration, and resolved
+feature checks pass. Removing the direct edge therefore requires removing the
+exception in the same change.
 
 The forbidden set currently protects the foundation from unreviewed async
 runtime, Arrow, Parquet, DataFusion/Flight, gRPC/protobuf, SQL/PostgreSQL,
@@ -75,10 +85,11 @@ negative direct, transitive, renamed-identity, adapter-reversal, tooling,
 implicit-default, unsafe-policy, missing-role, and forbidden-prefix cases. It
 also proves the exact direct Tokio exception, aliases, core/other-native and
 transitive rejection, dependency-free roots, malformed/duplicate/unused
-exceptions, non-native sources, and non-forbidden targets. An integration test
-loads the actual workspace with Cargo metadata and proves two native roots and a
-four-package union closure: `och-core`, `och-runtime`, `tokio`, and
-`pin-project-lite`.
+exceptions, non-native sources, non-forbidden targets, manifest default-feature,
+kind, optionality, target, exact-feature failures, and resolved feature
+broadening. An integration test loads the actual workspace with Cargo metadata
+and proves both the feature contract and two native roots with a four-package
+union closure: `och-core`, `och-runtime`, `tokio`, and `pin-project-lite`.
 
 When roles or dependencies change, update policy metadata and tests together.
 Do not weaken the forbidden list or add broad exceptions merely to admit a new

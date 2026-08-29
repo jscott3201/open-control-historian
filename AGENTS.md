@@ -31,11 +31,12 @@ public documentation.
 
 Tokio remains forbidden except for the exact direct `och-runtime -> tokio` edge
 with default features disabled and only `rt` and `sync`; never route it through a
-helper or admit it to `och-core` or another native root. Do not introduce Arrow,
-Parquet, DataFusion, Flight, tonic/prost, SQLx, PostgreSQL, object/cloud providers,
-embedded databases, memory mapping, Studio, Engine, or donor code into the native
-model. A dependency needed only by a policy or build check belongs under `tools/`,
-not in a native crate.
+helper or admit it to `och-core` or another native root. Policy must verify both
+that exact normal, non-optional manifest declaration and Tokio's resolved unified
+feature set. Do not introduce Arrow, Parquet, DataFusion, Flight, tonic/prost,
+SQLx, PostgreSQL, object/cloud providers, embedded databases, memory mapping,
+Studio, Engine, or donor code into the native model. A dependency needed only by
+a policy or build check belongs under `tools/`, not in a native crate.
 
 ## Required workflow
 

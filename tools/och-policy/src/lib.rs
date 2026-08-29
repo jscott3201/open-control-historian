@@ -8,7 +8,7 @@
 //! cannot bypass the policy. Tool packages remain visible for ownership
 //! validation but are not roots of the native product closure.
 
-use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, PackageId};
+use cargo_metadata::{CargoOpt, DependencyKind, Metadata, MetadataCommand, PackageId};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
@@ -82,6 +82,8 @@ impl Error for PolicyError {}
 /// Returns an actionable error when Cargo metadata cannot be loaded, role or
 /// policy metadata is missing or malformed, defaults violate package roles, or
 /// a native dependency path reaches a forbidden, adapter, or tooling package.
+/// A forbidden-package exception also fails unless its direct manifest
+/// declaration and resolved unified features exactly match policy.
 pub fn check_workspace(manifest_path: &Path) -> Result<PolicySummary, PolicyError> {
     let mut command = MetadataCommand::new();
     command.manifest_path(manifest_path);
@@ -128,12 +130,29 @@ struct PackageNode {
     unsafe_policy: Option<String>,
     missing_docs_policy: Option<String>,
     dependencies: Vec<DependencyEdge>,
+    resolved_features: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
 struct DependencyEdge {
     package_id: String,
     dependency_name: String,
+    declarations: Vec<DependencyDeclaration>,
+}
+
+#[derive(Clone, Debug)]
+struct DependencyDeclaration {
+    kind: ManifestDependencyKind,
+    optional: bool,
+    unconditional: bool,
+    uses_default_features: bool,
+    features: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManifestDependencyKind {
+    Normal,
+    Other,
 }
 
 #[derive(Debug)]
@@ -151,6 +170,8 @@ struct PolicyConfig {
 struct ForbiddenDependencyException {
     source: String,
     target: String,
+    default_features: bool,
+    features: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -178,6 +199,11 @@ fn check_metadata(metadata: &Metadata) -> Result<PolicySummary, PolicyError> {
         .ok_or_else(|| PolicyError::single("Cargo metadata did not contain a resolve graph"))?;
     let resolved_nodes: BTreeMap<&PackageId, _> =
         resolve.nodes.iter().map(|node| (&node.id, node)).collect();
+    let metadata_packages: BTreeMap<&PackageId, _> = metadata
+        .packages
+        .iter()
+        .map(|package| (&package.id, package))
+        .collect();
 
     let mut packages = BTreeMap::new();
     for package in &metadata.packages {
@@ -193,11 +219,46 @@ fn check_metadata(metadata: &Metadata) -> Result<PolicySummary, PolicyError> {
             .map_or_else(Vec::new, |node| {
                 node.deps
                     .iter()
-                    .map(|dependency| DependencyEdge {
-                        package_id: dependency.pkg.to_string(),
-                        dependency_name: dependency.name.clone(),
+                    .map(|dependency| {
+                        let target_name = metadata_packages
+                            .get(&dependency.pkg)
+                            .map(|target| target.name.to_string());
+                        let declarations = target_name.map_or_else(Vec::new, |target_name| {
+                            package
+                                .dependencies
+                                .iter()
+                                .filter(|declaration| {
+                                    let alias_matches = declaration.rename.as_ref().map_or_else(
+                                        || declaration.name == dependency.name,
+                                        |rename| rename == &dependency.name,
+                                    );
+                                    declaration.name == target_name && alias_matches
+                                })
+                                .map(|declaration| DependencyDeclaration {
+                                    kind: if declaration.kind == DependencyKind::Normal {
+                                        ManifestDependencyKind::Normal
+                                    } else {
+                                        ManifestDependencyKind::Other
+                                    },
+                                    optional: declaration.optional,
+                                    unconditional: declaration.target.is_none(),
+                                    uses_default_features: declaration.uses_default_features,
+                                    features: declaration.features.clone(),
+                                })
+                                .collect()
+                        });
+                        DependencyEdge {
+                            package_id: dependency.pkg.to_string(),
+                            dependency_name: dependency.name.clone(),
+                            declarations,
+                        }
                     })
                     .collect()
+            });
+        let resolved_features = resolved_nodes
+            .get(&package.id)
+            .map_or_else(Vec::new, |node| {
+                node.features.iter().map(ToString::to_string).collect()
             });
         packages.insert(
             id.clone(),
@@ -209,6 +270,7 @@ fn check_metadata(metadata: &Metadata) -> Result<PolicySummary, PolicyError> {
                 unsafe_policy,
                 missing_docs_policy,
                 dependencies,
+                resolved_features,
             },
         );
     }
@@ -276,22 +338,24 @@ fn required_exception_set(
 ) -> Result<BTreeSet<ForbiddenDependencyException>, PolicyError> {
     let values = object.get(key).and_then(Value::as_array).ok_or_else(|| {
         PolicyError::single(format!(
-            "workspace dependency policy field `{key}` must be an array of source/target tables"
+            "workspace dependency policy field `{key}` must be an array of exception tables"
         ))
     })?;
     let mut result = BTreeSet::new();
     for value in values {
         let exception = value.as_object().ok_or_else(|| {
             PolicyError::single(format!(
-                "workspace dependency policy field `{key}` must contain only source/target tables"
+                "workspace dependency policy field `{key}` must contain only exception tables"
             ))
         })?;
-        if exception.len() != 2
+        if exception.len() != 4
             || !exception.contains_key("source")
             || !exception.contains_key("target")
+            || !exception.contains_key("default-features")
+            || !exception.contains_key("features")
         {
             return Err(PolicyError::single(format!(
-                "workspace dependency policy field `{key}` entries must contain exactly `source` and `target`"
+                "workspace dependency policy field `{key}` entries must contain exactly `source`, `target`, `default-features`, and `features`"
             )));
         }
         let source = exception
@@ -312,16 +376,67 @@ fn required_exception_set(
                     "workspace dependency policy field `{key}` entry has an invalid `target`"
                 ))
             })?;
-        if !result.insert(ForbiddenDependencyException {
+        let default_features = exception
+            .get("default-features")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                PolicyError::single(format!(
+                    "workspace dependency policy field `{key}` entry has a non-Boolean `default-features`"
+                ))
+            })?;
+        if default_features {
+            return Err(PolicyError::single(format!(
+                "workspace dependency policy field `{key}` exceptions must set `default-features = false`"
+            )));
+        }
+        let features = required_exception_features(exception, key)?;
+        if result
+            .iter()
+            .any(|existing: &ForbiddenDependencyException| {
+                existing.source == source && existing.target == target
+            })
+        {
+            return Err(PolicyError::single(format!(
+                "workspace dependency policy field `{key}` contains a duplicate source/target exception"
+            )));
+        }
+        result.insert(ForbiddenDependencyException {
             source: source.to_owned(),
             target: target.to_owned(),
-        }) {
+            default_features,
+            features,
+        });
+    }
+    Ok(result)
+}
+
+fn required_exception_features(
+    exception: &Map<String, Value>,
+    key: &str,
+) -> Result<BTreeSet<String>, PolicyError> {
+    let values = exception
+        .get("features")
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty())
+        .ok_or_else(|| {
+            PolicyError::single(format!(
+                "workspace dependency policy field `{key}` exception `features` must be a non-empty array of strings"
+            ))
+        })?;
+    let mut features = BTreeSet::new();
+    for value in values {
+        let feature = value.as_str().filter(|feature| !feature.is_empty()).ok_or_else(|| {
+            PolicyError::single(format!(
+                "workspace dependency policy field `{key}` exception `features` must contain non-empty strings"
+            ))
+        })?;
+        if !features.insert(feature.to_owned()) {
             return Err(PolicyError::single(format!(
-                "workspace dependency policy field `{key}` contains a duplicate exception"
+                "workspace dependency policy field `{key}` exception `features` contains a duplicate `{feature}`"
             )));
         }
     }
-    Ok(result)
+    Ok(features)
 }
 
 fn parse_package_role(metadata: &Value) -> Option<(Option<Role>, Option<String>, Option<String>)> {
@@ -413,7 +528,14 @@ fn validate_dependency_laws(
         }
     }
 
+    let mut exception_pairs = BTreeSet::new();
     for exception in &graph.config.forbidden_exceptions {
+        if !exception_pairs.insert((exception.source.as_str(), exception.target.as_str())) {
+            violations.insert(format!(
+                "forbidden dependency exception `{} -> {}` is duplicated",
+                exception.source, exception.target
+            ));
+        }
         if !graph.config.native.contains(&exception.source) {
             violations.insert(format!(
                 "forbidden dependency exception source `{}` is not a native package",
@@ -424,6 +546,18 @@ fn validate_dependency_laws(
             violations.insert(format!(
                 "forbidden dependency exception target `{}` is not forbidden",
                 exception.target
+            ));
+        }
+        if exception.default_features {
+            violations.insert(format!(
+                "forbidden dependency exception `{} -> {}` must disable default features",
+                exception.source, exception.target
+            ));
+        }
+        if exception.features.is_empty() {
+            violations.insert(format!(
+                "forbidden dependency exception `{} -> {}` must name at least one allowed feature",
+                exception.source, exception.target
             ));
         }
     }
@@ -568,15 +702,18 @@ fn walk_native_closure(
                 ));
             }
             if is_forbidden(&target.name, &graph.config) {
-                let exception = ForbiddenDependencyException {
-                    source: root.name.clone(),
-                    target: target.name.clone(),
-                };
-                let is_exact_direct_exception = path.len() == 1
-                    && package.id == root.id
-                    && graph.config.forbidden_exceptions.contains(&exception);
-                if is_exact_direct_exception {
-                    used_exceptions.insert(exception);
+                let configured_exception =
+                    graph.config.forbidden_exceptions.iter().find(|exception| {
+                        exception.source == root.name && exception.target == target.name
+                    });
+                let is_direct_from_exception_source = path.len() == 1 && package.id == root.id;
+                if let Some(exception) = configured_exception
+                    && is_direct_from_exception_source
+                {
+                    if validate_forbidden_exception_edge(exception, &dependency, target, violations)
+                    {
+                        used_exceptions.insert(exception.clone());
+                    }
                 } else {
                     violations.insert(format!(
                         "forbidden package identity `{}` is in the native closure: {rendered_path}",
@@ -593,6 +730,108 @@ fn walk_native_closure(
     }
 }
 
+fn validate_forbidden_exception_edge(
+    exception: &ForbiddenDependencyException,
+    dependency: &DependencyEdge,
+    target: &PackageNode,
+    violations: &mut BTreeSet<String>,
+) -> bool {
+    let edge = format!("{} -> {}", exception.source, exception.target);
+    let mut valid = !exception.default_features && !exception.features.is_empty();
+    if dependency.declarations.len() == 1 {
+        let declaration = &dependency.declarations[0];
+        if declaration.kind != ManifestDependencyKind::Normal {
+            violations.insert(format!(
+                "forbidden dependency exception `{edge}` requires a normal manifest dependency"
+            ));
+            valid = false;
+        }
+        if declaration.optional {
+            violations.insert(format!(
+                "forbidden dependency exception `{edge}` requires a non-optional manifest dependency"
+            ));
+            valid = false;
+        }
+        if !declaration.unconditional {
+            violations.insert(format!(
+                "forbidden dependency exception `{edge}` requires an unconditional manifest dependency"
+            ));
+            valid = false;
+        }
+        if declaration.uses_default_features != exception.default_features {
+            violations.insert(format!(
+                "forbidden dependency exception `{edge}` requires manifest `default-features = false`"
+            ));
+            valid = false;
+        }
+        match checked_feature_set(&declaration.features) {
+            None => {
+                violations.insert(format!(
+                    "forbidden dependency exception `{edge}` manifest declaration contains an empty or duplicate feature"
+                ));
+                valid = false;
+            }
+            Some(features) if features != exception.features => {
+                violations.insert(format!(
+                    "forbidden dependency exception `{edge}` manifest features are {}; expected exactly {}",
+                    render_features(&features),
+                    render_features(&exception.features)
+                ));
+                valid = false;
+            }
+            Some(_) => {}
+        }
+    } else {
+        violations.insert(format!(
+            "forbidden dependency exception `{edge}` requires exactly one matching direct manifest declaration; found {}",
+            dependency.declarations.len()
+        ));
+        valid = false;
+    }
+
+    match checked_feature_set(&target.resolved_features) {
+        None => {
+            violations.insert(format!(
+                "resolved package identity `{}` reports an empty or duplicate enabled feature",
+                target.name
+            ));
+            valid = false;
+        }
+        Some(features) if features != exception.features => {
+            violations.insert(format!(
+                "resolved package identity `{}` enables features {}; exception `{edge}` permits exactly {}",
+                target.name,
+                render_features(&features),
+                render_features(&exception.features)
+            ));
+            valid = false;
+        }
+        Some(_) => {}
+    }
+    valid
+}
+
+fn checked_feature_set(features: &[String]) -> Option<BTreeSet<String>> {
+    let mut result = BTreeSet::new();
+    for feature in features {
+        if feature.is_empty() || !result.insert(feature.clone()) {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+fn render_features(features: &BTreeSet<String>) -> String {
+    format!(
+        "[{}]",
+        features
+            .iter()
+            .map(|feature| format!("`{feature}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 fn is_forbidden(package_name: &str, config: &PolicyConfig) -> bool {
     config.forbidden.contains(package_name)
         || config
@@ -604,11 +843,12 @@ fn is_forbidden(package_name: &str, config: &PolicyConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DependencyEdge, ForbiddenDependencyException, PackageGraph, PackageNode, PolicyConfig,
-        Role, check_graph, parse_policy_config,
+        DependencyDeclaration, DependencyEdge, ForbiddenDependencyException,
+        ManifestDependencyKind, PackageGraph, PackageNode, PolicyConfig, Role, check_graph,
+        parse_policy_config,
     };
     use serde::Deserialize;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet};
 
     #[derive(Debug, Deserialize)]
@@ -641,6 +881,8 @@ mod tests {
     struct FixtureException {
         source: String,
         target: String,
+        default_features: bool,
+        features: Vec<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -654,12 +896,25 @@ mod tests {
         missing_docs_policy: Option<String>,
         #[serde(default)]
         dependencies: Vec<FixtureDependency>,
+        #[serde(default)]
+        resolved_features: Vec<String>,
     }
 
     #[derive(Debug, Deserialize)]
     struct FixtureDependency {
         package_id: String,
         name: String,
+        #[serde(default)]
+        declarations: Vec<FixtureDeclaration>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixtureDeclaration {
+        kind: String,
+        optional: bool,
+        unconditional: bool,
+        uses_default_features: bool,
+        features: Vec<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -675,7 +930,7 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/policy-cases.json"))
                 .expect("fixture JSON should parse");
         assert!(
-            cases.len() >= 18,
+            cases.len() >= 28,
             "the policy fixture suite must remain broad"
         );
 
@@ -726,8 +981,24 @@ mod tests {
                         .map(|dependency| DependencyEdge {
                             package_id: dependency.package_id.clone(),
                             dependency_name: dependency.name.clone(),
+                            declarations: dependency
+                                .declarations
+                                .iter()
+                                .map(|declaration| DependencyDeclaration {
+                                    kind: if declaration.kind == "normal" {
+                                        ManifestDependencyKind::Normal
+                                    } else {
+                                        ManifestDependencyKind::Other
+                                    },
+                                    optional: declaration.optional,
+                                    unconditional: declaration.unconditional,
+                                    uses_default_features: declaration.uses_default_features,
+                                    features: declaration.features.clone(),
+                                })
+                                .collect(),
                         })
                         .collect(),
+                    resolved_features: package.resolved_features.clone(),
                 };
                 (node.id.clone(), node)
             })
@@ -765,6 +1036,8 @@ mod tests {
                     .map(|exception| ForbiddenDependencyException {
                         source: exception.source.clone(),
                         target: exception.target.clone(),
+                        default_features: exception.default_features,
+                        features: exception.features.iter().cloned().collect(),
                     })
                     .collect(),
                 forbidden: case.policy.forbidden.iter().cloned().collect(),
@@ -783,6 +1056,7 @@ mod tests {
             unsafe_policy: Some("forbid".to_owned()),
             missing_docs_policy: Some("deny".to_owned()),
             dependencies: Vec::new(),
+            resolved_features: Vec::new(),
         };
         let graph = PackageGraph {
             packages: BTreeMap::from([(package.id.clone(), package)]),
@@ -831,7 +1105,13 @@ mod tests {
                 "tool-packages": [],
                 "dependency-free-native-packages": ["core"],
                 "forbidden-dependency-exceptions": [
-                    { "source": "core", "target": "tokio", "reason": "too broad" }
+                    {
+                        "source": "core",
+                        "target": "tokio",
+                        "default-features": false,
+                        "features": ["rt", "sync"],
+                        "reason": "too broad"
+                    }
                 ],
                 "forbidden-packages": ["tokio"],
                 "forbidden-package-prefixes": []
@@ -841,7 +1121,19 @@ mod tests {
             parse_policy_config(&malformed_exception)
                 .expect_err("extra exception fields must fail")
                 .to_string()
-                .contains("exactly `source` and `target`")
+                .contains("exactly `source`, `target`, `default-features`, and `features`")
+        );
+
+        let missing_features = policy_metadata_with_exception(&json!({
+            "source": "core",
+            "target": "tokio",
+            "default-features": false
+        }));
+        assert!(
+            parse_policy_config(&missing_features)
+                .expect_err("missing exception fields must fail")
+                .to_string()
+                .contains("exactly `source`, `target`, `default-features`, and `features`")
         );
     }
 
@@ -855,8 +1147,8 @@ mod tests {
                 "tool-packages": [],
                 "dependency-free-native-packages": ["core"],
                 "forbidden-dependency-exceptions": [
-                    { "source": "core", "target": "tokio" },
-                    { "source": "core", "target": "tokio" }
+                    { "source": "core", "target": "tokio", "default-features": false, "features": ["rt", "sync"] },
+                    { "source": "core", "target": "tokio", "default-features": false, "features": ["rt", "time"] }
                 ],
                 "forbidden-packages": ["tokio"],
                 "forbidden-package-prefixes": []
@@ -866,7 +1158,7 @@ mod tests {
             parse_policy_config(&duplicate_exception)
                 .expect_err("duplicate exceptions must fail")
                 .to_string()
-                .contains("duplicate exception")
+                .contains("duplicate source/target exception")
         );
 
         let duplicate_root = json!({
@@ -887,5 +1179,70 @@ mod tests {
                 .to_string()
                 .contains("empty or duplicate value")
         );
+    }
+
+    #[test]
+    fn exception_default_and_feature_configuration_fail_closed() {
+        let default_features = policy_metadata_with_exception(&json!({
+            "source": "core",
+            "target": "tokio",
+            "default-features": true,
+            "features": ["rt", "sync"]
+        }));
+        assert!(
+            parse_policy_config(&default_features)
+                .expect_err("default features must not be configurable for an exception")
+                .to_string()
+                .contains("must set `default-features = false`")
+        );
+
+        let non_boolean_default = policy_metadata_with_exception(&json!({
+            "source": "core",
+            "target": "tokio",
+            "default-features": "false",
+            "features": ["rt", "sync"]
+        }));
+        assert!(
+            parse_policy_config(&non_boolean_default)
+                .expect_err("non-Boolean default feature policy must fail")
+                .to_string()
+                .contains("non-Boolean `default-features`")
+        );
+
+        for (features, expected) in [
+            (json!("rt"), "non-empty array of strings"),
+            (json!([]), "non-empty array of strings"),
+            (json!(["rt", ""]), "non-empty strings"),
+            (json!(["rt", "rt"]), "contains a duplicate `rt`"),
+        ] {
+            let metadata = policy_metadata_with_exception(&json!({
+                "source": "core",
+                "target": "tokio",
+                "default-features": false,
+                "features": features
+            }));
+            let error = parse_policy_config(&metadata)
+                .expect_err("malformed exception features must fail")
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "feature error `{error}` did not contain `{expected}`"
+            );
+        }
+    }
+
+    fn policy_metadata_with_exception(exception: &Value) -> Value {
+        json!({
+            "och-policy": {
+                "schema": 2,
+                "native-packages": ["core"],
+                "adapter-packages": [],
+                "tool-packages": [],
+                "dependency-free-native-packages": ["core"],
+                "forbidden-dependency-exceptions": [exception],
+                "forbidden-packages": ["tokio"],
+                "forbidden-package-prefixes": []
+            }
+        })
     }
 }

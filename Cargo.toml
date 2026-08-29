@@ -49,7 +49,7 @@ adapter-packages = []
 tool-packages = ["och-policy"]
 dependency-free-native-packages = ["och-core"]
 forbidden-dependency-exceptions = [
-    { source = "och-runtime", target = "tokio" },
+    { source = "och-runtime", target = "tokio", default-features = false, features = ["rt", "sync"] },
 ]
 forbidden-packages = [
     "arrow",

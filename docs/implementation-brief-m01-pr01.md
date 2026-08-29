@@ -35,9 +35,12 @@ Drop. Multiple instances are independent.
 only `rt` and `sync`. It has no `och-core` dependency because this slice has no
 model command. Policy schema 2 keeps `tokio` forbidden globally, proves
 `och-core` dependency-free, and admits only the exact direct resolved package
-edge `och-runtime -> tokio`. Aliases do not evade identity checks; malformed,
-duplicate, unused, transitive, non-native-source, and non-forbidden-target
-exceptions fail closed.
+edge `och-runtime -> tokio`. The structured exception also requires one normal,
+non-optional, unconditional manifest declaration with defaults disabled and
+exactly `rt` plus `sync`, then verifies that Tokio's resolved unified feature set
+is exactly the same. Aliases do not evade identity checks; malformed, duplicate,
+unused, transitive, declaration-mismatched, resolved-feature-broadened,
+non-native-source, and non-forbidden-target exceptions fail closed.
 
 ## Deterministic evidence
 
