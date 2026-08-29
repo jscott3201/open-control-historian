@@ -6,8 +6,9 @@ boundary, the dependency-free canonical Historian data model, bounded series
 declaration authority, source/capture provenance and admission boundary,
 independent deterministic contract evidence, and one caller-executor-owned Tokio writer
 lifecycle with strict bounded volatile ingress and latest-observation snapshots
-per runtime instance. It does **not** provide storage, persistence, durable
-history, current/held-value, or query behavior.
+per runtime instance, plus a bounded Journal V1 semantic frame format for those
+already-authorized admissions. It does **not** provide filesystem storage,
+append/sync, persistence, durable history, current/held-value, or query behavior.
 
 ## Current status
 
@@ -31,9 +32,13 @@ nonblocking and abort-only on the caller's active Tokio executor. `WriterHandled
 means the writer consumed the command and completed its publication decision;
 ineligible and stale commands remain handled no-ops. Published exact observations
 are not current/held values and prove no storage, persistence, durable history,
-query result, restart recovery, wire format, or adapter behavior. The volatile
+query result, restart recovery, or adapter behavior. The volatile
 runtime never consumes or mutates the series registry and gains no declaration,
 source-interpretation, persistence, or durability authority.
+`och-store` adds fixed store-scoped Journal V1 headers, independently framed
+canonical admissions, canonical big-endian bytes, CRC-32C, and hostile bounded
+decode into non-authorizing inspection records. It does not open, append, sync,
+lock, recover, or claim durability, and runtime does not depend on it.
 
 The current workspace contains:
 
@@ -41,13 +46,16 @@ The current workspace contains:
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model, bounded series declaration authority, and a measurement-only example |
 | [`och-runtime`](crates/och-runtime/) | native | Store-scoped caller-executor writer, canonical-admission ingress, and volatile immutable latest snapshots |
+| [`och-store`](crates/och-store/) | native | Bounded Journal V1 semantic framing and non-authorizing hostile decode |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
-`och-core` has no dependencies. `och-runtime` depends inward on `och-core`; the
+`och-core` has no dependencies. `och-runtime` and `och-store` depend inward on
+`och-core`; the
 only forbidden-dependency exception remains the direct `och-runtime -> tokio`
 edge with Tokio default features disabled and only `rt` and `sync`. Because core
-was already a native root, the union native closure remains two roots and four
-packages. `och-policy` and its dependencies are tooling excluded from defaults.
+is shared, the union native closure is three roots and five packages:
+`och-core`, `och-runtime`, `och-store`, `tokio`, and `pin-project-lite`.
+`och-policy` and its dependencies are tooling excluded from defaults.
 
 ## Toolchain and checks
 
@@ -107,6 +115,12 @@ through nextest rather than being repeated with `cargo test`.
 - [M02-PR01a canonical-admission runtime record](docs/continuation-m02-pr01a.md)
   records the store-scoped runtime authority transition, exact volatile proof,
   accepted durable-journal split, and remaining M02 hard boundary.
+- [M02-PR01b0 implementation brief](docs/implementation-brief-m02-pr01b0.md)
+  specifies the dependency-light Journal V1 semantic framing slice.
+- [M02-PR01b0 continuation](docs/continuation-m02-pr01b0.md) records exact
+  framing/decode evidence and the hard boundary before the durable PR01b1 vertical.
+- [Journal V1 format](docs/journal-v1-format.md) defines the exact version-one
+  header, frame, payload, byte-order, bound, checksum, and refusal contracts.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

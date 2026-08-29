@@ -97,6 +97,12 @@ durable receipt is claimed. The following remain explicitly deferred:
   state/horizon;
 - platform and filesystem qualification.
 
+M02-PR01b0 subsequently supplied only the exact bounded Journal V1 semantic
+bytes and hostile non-authorizing decoder. The filesystem, sole-writer,
+group-commit, receipt, reopen, recovery, and qualification items above remain
+the M02-PR01b1 complete active-journal durable vertical; PR01b0 does not change
+this record's non-durable runtime outcome.
+
 Persistent registry/bootstrap, manifest/rotation ownership, and durable retry
 must stay aligned with the planned M02-PR02 authority even when PR01b defines the
 active journal needed to exercise them. Query, rollup, retention policy, Studio

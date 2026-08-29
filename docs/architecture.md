@@ -6,25 +6,23 @@ M00 established the reviewed dependency-free canonical model. M01-PR01 added a
 separate native lifecycle root, M01-PR02 connected it inward through bounded
 volatile ingress, and M01-PR03 added bounded runtime-local latest publication.
 M00-PR04 added bounded canonical series declaration authority, M00-PR05 added
-bounded source/capture provenance and canonical admission, and M02-PR01a wires
-only that complete admission evidence into an explicitly store-scoped volatile
-runtime:
+bounded source/capture provenance and canonical admission, M02-PR01a wires only
+that complete admission evidence into an explicitly store-scoped volatile
+runtime, and M02-PR01b0 adds its non-durable Journal V1 semantic framing:
 
 ```text
 default workspace selection
         |
         v
-  och-core (native) <---- och-runtime (native)       och-policy (tooling)
-  canonical model         caller-owned executor      cargo_metadata + parsing
-  series + admission      canonical admissions
-  no dependencies         one writer + 16 slots      support
-                          store-scoped latest
-                                   |
-                                   v
-                           tokio rt + sync only
-        ^
-        |
-  future adapters (not created yet)
+  och-store (native) ----> och-core (native) <---- och-runtime (native)
+  Journal V1 frames            ^                   caller-owned executor
+  hostile bounded decode       |                   one writer + 16 slots
+                               |                   store-scoped latest
+                               |                           |
+                 future adapters (not created yet)         v
+                                                   tokio rt + sync only
+
+  och-policy (tooling): cargo_metadata + parsing support
 ```
 
 [`och-core`](../crates/och-core/) owns exact platform-independent contracts for
@@ -62,9 +60,25 @@ revision. Source/declaration evidence stays owned by the command until terminal
 completion or recoverable rejection. This transition defines no journal bytes or
 durable acceptance.
 
+[`och-store`](../crates/och-store/) owns version-one semantic bytes for complete
+already-authorized admissions. A fixed 28-byte header scopes a future journal to
+one exact `StoreId`; each independent admission frame carries its own magic,
+version, closed kind, zero flags, positive append sequence, bounded payload
+length, complete canonical payload, and CRC-32C. Integer fields are big-endian
+and strings and counts are explicitly length-prefixed. Decode checks the
+declared payload against both the fixed 8 MiB maximum and a caller-selected lower
+limit before any field allocation. It produces only store-owned non-authorizing
+inspection evidence, never a registry-issued declaration or `CanonicalAdmission`.
+
+This crate deliberately owns no path, file, open, append, synchronization,
+locking, writer, receipt, recovery, registry mutation, or runtime behavior.
+`och-runtime` has no dependency on it. M02-PR01b1 must connect framing to one
+complete active-journal durable vertical; PR01b0 does not create a callable
+parallel journal path or make any persistence claim.
+
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`
-selects both native roots and no tooling. Consequently the tool's Cargo
+selects all three native roots and no tooling. Consequently the tool's Cargo
 metadata/parsing dependencies do not masquerade as native product dependencies.
 
 ## Direction and ownership
@@ -156,8 +170,8 @@ admission or envelope content.
 ## Intentionally absent
 
 There is currently no async/blocking admission wait, configurable capacity,
-eviction, public queue status, subscription/wait API, mutable read guard, journal,
-segment, storage engine, persistence or wire format, durable history, restart recovery,
+eviction, public queue status, subscription/wait API, mutable read guard, active
+journal, segment, storage engine, persistence, durable history, restart recovery,
 query engine, network service, SQL layer, cloud/object provider, embedded database,
 memory mapping, Studio/Engine link, adapter, or donor-code compatibility layer.
 
@@ -172,4 +186,6 @@ The canonical declaration transition and its pre-M02 hard stop are recorded by
 exact future journal input boundary are recorded by
 [M00-PR05](continuation-m00-pr05.md). The store-scoped canonical-admission runtime
 transition and accepted split before journal bytes are recorded by
-[M02-PR01a](continuation-m02-pr01a.md).
+[M02-PR01a](continuation-m02-pr01a.md). The exact non-durable Journal V1 bytes
+and remaining durable hard stop are recorded by
+[M02-PR01b0](continuation-m02-pr01b0.md).

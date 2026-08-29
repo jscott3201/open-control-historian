@@ -21,16 +21,18 @@ Recorded for M00-PR01 with `./scripts/measure-baseline.sh`:
 
 The script first builds and runs the example, verifies its fixed marker output,
 then selects only the configured default `och-core` root from all-present-feature
-Cargo metadata. It fails unless the workspace has the two reviewed M01 native
+Cargo metadata. It fails unless the workspace has the three reviewed native
 roots, `och-core`'s own closure remains one package, and the executable stays
 within the bound. It does not build or measure `och-runtime`; Tokio is therefore
 not attributed to this model baseline. Live results are written to
 `target/baseline/baseline.txt`; release-cycle CI uploads that file so
 platform-specific evidence is not confused with this initial macOS record.
 
-The executable size above remains the historical M00 measurement. M01 changes
-the current workspace policy result to two native roots and a four-package union
-closure (`och-core`, `och-runtime`, `tokio`, and `pin-project-lite`) while the
+The executable size above remains the historical M00 measurement. M01 changed
+the workspace policy result to two native roots and a four-package union
+closure (`och-core`, `och-runtime`, `tokio`, and `pin-project-lite`). M02-PR01b0
+adds dependency-light `och-store`, making the current result three native roots
+and a five-package union closure while the
 measured `och-core` closure remains exactly one package. No runtime binary, RSS,
 latency, throughput, ingress, or durability measurement is claimed.
 
