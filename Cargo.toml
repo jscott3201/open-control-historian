@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/och-core", "crates/och-runtime", "tools/och-policy"]
-default-members = ["crates/och-core", "crates/och-runtime"]
+members = ["crates/och-core", "crates/och-runtime", "crates/och-store", "tools/och-policy"]
+default-members = ["crates/och-core", "crates/och-runtime", "crates/och-store"]
 
 [workspace.package]
 version = "0.0.0"
@@ -44,7 +44,7 @@ strip = false
 # adapter part of the default native product boundary.
 [workspace.metadata.och-policy]
 schema = 2
-native-packages = ["och-core", "och-runtime"]
+native-packages = ["och-core", "och-runtime", "och-store"]
 adapter-packages = []
 tool-packages = ["och-policy"]
 dependency-free-native-packages = ["och-core"]

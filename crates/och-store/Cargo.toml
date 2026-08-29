@@ -1,0 +1,24 @@
+[package]
+name = "och-store"
+description = "Bounded Journal V1 semantic framing for OpenControl Historian"
+readme = "../../README.md"
+keywords = ["historian", "industrial", "opencontrol"]
+categories = ["encoding"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata.och]
+role = "native"
+unsafe-policy = "forbid"
+missing-docs-policy = "deny"
+
+[dependencies]
+och-core = { version = "=0.0.0", path = "../och-core" }
+
+[lints]
+workspace = true

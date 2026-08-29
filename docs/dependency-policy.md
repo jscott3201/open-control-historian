@@ -17,7 +17,7 @@ fail closed during the graph check.
 
 `dependency-free-native-packages = ["och-core"]` separately names the canonical
 model root whose resolved dependency list must remain empty. This proves
-`och-core`'s closure independently of the other native root.
+`och-core`'s closure independently of the other native roots.
 
 The root `default-members` selection must consist only of native packages, and
 every native package must be selected. This explicit comparison distinguishes
@@ -43,6 +43,11 @@ no exception: both package identities are declared native, and `och-core` remain
 independently dependency-free. Because both were already traversal roots, this
 edge does not enlarge the union native closure.
 
+M02-PR01b0 adds the ordinary inward native edge `och-store -> och-core`. It
+needs no exception and adds no third-party package. `och-store` is a third
+default native root; sharing `och-core` grows the union closure by only
+`och-store` itself.
+
 ## Exact Tokio exception
 
 Tokio remains in `forbidden-packages`. One structured exception admits resolved
@@ -65,7 +70,7 @@ edge. Cargo metadata 1 for the checked-in manifest reports declaration features
 `["rt", "sync"]` and resolved Tokio node features `["rt", "sync"]`; no implicit
 feature is omitted from the executable comparison.
 
-The exception does not apply to `och-core -> tokio`, another native root, a
+The exception does not apply to `och-core -> tokio`, `och-store -> tokio`, another native root, a
 transitive `och-runtime -> helper -> tokio` path, or a path entering
 `och-runtime` from a different root. Exceptions with missing, malformed, or extra
 fields, empty/duplicate feature entries, duplicate source/target pairs,
@@ -93,8 +98,9 @@ transitive rejection, dependency-free roots, malformed/duplicate/unused
 exceptions, non-native sources, non-forbidden targets, manifest default-feature,
 kind, optionality, target, exact-feature failures, and resolved feature
 broadening. An integration test loads the actual workspace with Cargo metadata
-and proves both the feature contract and two native roots with a four-package
-union closure: `och-core`, `och-runtime`, `tokio`, and `pin-project-lite`.
+and proves both the feature contract and three native roots with a five-package
+union closure: `och-core`, `och-runtime`, `och-store`, `tokio`, and
+`pin-project-lite`.
 
 When roles or dependencies change, update policy metadata and tests together.
 Do not weaken the forbidden list or add broad exceptions merely to admit a new

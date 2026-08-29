@@ -73,8 +73,8 @@ print(len(native_names), len(visited))
 PY
 )"
 
-if [[ "${native_roots}" != "2" ]]; then
-    echo "workspace has ${native_roots} native roots; expected M01 baseline is 2" >&2
+if [[ "${native_roots}" != "3" ]]; then
+    echo "workspace has ${native_roots} native roots; expected current boundary is 3" >&2
     exit 1
 fi
 if [[ "${core_closure_packages}" != "1" ]]; then

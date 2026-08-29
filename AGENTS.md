@@ -30,6 +30,14 @@ interpretation authority. It has no persistence, durable history, query,
 storage, restart recovery, wire, or adapter behavior. Published observations
 never imply current or held values.
 
+M02-PR01b0 is the reviewed native framing successor. `och-store` depends only
+on `och-core` and owns the fixed Journal V1 header, independent bounded
+canonical-admission frames, canonical byte order, CRC-32C, and hostile bounded
+decode into non-authorizing inspection evidence. It owns no filesystem, open,
+append, synchronization, lock, writer, receipt, recovery, registry mutation, or
+durability behavior. `och-runtime` does not depend on `och-store`; M02-PR01b1
+remains the first complete active-journal durable vertical.
+
 The ignored `_roadmap/` directory is local and unpublished.
 Do not commit or push the `_roadmap/` directory to github. Preserve unrelated
 work and never use reset, stash, or broad cleanup to make a task appear clean.
@@ -49,7 +57,7 @@ public documentation.
 
 Tokio remains forbidden except for the exact direct `och-runtime -> tokio` edge
 with default features disabled and only `rt` and `sync`; never route it through a
-helper or admit it to `och-core` or another native root. Policy must verify both
+helper or admit it to `och-core`, `och-store`, or another native root. Policy must verify both
 that exact normal, non-optional manifest declaration and Tokio's resolved unified
 feature set. Do not introduce Arrow, Parquet, DataFusion, Flight, tonic/prost,
 SQLx, PostgreSQL, object/cloud providers, embedded databases, memory mapping,

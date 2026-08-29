@@ -10,7 +10,9 @@ envelope binding. M00-PR05 is the reviewed successor for source projection,
 capture/batch provenance, and the final bounded declaration-authorized canonical
 admission record. M02-PR01a changes no core model: it consumes that final record
 as the only runtime command input and scopes each runtime/latest view to one
-explicit `StoreId`. All pre-existing exact value, time, quality, order, collection,
+explicit `StoreId`. M02-PR01b0 likewise changes no core semantics: `och-store`
+encodes complete admissions into Journal V1 and decodes them only into
+non-authorizing inspection evidence. All pre-existing exact value, time, quality, order, collection,
 gap/no-change, envelope, and retry semantics remain unchanged. The model is native
 Historian authority rather than a serialization of a Studio, Engine, transport,
 or persistence schema. Future adapters must preserve supported values exactly and
@@ -168,15 +170,38 @@ records remain evidence only and are never derived from, equated with, or used t
 classify `RetryQualification`.
 
 `CanonicalAdmission` is the exact native semantic input accepted by the
-store-scoped M02-PR01a runtime and the only semantic record M02-PR01b may encode.
+store-scoped M02-PR01a runtime and the only semantic record Journal V1 encodes.
 `IngressCommand` adds no bypass constructor or second validation authority: it
 owns one admission, retry coalescing reads `admission.retry()`, and volatile
 publication reads `admission.envelope()`. The runtime rejects a foreign StoreId
 after closed-state precedence and before retry/capacity without mutating slots or
-latest state. It defines no frame, codec, persistence, group commit, durable
+latest state. Runtime defines no frame, codec, persistence, group commit, durable
 receipt, recovery, or adapter behavior. A future adapter may split one Studio batch into per-series
 admissions by copying the shared lifecycle and preserving original ordinals;
 cross-series atomicity and active binding uniqueness are deliberately absent.
+
+## Journal V1 semantic framing
+
+`och-store` consumes only an already-authorized `CanonicalAdmission`. It writes
+every publicly reachable canonical field without inference, normalization,
+generated identity, compression, dictionary substitution, or unstable hashing.
+The exact fixed header, frame prefix, payload grammar, canonical big-endian byte
+order, string/count prefixes, 8 MiB payload ceiling, and CRC-32C parameters are
+specified in [Journal V1](journal-v1-format.md).
+
+Decode treats all bytes as hostile. The declared payload length must fit both
+the hard ceiling and `DecodeLimitsV1` before strings or vectors are allocated;
+each inner count and string length is checked before its allocation. Unknown
+magic, version, kind, flag, tag, impossible count/length, invalid primitive,
+cross-field mismatch, duplicate evidence identity, truncation, trailing bytes,
+and checksum failure are closed sanitized errors.
+
+`DecodedAdmissionV1` retains the complete declaration snapshot, envelope,
+retry evidence, source batch/lifecycle, lineages, gaps, and append sequence for
+inspection and deterministic re-encoding. It deliberately cannot construct or
+convert into `CanonicalAdmission`, bind new evidence, resolve missing declaration
+history, mutate a registry, or be submitted to runtime. Journal V1 framing alone
+is neither persistence nor authorization.
 
 ### Values and content
 
