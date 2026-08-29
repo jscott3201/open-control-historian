@@ -1,11 +1,11 @@
 # OpenControl Historian
 
-OpenControl Historian is at its canonical-model and lifecycle-substrate stage.
+OpenControl Historian is at its canonical-model and bounded-runtime stage.
 This repository provides a small Rust workspace, an enforceable native dependency
 boundary, the dependency-free canonical Historian data model, independent
 deterministic contract evidence, and one caller-executor-owned Tokio writer
-lifecycle per runtime instance. It does **not** yet provide data ingress, storage,
-or persistence behavior.
+lifecycle with strict bounded volatile ingress per runtime instance. It does
+**not** provide storage, persistence, publication, or query behavior.
 
 ## Current status
 
@@ -15,25 +15,28 @@ and content-qualified retry contracts described in the
 [model contract](docs/model-contract.md). M00 also has an independent raw-fixture
 oracle, public-model adapter comparison, and checked-in schema-v1 ASCII golden
 ledger under [`crates/och-core/tests/`](crates/och-core/tests/).
-`och-runtime` adds async startup-after-readiness, consuming graceful shutdown and
-join, and nonblocking abort-only Drop on the caller's active Tokio executor. It
-has no public command channel or state observation. There is still no storage
-engine, persistence or wire format, query layer, or adapter. Those absent
-capabilities must not be inferred from lifecycle success, the model, tests,
-ledger, or baseline example.
+`och-runtime` adds async startup-after-readiness, one private writer, a synchronous
+fixed 16-command ingress, outstanding-only retry coalescing/conflict rejection,
+shared terminal receipts, draining graceful shutdown and join, and nonblocking
+abort-only Drop on the caller's active Tokio executor. `WriterHandled` means only
+that the private volatile writer consumed the command. There is still no latest
+publication or registry, snapshot/read handle, storage engine, persistence or
+wire format, query layer, or adapter. Those absent capabilities must not be
+inferred from lifecycle or receipt success, the model, tests, ledger, or baseline.
 
 The current workspace contains:
 
 | Package | Role | Purpose |
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model and a measurement-only example |
-| [`och-runtime`](crates/och-runtime/) | native | Caller-executor writer lifecycle with no data commands |
+| [`och-runtime`](crates/och-runtime/) | native | Caller-executor writer lifecycle and bounded volatile envelope ingress |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
-`och-core` has no dependencies. The only forbidden-dependency exception is the
-direct `och-runtime -> tokio` edge with Tokio default features disabled and only
-`rt` and `sync`. `och-policy` and its dependencies are workspace tooling and are
-excluded from the default native closure.
+`och-core` has no dependencies. `och-runtime` depends inward on `och-core`; the
+only forbidden-dependency exception remains the direct `och-runtime -> tokio`
+edge with Tokio default features disabled and only `rt` and `sync`. Because core
+was already a native root, the union native closure remains two roots and four
+packages. `och-policy` and its dependencies are tooling excluded from defaults.
 
 ## Toolchain and checks
 
@@ -71,8 +74,10 @@ through nextest rather than being repeated with `cargo test`.
   closure law, the exact Tokio exception, and how future adapters must point inward.
 - [M01-PR01 lifecycle contract and implementation brief](docs/implementation-brief-m01-pr01.md)
   records startup, shutdown, cancellation, error, and non-goal semantics.
-- [M01-PR02 continuation](docs/continuation-m01-pr02.md) bounds the future ingress
-  contract without preempting it in this lifecycle slice.
+- [M01-PR02 bounded-ingress delivery record](docs/continuation-m01-pr02.md)
+  records admission, retry, receipt, drain, failure, bound, and non-goal evidence.
+- [M01-PR03 continuation](docs/continuation-m01-pr03.md) reserves latest
+  publication, registry, snapshots, and read-handle ownership for separate review.
 - [M00-PR02 implementation brief](docs/implementation-brief-m00-pr02.md) records
   this model slice's scope and acceptance evidence.
 - [Foundation implementation brief](docs/implementation-brief.md) remains the

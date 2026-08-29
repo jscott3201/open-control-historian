@@ -54,11 +54,21 @@ exception laws and exact native graph. Platform evidence is the current-thread
 harness on the local host plus the repository's hosted Linux PR gate; this slice
 makes no multi-thread-runtime, WASM, or other platform compatibility claim.
 
-## Excluded
+## M01-PR02 evolution
+
+M01-PR01's vacuous-drain and no-core-dependency statements below describe that
+historical delivery boundary. M01-PR02 now adds the reviewed inward
+`och-runtime -> och-core` edge, fixed bounded envelope ingress, shared terminal
+receipts, and real graceful draining while preserving caller executor ownership,
+one private writer, startup readiness, sanitized lifecycle errors, joined
+shutdown, and abort-only Drop. Receipt handling still proves no durability.
+
+## Excluded from M01-PR01
 
 There is no public writer command, observation/envelope ingress, queue capacity,
 backpressure/coalescing, receipt, retry durability, state publication, registry,
 storage, journal, persistence, query, wire/serialization, hashing, UUID generation,
 adapter, library-owned executor/thread, blocking lifecycle API, or compatibility
-claim. The [M01-PR02 continuation](continuation-m01-pr02.md) owns the next ingress
-contract.
+claim. The [M01-PR02 delivery record](continuation-m01-pr02.md) now owns the
+implemented ingress contract, while [M01-PR03](continuation-m01-pr03.md) owns the
+next publication/read boundary.

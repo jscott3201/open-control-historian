@@ -38,6 +38,11 @@ Native paths may reach another native package or an allowed external package,
 but cannot reach a workspace adapter/tooling package or a configured forbidden
 identity except for the single structured exception below.
 
+M01-PR02 adds the ordinary inward native edge `och-runtime -> och-core`. It needs
+no exception: both package identities are declared native, and `och-core` remains
+independently dependency-free. Because both were already traversal roots, this
+edge does not enlarge the union native closure.
+
 ## Exact Tokio exception
 
 Tokio remains in `forbidden-packages`. One structured exception admits resolved

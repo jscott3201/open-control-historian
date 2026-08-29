@@ -14,7 +14,7 @@ MAX_FILE_BYTES = 1_048_576
 REQUIRED_TEXT = {
     "README.md": ("canonical Historian data model", "cargo nextest"),
     "CONTRIBUTING.md": ("cargo nextest", "test --workspace --doc --locked"),
-    "AGENTS.md": ("_roadmap/", "M00-PR03"),
+    "AGENTS.md": ("_roadmap/", "M01-PR02"),
     "docs/architecture.md": ("native", "adapter", "tooling", "canonical model"),
     "docs/dependency-policy.md": ("package identity", "default-members"),
     "docs/implementation-brief.md": ("M00-PR01", "foundation"),
@@ -25,6 +25,7 @@ REQUIRED_TEXT = {
     "docs/continuation-m00-pr02.md": ("M00-PR02", "semantic"),
     "docs/continuation-m00-pr03.md": ("M00-PR03", "independent oracle"),
     "docs/continuation-m01-pr02.md": ("M01-PR02", "bounded ingress"),
+    "docs/continuation-m01-pr03.md": ("M01-PR03", "latest publication"),
 }
 SECRET_PATTERNS = {
     "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
