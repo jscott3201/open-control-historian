@@ -1,14 +1,15 @@
 # OpenControl Historian
 
-OpenControl Historian is at its canonical-model and bounded-runtime stage.
+OpenControl Historian is at its canonical-model and bounded active-journal stage.
 This repository provides a small Rust workspace, an enforceable native dependency
 boundary, the dependency-free canonical Historian data model, bounded series
 declaration authority, source/capture provenance and admission boundary,
-independent deterministic contract evidence, and one caller-executor-owned Tokio writer
-lifecycle with strict bounded volatile ingress and latest-observation snapshots
-per runtime instance, plus a bounded Journal V1 semantic frame format for those
-already-authorized admissions. It does **not** provide filesystem storage,
-append/sync, persistence, durable history, current/held-value, or query behavior.
+independent deterministic contract evidence, and one filesystem-backed runtime
+path with exact byte reservation, a dedicated blocking writer, Journal V1 append,
+group barriers, crash-safe durable high-water receipts, bounded reopen evidence,
+and volatile latest-observation snapshots. It does **not** yet provide manifests,
+successor rotation, registry bootstrap, long-term retry, immutable history,
+current/held-value, or query behavior.
 
 ## Current status
 
@@ -21,36 +22,40 @@ content-qualified retry contracts described in the
 oracle for both the original model and series lifecycle, public-model adapter
 comparison, and checked-in schema-v1 ASCII golden
 ledger under [`crates/och-core/tests/`](crates/och-core/tests/).
-`och-runtime` adds async startup-after-readiness, one explicit immutable store
-scope, one private writer, a synchronous fixed 16-command ingress that accepts
-only complete `CanonicalAdmission` evidence, outstanding-only retry
-coalescing/conflict rejection, shared terminal receipts, and a separately fixed
-16-series runtime-local volatile latest registry. Cloneable synchronous read
-handles capture store-scoped immutable snapshots;
-graceful shutdown drains, seals the final registry, and joins, while Drop remains
-nonblocking and abort-only on the caller's active Tokio executor. `WriterHandled`
-means the writer consumed the command and completed its publication decision;
-ineligible and stale commands remain handled no-ops. Published exact observations
-are not current/held values and prove no storage, persistence, durable history,
-query result, restart recovery, or adapter behavior. The volatile
-runtime never consumes or mutates the series registry and gains no declaration,
-source-interpretation, persistence, or durability authority.
-`och-store` adds fixed store-scoped Journal V1 headers, independently framed
-canonical admissions, canonical big-endian bytes, CRC-32C, and hostile bounded
-decode into non-authorizing inspection records. It does not open, append, sync,
-lock, recover, or claim durability, and runtime does not depend on it.
+`och-runtime` now opens one explicit immutable store scope asynchronously after
+the dedicated blocking writer has created or validated and locked the active
+artifacts. Its synchronous fixed 16-command ingress accepts only complete
+`CanonicalAdmission` evidence, reserves exact frame bytes before allocation,
+preserves FIFO across protected/normal/bulk resource classes, and coalesces only
+equivalent outstanding retries. Handled receipts identify an append after its
+volatile publication decision; distinct durable receipts are released only after
+the group barrier covers that append in both the journal and checkpoint. Slots
+and byte reservations remain held through durability. Cloneable read handles
+capture store-scoped immutable latest snapshots; latest restarts empty and never
+becomes recovery or declaration authority. Graceful shutdown drains, forces a
+final barrier, seals latest, and joins. Drop signals fail-stop without blocking;
+a fixed reaper owns the eventual blocking-thread join.
+
+`och-store` owns fixed store-scoped Journal V1 framing and hostile bounded decode,
+plus the fixed generation-one active journal/checkpoint artifacts, process-safe
+writer lock, bounded append/scan, recovery convergence, centralized sync, and a
+double-slot CRC-protected durable cutoff. Reopen exposes only bounded decoded
+non-authorizing evidence and does not seed durable retry or rebuild latest. A
+durable receipt proves the active journal and checkpoint cover its append under
+the stated platform contract; it is not a manifest-backed immutable-history or
+universal physical-power-loss claim.
 
 The current workspace contains:
 
 | Package | Role | Purpose |
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model, bounded series declaration authority, and a measurement-only example |
-| [`och-runtime`](crates/och-runtime/) | native | Store-scoped caller-executor writer, canonical-admission ingress, and volatile immutable latest snapshots |
-| [`och-store`](crates/och-store/) | native | Bounded Journal V1 semantic framing and non-authorizing hostile decode |
+| [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, blocking-writer coordination, handled/durable receipts, and volatile latest snapshots |
+| [`och-store`](crates/och-store/) | native | Journal V1 framing plus bounded locked active-journal append, checkpoint, and reopen inspection |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
-`och-core` has no dependencies. `och-runtime` and `och-store` depend inward on
-`och-core`; the
+`och-core` has no dependencies. `och-store` depends inward on `och-core`, and
+`och-runtime` depends inward on both. The
 only forbidden-dependency exception remains the direct `och-runtime -> tokio`
 edge with Tokio default features disabled and only `rt` and `sync`. Because core
 is shared, the union native closure is three roots and five packages:
@@ -118,9 +123,14 @@ through nextest rather than being repeated with `cargo test`.
 - [M02-PR01b0 implementation brief](docs/implementation-brief-m02-pr01b0.md)
   specifies the dependency-light Journal V1 semantic framing slice.
 - [M02-PR01b0 continuation](docs/continuation-m02-pr01b0.md) records exact
-  framing/decode evidence and the hard boundary before the durable PR01b1 vertical.
+  framing/decode evidence and its historical hard boundary before PR01b1.
+- [M02-PR01b1 implementation brief](docs/implementation-brief-m02-pr01b1.md)
+  specifies the sole active-journal durable runtime vertical and its bounds.
+- [M02-PR01b1 continuation](docs/continuation-m02-pr01b1.md) records its exact
+  ownership, evidence, platform qualification, and remaining PR02 boundary.
 - [Journal V1 format](docs/journal-v1-format.md) defines the exact version-one
-  header, frame, payload, byte-order, bound, checksum, and refusal contracts.
+  header, frame, payload, active-artifact, checkpoint, byte-order, bound,
+  checksum, and refusal contracts.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

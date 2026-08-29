@@ -48,6 +48,13 @@ needs no exception and adds no third-party package. `och-store` is a third
 default native root; sharing `och-core` grows the union closure by only
 `och-store` itself.
 
+M02-PR01b1 adds the ordinary inward native edge `och-runtime -> och-store` so the
+only public runtime writer uses the reviewed Journal V1 and active-journal owner.
+Both are native default roots, so the edge needs no exception and adds no package
+to the three-root, five-package union closure. `och-runtime` also retains its
+direct `och-core` edge for canonical types; neither edge changes `och-core`'s
+separately enforced dependency-free status.
+
 ## Exact Tokio exception
 
 Tokio remains in `forbidden-packages`. One structured exception admits resolved

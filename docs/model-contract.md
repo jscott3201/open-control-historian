@@ -12,8 +12,10 @@ admission record. M02-PR01a changes no core model: it consumes that final record
 as the only runtime command input and scopes each runtime/latest view to one
 explicit `StoreId`. M02-PR01b0 likewise changes no core semantics: `och-store`
 encodes complete admissions into Journal V1 and decodes them only into
-non-authorizing inspection evidence. All pre-existing exact value, time, quality, order, collection,
-gap/no-change, envelope, and retry semantics remain unchanged. The model is native
+non-authorizing inspection evidence. M02-PR01b1 changes no core semantics either:
+it makes that exact byte format the sole runtime active-journal path and adds
+mechanical durable cutoff evidence around it. All pre-existing exact value, time,
+quality, order, collection, gap/no-change, envelope, and retry semantics remain unchanged. The model is native
 Historian authority rather than a serialization of a Studio, Engine, transport,
 or persistence schema. Future adapters must preserve supported values exactly and
 reject or report unsupported unsigned, unavailable, or collection-mode extensions
@@ -170,15 +172,17 @@ records remain evidence only and are never derived from, equated with, or used t
 classify `RetryQualification`.
 
 `CanonicalAdmission` is the exact native semantic input accepted by the
-store-scoped M02-PR01a runtime and the only semantic record Journal V1 encodes.
+store-scoped runtime and the only semantic record Journal V1 encodes.
 `IngressCommand` adds no bypass constructor or second validation authority: it
 owns one admission, retry coalescing reads `admission.retry()`, and volatile
 publication reads `admission.envelope()`. The runtime rejects a foreign StoreId
 after closed-state precedence and before retry/capacity without mutating slots or
-latest state. Runtime defines no frame, codec, persistence, group commit, durable
-receipt, recovery, or adapter behavior. A future adapter may split one Studio batch into per-series
-admissions by copying the shared lifecycle and preserving original ordinals;
-cross-series atomicity and active binding uniqueness are deliberately absent.
+latest state. The runtime adds only resource policy, append/publication staging,
+and mechanical handled/durable evidence; it cannot reinterpret the admission or
+turn decoded reopen evidence back into authorization. A future adapter may split
+one Studio batch into per-series admissions by copying the shared lifecycle and
+preserving original ordinals; cross-series atomicity and active binding
+uniqueness are deliberately absent.
 
 ## Journal V1 semantic framing
 
@@ -200,8 +204,32 @@ and checksum failure are closed sanitized errors.
 retry evidence, source batch/lifecycle, lineages, gaps, and append sequence for
 inspection and deterministic re-encoding. It deliberately cannot construct or
 convert into `CanonicalAdmission`, bind new evidence, resolve missing declaration
-history, mutate a registry, or be submitted to runtime. Journal V1 framing alone
-is neither persistence nor authorization.
+history, mutate a registry, or be submitted to runtime.
+
+M02-PR01b1 places those frames in one fixed generation-one active journal paired
+with a two-slot mechanical checkpoint. The runtime computes the exact frame size
+without allocating, reserves count and bytes atomically, then allocates and
+encodes under that retained reservation. The sole blocking writer assigns append
+sequence and validates frame and declaration StoreId against the journal header.
+Durable order is append, journal sync, alternate checkpoint write, checkpoint
+sync, then receipt and reservation release. The checkpoint retains only store and
+journal identity, slot generation, append sequence, end offset, and CRC. The
+public cutoff exposes slot generation separately from journal generation. Two
+valid consecutive slots must advance append sequence and end offset strictly; a
+recomputed checksum cannot legitimize a non-progressing cutoff. The checkpoint is
+neither registry nor retry authority.
+
+Open scans only configured active bytes and record counts. It refuses corruption
+inside the durable prefix, any ambiguous newer nonzero checkpoint slot, and any
+complete malformed suffix followed by later bytes. A proven terminal invalid
+unacknowledged suffix may be truncated and synchronized; a proven valid suffix
+may be synchronized and checkpointed before readiness. A missing checkpoint is
+created only for an exact valid header-only journal under the retained lock.
+Returned
+reopen records remain `DecodedAdmissionV1` inspection evidence, never seed a
+completed retry cache, and do not rebuild volatile latest. Journal persistence is
+therefore bounded to this active generation and cutoff; manifests, rotation,
+registry bootstrap, immutable history, and durable long-term retry remain absent.
 
 ### Values and content
 

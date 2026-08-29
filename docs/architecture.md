@@ -6,21 +6,21 @@ M00 established the reviewed dependency-free canonical model. M01-PR01 added a
 separate native lifecycle root, M01-PR02 connected it inward through bounded
 volatile ingress, and M01-PR03 added bounded runtime-local latest publication.
 M00-PR04 added bounded canonical series declaration authority, M00-PR05 added
-bounded source/capture provenance and canonical admission, M02-PR01a wires only
-that complete admission evidence into an explicitly store-scoped volatile
-runtime, and M02-PR01b0 adds its non-durable Journal V1 semantic framing:
+bounded source/capture provenance and canonical admission, M02-PR01a established
+the store-scoped runtime input, M02-PR01b0 froze Journal V1 semantic framing, and
+M02-PR01b1 connects that single path to one bounded active-journal durable
+vertical:
 
 ```text
 default workspace selection
         |
         v
-  och-store (native) ----> och-core (native) <---- och-runtime (native)
-  Journal V1 frames            ^                   caller-owned executor
-  hostile bounded decode       |                   one writer + 16 slots
-                               |                   store-scoped latest
-                               |                           |
-                 future adapters (not created yet)         v
-                                                   tokio rt + sync only
+  och-runtime (native) ----> och-store (native) ----> och-core (native)
+  Tokio coordinator            active journal              ^
+  16 slots + byte bounds       Journal V1 + checkpoint      |
+       |                                                    |
+       v                                      future adapters (not created yet)
+  tokio rt + sync only
 
   och-policy (tooling): cargo_metadata + parsing support
 ```
@@ -34,47 +34,69 @@ comparison. It retains no product dependencies. Its only executable remains a
 baseline example used to verify buildability and measure a native binary bound;
 that example is not a runtime or supported product command.
 
-[`och-runtime`](../crates/och-runtime/) owns async writer lifecycle, one immutable
-`StoreId`, one fixed volatile admission window, and one fixed volatile latest
-registry per instance. Its public runtime starts one private task on the caller's
-active Tokio executor and returns after private state, store-scoped ingress, and
-an empty store-scoped latest view are ready. `IngressCommand` owns exactly one
-already-authorized `CanonicalAdmission`; there is no bare-envelope command path.
-A custom cloneable ingress synchronously admits at most 16 outstanding distinct
-commands, including in-flight work, and exposes no Tokio type. Closed state takes
-precedence, then a foreign store is recoverably refused before retry comparison
-or capacity. Exact core retry classification coalesces only equivalent
-outstanding work; conflicts, full capacity, and closure recover the complete
-incoming command. A separate synchronous read handle captures immutable
-store-scoped snapshots of at most 16 nominal series. Multiple runtimes, including
-ones for different stores, are independent; there is no global singleton,
-restart path, or exposed writer state. Tokio remains admitted only on the direct
-runtime edge with default features disabled and `rt` plus `sync` enabled.
+[`och-runtime`](../crates/och-runtime/) owns the async facade around one immutable
+`StoreId`, one fixed 16-command count window, explicit exact encoded-byte limits,
+one Tokio coordinator, one dedicated blocking store writer, one fixed reaper,
+and one fixed volatile latest registry. `HistorianRuntime::open` returns only
+after active-artifact create/open, retained writer lock, bounded scan/recovery
+convergence, store evidence publication, and coordinator readiness. There is no
+competing public volatile start path. `IngressCommand` owns exactly one
+already-authorized `CanonicalAdmission` plus resource class and barrier demand;
+there is no bare-envelope command path.
+
+Submission first obtains the exact Journal V1 frame length without allocating
+the frame. Under the existing state authority it applies closed/store/retry/count
+and protected/normal/bulk byte-capacity rules, retains the slot and reservation,
+then allocates and encodes outside the lock and verifies the exact length.
+Priorities reserve capacity and may demand a barrier but never reorder semantic
+FIFO. Equivalent outstanding retries share handled and durable stages; no
+completed retry outcome is seeded from reopen evidence. A separate synchronous
+read handle captures immutable store-scoped snapshots of at most 16 nominal
+series. Multiple runtimes are independent; the retained file lock excludes a
+second active writer for the same artifacts. Tokio remains admitted only on the
+direct runtime edge with default features disabled and `rt` plus `sync` enabled.
 
 The runtime neither consumes nor mutates `SeriesRegistry`; core remains the sole
 declaration and source-admission authority. Retry classification reads the
 admission's exact `RetryQualification`, while volatile publication reads only its
 validated envelope. The exact `SeriesMetadata` bind remains a runtime-local read
 optimization invariant and cannot authorize a declaration or reinterpret an old
-revision. Source/declaration evidence stays owned by the command until terminal
-completion or recoverable rejection. This transition defines no journal bytes or
-durable acceptance.
+revision. Source/declaration evidence stays owned by the command until
+append/publication returns it to the bounded slot, and the slot and exact byte
+reservation remain retained until durability or terminal stop. Reopen evidence
+is decoded and bounded but cannot authorize submission, registry, or latest state.
 
 [`och-store`](../crates/och-store/) owns version-one semantic bytes for complete
-already-authorized admissions. A fixed 28-byte header scopes a future journal to
-one exact `StoreId`; each independent admission frame carries its own magic,
-version, closed kind, zero flags, positive append sequence, bounded payload
-length, complete canonical payload, and CRC-32C. Integer fields are big-endian
-and strings and counts are explicitly length-prefixed. Decode checks the
-declared payload against both the fixed 8 MiB maximum and a caller-selected lower
-limit before any field allocation. It produces only store-owned non-authorizing
+already-authorized admissions. A fixed 28-byte header scopes a journal to one
+exact `StoreId`; each independent admission frame carries its own magic, version,
+closed kind, zero flags, positive append sequence, bounded payload length,
+complete canonical payload, and CRC-32C. Integer fields are big-endian and
+strings and counts are explicitly length-prefixed. Decode checks the declared
+payload against both the fixed 8 MiB maximum and a caller-selected lower limit
+before any field allocation. It produces only store-owned non-authorizing
 inspection evidence, never a registry-issued declaration or `CanonicalAdmission`.
 
-This crate deliberately owns no path, file, open, append, synchronization,
-locking, writer, receipt, recovery, registry mutation, or runtime behavior.
-`och-runtime` has no dependency on it. M02-PR01b1 must connect framing to one
-complete active-journal durable vertical; PR01b0 does not create a callable
-parallel journal path or make any persistence claim.
+The store also owns two exact generation-one active artifacts in one existing
+directory: the locked read/write journal and a fixed two-slot durable-high-water
+checkpoint. Create-new synchronizes the header, initial checkpoint state, and
+directory entries before readiness. The sole blocking writer assigns strict
+append sequences, explicitly seeks to journal end, and validates both frame and
+declaration StoreId against the header. A barrier performs journal sync, writes
+the alternate CRC-protected checkpoint slot, then synchronizes that checkpoint
+before publishing the new cutoff. The checkpoint contains only store/journal
+identity, slot generation, append sequence, end offset, and checksum; it is not
+registry or retry authority.
+
+Open-existing retains the writer lock, bounds journal bytes/records/payload before
+allocation, scans the checkpoint prefix exactly, and refuses interior corruption
+or ambiguous/non-progressing checkpoint fallback. Missing checkpoint genesis is
+recreated only for an exact valid header-only journal under that lock. A proven
+terminal invalid unacknowledged suffix is truncated and synchronized; a complete
+malformed frame with later bytes refuses unchanged, while a proven valid suffix
+may be synchronized and adopted before readiness. The active scan exposes bounded
+decoded evidence only and latest restarts empty. `och-store` still owns no runtime
+scheduling, receipt, registry mutation, manifest, successor rotation, immutable
+segment, or query behavior.
 
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`
@@ -122,22 +144,27 @@ See the [canonical model contract](model-contract.md).
 
 ## Lifecycle, ingress, and failure ownership
 
-The caller owns the active executor. Startup uses `Handle::try_current`, never
-constructs a Tokio runtime or thread, and fails without panic when no executor is
-active. A startup guard aborts the writer if startup is cancelled. Graceful
-shutdown retains the join while it is awaited, so cancellation drops the handle
-and requests abort rather than detaching the task. Ordinary Drop never blocks or
-promises completion. Closed errors sanitize early exit, cancellation, and panic;
-the release profile's `panic=abort` means panic classification is test/debug
-evidence, not a release recovery guarantee.
+The caller owns the active executor. Open uses `Handle::try_current`, never
+constructs a Tokio runtime, and fails without panic when no executor is active.
+Filesystem work is isolated on one long-lived standard-library blocking thread;
+the Tokio coordinator only exchanges bounded messages and awaits readiness or
+completion. A fixed reaper owns the blocking-thread join. Startup cancellation,
+runtime Drop, or shutdown cancellation signals fail-stop without joining in Drop;
+the reaper supplies observable eventual lock release. Graceful shutdown awaits
+both coordinator and reaper. Closed errors sanitize early exit, cancellation,
+panic, and path-free store I/O evidence; the release profile's `panic=abort`
+means panic classification is test/debug evidence, not a release recovery
+guarantee.
 
 One short private synchronous mutex linearizes submission, snapshot capture,
-publication swap, terminal receipt assignment, slot release, stop, and shutdown;
+publication swap, receipt assignment, reservation release, stop, and shutdown;
 no guard crosses an await. A fixed slot table and FIFO index ring bound queued plus
-in-flight distinct work at 16. Equivalent retries share one fixed terminal state
-and do not retain the duplicate admission. Closure takes precedence, then the
-exact runtime StoreId is enforced before retry comparison and the full check. The
-retry window ends at terminal completion and has no durable horizon.
+in-flight-and-pending-durability distinct work at 16. Exact encoded bytes are
+counted before allocation and held under the configured global/class ceilings.
+Equivalent retries share one two-stage state and do not retain the duplicate
+admission. Closure takes precedence, then the exact runtime StoreId is enforced
+before retry comparison and count/byte capacity. The outstanding retry window
+ends only at durable completion or terminal stop; it has no restart horizon.
 
 Only an envelope with at least one observation and explicit positions on all its
 observations is publication-eligible. Core validation makes the final observation
@@ -150,29 +177,47 @@ series fail closed without eviction or partial visibility. All five collection
 modes may publish exact observation evidence without implying hold, current value,
 freshness, interpolation, delta/reset, or interval extension.
 
-The private writer is the sole queue consumer. It stages one bounded candidate
-snapshot outside the final critical section, then swaps a complete immutable view
-before assigning `WriterHandled` for an advance. Readers see only a complete old
-or complete new view. Runtime state retains only the current snapshot; caller-held
-old snapshots account for caller-owned volatile memory, not runtime history.
+The Tokio coordinator is the sole ingress consumer and the blocking worker is the
+sole mutable store-I/O owner. The worker appends first; the coordinator then stages
+and atomically swaps the complete volatile publication decision before returning
+the worker's publication acknowledgement. `WriterHandled` exposes append identity
+only after both append and publication decision, but is explicitly non-durable.
+Readers see only a complete old or complete new latest view. Runtime latest state
+retains only the current snapshot; caller-held old snapshots account for
+caller-owned volatile memory, not runtime history.
+
+The blocking worker preserves FIFO and groups handled appends until the first of
+configured time, record, or byte bounds, explicit/immediate demand, protected
+demand, or shutdown. Durable order is append, journal sync, alternate checkpoint
+slot write, checkpoint sync, then `Durable` receipt assignment and reservation
+release. A durable receipt names store, fixed journal generation, append sequence,
+frame end, mechanical checkpoint generation, and covering cutoff. A timeout never
+synchronizes while the newest append still awaits the coordinator's publication
+acknowledgement; after acknowledgement an elapsed deadline may flush immediately.
+The receipt claims only the active artifacts under the documented platform
+contract.
 
 Graceful shutdown closes admission, drains accepted work FIFO, resolves each
-publication decision, seals the final registry, and joins. Outliving read handles
-continue to capture that sealed view. `WriterHandled` includes ineligible and stale
-no-ops and proves no durability or query result. Runtime Drop, cancelled shutdown,
-task cancellation/panic/early exit, publication fault, and admission-lock poison
-close admission, single-assign every unresolved receipt to `WriterStopped`, and
-make future snapshot capture unavailable; snapshots acquired earlier remain
-immutable. Handled state cannot be overwritten. Caller-supplied content identity
-is trusted only for core retry classification and is never recomputed from
-admission or envelope content.
+publication decision, forces a final barrier, seals latest, and joins coordinator
+and blocking worker through the reaper. Outliving read handles continue to capture
+that sealed view. `WriterHandled` includes ineligible and stale no-ops and proves
+no durability or query result. Runtime Drop, cancelled shutdown, task
+cancellation/panic/early exit, write/sync/checkpoint/publication fault, and
+admission-lock poison close admission, single-assign unresolved stages to
+`WriterStopped`, report sanitized fault health unless a typed rotation demand is
+already established, and advance no false cutoff. Previously acquired snapshots
+remain immutable. A preparation rollback likewise stops and wakes any equivalent
+receipt that coalesced during the preparation window while releasing exact bytes.
+Caller-supplied content identity is trusted only for core retry classification
+and is never recomputed from admission or envelope content.
 
 ## Intentionally absent
 
-There is currently no async/blocking admission wait, configurable capacity,
-eviction, public queue status, subscription/wait API, mutable read guard, active
-journal, segment, storage engine, persistence, durable history, restart recovery,
-query engine, network service, SQL layer, cloud/object provider, embedded database,
+There is currently no async/blocking admission wait, eviction, subscription/wait
+API, mutable read guard, manifest, active-generation successor publication,
+rotation handoff, immutable segment, registry persistence/bootstrap, durable
+long-term retry cache, latest reconstruction, broad recovery event model, query
+engine, network service, SQL layer, cloud/object provider, embedded database,
 memory mapping, Studio/Engine link, adapter, or donor-code compatibility layer.
 
 Those omissions keep the reviewed canonical model independent of lifecycle and
@@ -186,6 +231,7 @@ The canonical declaration transition and its pre-M02 hard stop are recorded by
 exact future journal input boundary are recorded by
 [M00-PR05](continuation-m00-pr05.md). The store-scoped canonical-admission runtime
 transition and accepted split before journal bytes are recorded by
-[M02-PR01a](continuation-m02-pr01a.md). The exact non-durable Journal V1 bytes
-and remaining durable hard stop are recorded by
-[M02-PR01b0](continuation-m02-pr01b0.md).
+[M02-PR01a](continuation-m02-pr01a.md). The exact Journal V1 bytes and historical
+durable hard stop are recorded by [M02-PR01b0](continuation-m02-pr01b0.md).
+The complete generation-one active-journal durable vertical and its PR02 handoff
+are recorded by [M02-PR01b1](continuation-m02-pr01b1.md).

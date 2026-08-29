@@ -18,25 +18,29 @@ declaration-authorized canonical admission record. Further `och-core` changes
 require another explicitly reviewed successor. `och-core` owns identity, exact
 value/content, time, quality/status, producer ordering, declaration lifecycle,
 source/capture provenance, collection, gap/no-change, envelope, canonical
-admission, and retry-comparison semantics. M02-PR01a is the reviewed runtime
-successor: each `och-runtime` instance is scoped to one explicit `StoreId`, and
-its command boundary consumes only complete M00-PR05 `CanonicalAdmission`
-evidence. `och-runtime` owns one private writer task per instance, readiness, a
-fixed 16-command admission window, outstanding-only retry coalescing, shared
-terminal receipts, a separately fixed 16-series volatile registry, store-scoped
-immutable snapshots, graceful drain/seal/join, and abort-only Drop. It does not
-consume or mutate `SeriesRegistry`, and gains no declaration-lifecycle or source
-interpretation authority. It has no persistence, durable history, query,
-storage, restart recovery, wire, or adapter behavior. Published observations
-never imply current or held values.
+admission, and retry-comparison semantics. M02-PR01a established the reviewed
+store-scoped runtime command boundary, and M02-PR01b0 established the reviewed
+Journal V1 semantic frame format. M02-PR01b1 is their active-journal durable
+successor: `och-runtime` depends inward on `och-store`, opens one explicitly
+bounded filesystem-backed store, admits only complete M00-PR05
+`CanonicalAdmission` evidence, reserves exact encoded bytes before allocation,
+and sends FIFO work to one dedicated blocking writer thread. Handled and durable
+receipt stages are distinct; the latter is released only after journal sync and
+the crash-safe mechanical checkpoint cover the append. A fixed reaper owns the
+eventual writer join after nonblocking Drop.
 
-M02-PR01b0 is the reviewed native framing successor. `och-store` depends only
-on `och-core` and owns the fixed Journal V1 header, independent bounded
-canonical-admission frames, canonical byte order, CRC-32C, and hostile bounded
-decode into non-authorizing inspection evidence. It owns no filesystem, open,
-append, synchronization, lock, writer, receipt, recovery, registry mutation, or
-durability behavior. `och-runtime` does not depend on `och-store`; M02-PR01b1
-remains the first complete active-journal durable vertical.
+`och-store` owns Journal V1 bytes plus fixed active-artifact create/open/lock,
+bounded scan, append, centralized synchronization, and the double-slot durable
+high-water checkpoint. Decoded reopen records remain non-authorizing inspection
+evidence. `och-runtime` retains the fixed 16-command count window, exact bounded
+byte reservations through durability, outstanding-only retry coalescing, a
+separately fixed 16-series volatile latest registry, store-scoped immutable
+snapshots, group barriers, graceful drain/final barrier/seal/join, and
+nonblocking fail-stop Drop. It does not consume or mutate `SeriesRegistry`, seed
+a completed retry cache on reopen, or gain declaration/source interpretation
+authority. Latest state restarts empty. Manifest publication, successor rotation,
+registry bootstrap, long-term retry, query, adapters, and broad recovery remain
+absent. Published observations never imply current or held values.
 
 The ignored `_roadmap/` directory is local and unpublished.
 Do not commit or push the `_roadmap/` directory to github. Preserve unrelated
@@ -55,7 +59,9 @@ by resolved Cargo package identity, not a dependency alias. Product crates must
 inherit the workspace lints, include `#![forbid(unsafe_code)]`, and deny missing
 public documentation.
 
-Tokio remains forbidden except for the exact direct `och-runtime -> tokio` edge
+The ordinary `och-runtime -> och-store -> och-core` product path adds no
+exception and no third-party package. Tokio remains forbidden except for the
+exact direct `och-runtime -> tokio` edge
 with default features disabled and only `rt` and `sync`; never route it through a
 helper or admit it to `och-core`, `och-store`, or another native root. Policy must verify both
 that exact normal, non-optional manifest declaration and Tokio's resolved unified
