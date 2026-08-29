@@ -1,0 +1,24 @@
+[package]
+name = "och-runtime"
+description = "Caller-executor lifecycle substrate for OpenControl Historian"
+readme = "../../README.md"
+keywords = ["historian", "industrial", "opencontrol"]
+categories = ["asynchronous"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata.och]
+role = "native"
+unsafe-policy = "forbid"
+missing-docs-policy = "deny"
+
+[dependencies]
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "sync"] }
+
+[lints]
+workspace = true

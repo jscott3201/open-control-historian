@@ -4,12 +4,13 @@ These instructions apply to the entire repository.
 
 ## Current authority boundary
 
-This workspace proves the M00-PR01 foundation and M00-PR02 dependency-free
-canonical Historian model. `och-core` owns reviewed identity, exact value/content,
-time, quality/status, producer ordering, collection, gap/no-change, envelope, and
-retry-comparison semantics. It has no runtime, storage, persistence, wire, query,
-or adapter implementation. M00-PR03 owns independent oracle, golden, and fixture
-evidence; do not silently change the model while building that evidence.
+This workspace proves the M00 foundation, dependency-free canonical Historian
+model, independent M00-PR03 evidence, and the M01-PR01 caller-executor lifecycle.
+`och-core` remains frozen and owns reviewed identity, exact value/content, time,
+quality/status, producer ordering, collection, gap/no-change, envelope, and
+retry-comparison semantics. `och-runtime` owns only one private writer task per
+instance, readiness, graceful shutdown/join, and abort-only Drop. It has no model
+commands, ingress, observation, persistence, registry, query, or adapter behavior.
 
 The ignored `_roadmap/` directory is local and unpublished. Do not read, edit,
 stage, copy, summarize, or publish it. Do not read PDF files. Preserve unrelated
@@ -28,10 +29,14 @@ by resolved Cargo package identity, not a dependency alias. Product crates must
 inherit the workspace lints, include `#![forbid(unsafe_code)]`, and deny missing
 public documentation.
 
-Do not introduce Tokio, Arrow, Parquet, DataFusion, Flight, tonic/prost, SQLx,
-PostgreSQL, object/cloud providers, embedded databases, memory mapping, Studio,
-Engine, or donor code into the native model. A dependency needed only by a
-policy or build check belongs under `tools/`, not in a native crate.
+Tokio remains forbidden except for the exact direct `och-runtime -> tokio` edge
+with default features disabled and only `rt` and `sync`; never route it through a
+helper or admit it to `och-core` or another native root. Policy must verify both
+that exact normal, non-optional manifest declaration and Tokio's resolved unified
+feature set. Do not introduce Arrow, Parquet, DataFusion, Flight, tonic/prost,
+SQLx, PostgreSQL, object/cloud providers, embedded databases, memory mapping,
+Studio, Engine, or donor code into the native model. A dependency needed only by
+a policy or build check belongs under `tools/`, not in a native crate.
 
 ## Required workflow
 

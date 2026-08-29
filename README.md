@@ -1,10 +1,11 @@
 # OpenControl Historian
 
-OpenControl Historian is at its evidenced canonical-model stage. This repository
-provides a small Rust workspace, an enforceable native dependency boundary, the
-dependency-free canonical Historian data model, and independent deterministic
-contract evidence. It does **not** yet provide a Historian runtime or storage
-behavior.
+OpenControl Historian is at its canonical-model and lifecycle-substrate stage.
+This repository provides a small Rust workspace, an enforceable native dependency
+boundary, the dependency-free canonical Historian data model, independent
+deterministic contract evidence, and one caller-executor-owned Tokio writer
+lifecycle per runtime instance. It does **not** yet provide data ingress, storage,
+or persistence behavior.
 
 ## Current status
 
@@ -13,20 +14,26 @@ quality/status, producer-order, collection-mode, gap/no-change, atomic envelope,
 and content-qualified retry contracts described in the
 [model contract](docs/model-contract.md). M00 also has an independent raw-fixture
 oracle, public-model adapter comparison, and checked-in schema-v1 ASCII golden
-ledger under [`crates/och-core/tests/`](crates/och-core/tests/). There is still no
-runtime, storage engine, persistence or wire format, query layer, or adapter.
-Those absent capabilities must not be inferred from the model, tests, ledger, or
-baseline example.
+ledger under [`crates/och-core/tests/`](crates/och-core/tests/).
+`och-runtime` adds async startup-after-readiness, consuming graceful shutdown and
+join, and nonblocking abort-only Drop on the caller's active Tokio executor. It
+has no public command channel or state observation. There is still no storage
+engine, persistence or wire format, query layer, or adapter. Those absent
+capabilities must not be inferred from lifecycle success, the model, tests,
+ledger, or baseline example.
 
 The current workspace contains:
 
 | Package | Role | Purpose |
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model and a measurement-only example |
+| [`och-runtime`](crates/och-runtime/) | native | Caller-executor writer lifecycle with no data commands |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
-`och-core` has no product dependencies. `och-policy` and its dependencies are
-workspace tooling and are excluded from the default native closure.
+`och-core` has no dependencies. The only forbidden-dependency exception is the
+direct `och-runtime -> tokio` edge with Tokio default features disabled and only
+`rt` and `sync`. `och-policy` and its dependencies are workspace tooling and are
+excluded from the default native closure.
 
 ## Toolchain and checks
 
@@ -38,7 +45,7 @@ Cargo tools from their prebuilt releases. Then run:
 ./scripts/gate.sh pr
 ```
 
-The PR gate formats, builds and checks the default native member, runs strict
+The PR gate formats, builds and checks the default native members, runs strict
 workspace clippy, executes tests with cargo nextest, runs doctests separately,
 proves the native metadata graph, builds rustdoc, checks repository hygiene, and
 enforces non-advisory cargo-deny policy. Nextest does not execute doctests, so
@@ -61,7 +68,11 @@ through nextest rather than being repeated with `cargo test`.
 - [Canonical model contract](docs/model-contract.md) records the exact public
   semantics, bounds, validation, and non-goals.
 - [Dependency policy](docs/dependency-policy.md) explains the executable native
-  closure law and how future adapters must point inward.
+  closure law, the exact Tokio exception, and how future adapters must point inward.
+- [M01-PR01 lifecycle contract and implementation brief](docs/implementation-brief-m01-pr01.md)
+  records startup, shutdown, cancellation, error, and non-goal semantics.
+- [M01-PR02 continuation](docs/continuation-m01-pr02.md) bounds the future ingress
+  contract without preempting it in this lifecycle slice.
 - [M00-PR02 implementation brief](docs/implementation-brief-m00-pr02.md) records
   this model slice's scope and acceptance evidence.
 - [Foundation implementation brief](docs/implementation-brief.md) remains the

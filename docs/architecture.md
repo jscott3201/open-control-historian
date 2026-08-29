@@ -1,17 +1,20 @@
-# Canonical native-model architecture
+# Canonical model and lifecycle architecture
 
 ## Present topology
 
-M00-PR01 established two workspace roles and one product boundary; M00-PR02 fills
-that native boundary with the reviewed dependency-free canonical model:
+M00 established the reviewed dependency-free canonical model. M01-PR01 adds a
+separate native lifecycle root while leaving that model frozen:
 
 ```text
 default workspace selection
         |
         v
-  och-core (native)       och-policy (tooling)
-  canonical model         cargo_metadata + parsing support
-  no dependencies
+  och-core (native)       och-runtime (native)       och-policy (tooling)
+  canonical model         caller-owned executor      cargo_metadata + parsing
+  no dependencies         one private writer         support
+                                   |
+                                   v
+                           tokio rt + sync only
         ^
         |
   future adapters (not created yet)
@@ -24,10 +27,18 @@ comparison. It retains no product dependencies. Its only executable remains a
 baseline example used to verify buildability and measure a native binary bound;
 that example is not a runtime or supported product command.
 
+[`och-runtime`](../crates/och-runtime/) owns only async writer lifecycle. Its
+public handle starts one private task on the caller's active Tokio executor,
+returns after private state initialization, consumes itself to signal and join
+normal shutdown, and requests nonblocking abortion on Drop. Multiple handles are
+independent; there is no global singleton, restart path, public command sender,
+status registry, or exposed writer state. Tokio is admitted only on this direct
+edge with default features disabled and `rt` plus `sync` enabled.
+
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
-the full workspace so clippy and tests cover it, but root `default-members`
-selects only `och-core`. Consequently the tool's Cargo metadata/parsing
-dependencies do not masquerade as native product dependencies.
+the full workspace so clippy and tests cover it, while root `default-members`
+selects both native roots and no tooling. Consequently the tool's Cargo
+metadata/parsing dependencies do not masquerade as native product dependencies.
 
 ## Direction and ownership
 
@@ -59,14 +70,27 @@ fields are private. The model does not create IDs, hash bytes, infer time or
 producer order, infer held values/deltas/resets, or translate native extensions.
 See the [canonical model contract](model-contract.md).
 
+## Lifecycle ownership and failure
+
+The caller owns the active executor. Startup uses `Handle::try_current`, never
+constructs a Tokio runtime or thread, and fails without panic when no executor is
+active. A startup guard aborts the writer if startup is cancelled. Graceful
+shutdown retains the join while it is awaited, so cancellation drops the handle
+and requests abort rather than detaching the task. Ordinary Drop never blocks or
+promises completion. Closed errors sanitize early exit, cancellation, and panic;
+the release profile's `panic=abort` means panic classification is test/debug
+evidence, not a release recovery guarantee.
+
 ## Intentionally absent
 
-There is currently no runtime, task/channel system, journal, segment, store,
-persistence or wire format, query engine, network service, SQL layer,
-cloud/object provider, embedded database, memory mapping, Studio/Engine link,
-adapter, or donor-code compatibility layer.
+There is currently no data command/ingress channel, acceptance or backpressure
+contract, receipt, state publication, registry, journal, segment, store,
+persistence or wire format, query engine, network service, SQL layer, cloud/object
+provider, embedded database, memory mapping, Studio/Engine link, adapter, or
+donor-code compatibility layer.
 
 Those omissions keep the reviewed canonical model independent of lifecycle and
 platform choices and prevent large implementation dependencies from becoming
-architectural facts before their contracts are reviewed. M00-PR03 is limited to
-independent model evidence; see [its continuation note](continuation-m00-pr03.md).
+architectural facts before their contracts are reviewed. Lifecycle details are
+bounded in the [M01-PR01 brief](implementation-brief-m01-pr01.md), and data ingress
+remains owned by [M01-PR02](continuation-m01-pr02.md).
