@@ -1,18 +1,22 @@
 # OpenControl Historian
 
-OpenControl Historian is at its canonical-model stage. This repository provides
-a small Rust workspace, an enforceable native dependency boundary, and the
-dependency-free canonical Historian data model. It does **not** yet provide a
-Historian runtime or storage behavior.
+OpenControl Historian is at its evidenced canonical-model stage. This repository
+provides a small Rust workspace, an enforceable native dependency boundary, the
+dependency-free canonical Historian data model, and independent deterministic
+contract evidence. It does **not** yet provide a Historian runtime or storage
+behavior.
 
 ## Current status
 
 `och-core` now defines the canonical identity, exact value/content, timestamp,
 quality/status, producer-order, collection-mode, gap/no-change, atomic envelope,
 and content-qualified retry contracts described in the
-[model contract](docs/model-contract.md). There is still no runtime, storage
-engine, persistence or wire format, query layer, or adapter. Those absent
-capabilities must not be inferred from the model or the baseline example.
+[model contract](docs/model-contract.md). M00 also has an independent raw-fixture
+oracle, public-model adapter comparison, and checked-in schema-v1 ASCII golden
+ledger under [`crates/och-core/tests/`](crates/och-core/tests/). There is still no
+runtime, storage engine, persistence or wire format, query layer, or adapter.
+Those absent capabilities must not be inferred from the model, tests, ledger, or
+baseline example.
 
 The current workspace contains:
 
@@ -64,8 +68,8 @@ through nextest rather than being repeated with `cargo test`.
   historical M00-PR01 record.
 - [Baseline](docs/baseline.md) records the initial dependency and binary-size
   evidence without inventing runtime measurements.
-- [M00-PR03 continuation](docs/continuation-m00-pr03.md) defines the independent
-  oracle, golden, and fixture-builder handoff.
+- [M00-PR03 evidence record](docs/continuation-m00-pr03.md) inventories the
+  delivered independent oracle, golden, fixture builders, and non-goals.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 
