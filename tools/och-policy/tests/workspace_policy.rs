@@ -14,8 +14,8 @@ fn workspace_manifest() -> PathBuf {
 fn actual_workspace_native_graph_is_minimal() {
     let summary = och_policy::check_workspace(&workspace_manifest())
         .expect("the actual workspace dependency graph should satisfy policy");
-    assert_eq!(summary.native_root_count(), 1);
-    assert_eq!(summary.native_closure_package_count(), 1);
+    assert_eq!(summary.native_root_count(), 2);
+    assert_eq!(summary.native_closure_package_count(), 4);
 }
 
 #[test]
@@ -31,7 +31,9 @@ fn command_reports_the_actual_workspace_summary() {
         "policy command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("1 package(s) in the native closure"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains(
+        "dependency policy passed: 2 native root(s), 4 package(s) in the native closure"
+    ));
 }
 
 #[test]

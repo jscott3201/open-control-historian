@@ -43,7 +43,7 @@ cargo "+${TOOLCHAIN}" metadata \
     --all-features \
     --locked > "${METADATA_FILE}"
 
-closure_packages="$(python3 - "${METADATA_FILE}" <<'PY'
+read -r native_roots core_closure_packages <<< "$(python3 - "${METADATA_FILE}" <<'PY'
 import json
 import sys
 
@@ -55,8 +55,11 @@ packages = {package["id"]: package for package in metadata["packages"]}
 roots = [
     package_id
     for package_id in metadata["workspace_default_members"]
-    if packages[package_id]["name"] in native_names
+    if packages[package_id]["name"] == "och-core"
+    and packages[package_id]["name"] in native_names
 ]
+if len(roots) != 1:
+    raise SystemExit("och-core must be one configured default native root")
 nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
 visited = set(roots)
 pending = list(roots)
@@ -66,12 +69,16 @@ while pending:
         if dependency not in visited:
             visited.add(dependency)
             pending.append(dependency)
-print(len(visited))
+print(len(native_names), len(visited))
 PY
 )"
 
-if [[ "${closure_packages}" != "1" ]]; then
-    echo "native closure contains ${closure_packages} packages; expected native baseline is 1" >&2
+if [[ "${native_roots}" != "2" ]]; then
+    echo "workspace has ${native_roots} native roots; expected M01 baseline is 2" >&2
+    exit 1
+fi
+if [[ "${core_closure_packages}" != "1" ]]; then
+    echo "och-core closure contains ${core_closure_packages} packages; expected dependency-free baseline is 1" >&2
     exit 1
 fi
 
@@ -80,8 +87,9 @@ fi
     echo "machine: $(uname -srm)"
     echo "rustc: $(rustc "+${TOOLCHAIN}" --version)"
     echo "profile: release (thin LTO, one codegen unit, panic=abort, symbols stripped)"
-    echo "native roots: 1"
-    echo "native closure packages: ${closure_packages}"
+    echo "workspace native roots: ${native_roots}"
+    echo "measured native root: och-core"
+    echo "och-core closure packages: ${core_closure_packages}"
     echo "baseline executable bytes: ${binary_bytes}"
     echo "baseline executable limit bytes: ${MAX_BINARY_BYTES}"
     echo "idle RSS: N/A (the measurement example has no long-running process to measure)"

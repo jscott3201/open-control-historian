@@ -20,10 +20,19 @@ Recorded for M00-PR01 with `./scripts/measure-baseline.sh`:
 | Idle RSS | N/A — there is no long-running process to measure |
 
 The script first builds and runs the example, verifies its fixed marker output,
-computes the all-present-feature native closure from Cargo metadata, and fails if
-the closure is not one package or the executable exceeds the bound. Live results
-are written to `target/baseline/baseline.txt`; release-cycle CI uploads that file
-so platform-specific evidence is not confused with this initial macOS record.
+then selects only the configured default `och-core` root from all-present-feature
+Cargo metadata. It fails unless the workspace has the two reviewed M01 native
+roots, `och-core`'s own closure remains one package, and the executable stays
+within the bound. It does not build or measure `och-runtime`; Tokio is therefore
+not attributed to this model baseline. Live results are written to
+`target/baseline/baseline.txt`; release-cycle CI uploads that file so
+platform-specific evidence is not confused with this initial macOS record.
+
+The executable size above remains the historical M00 measurement. M01 changes
+the current workspace policy result to two native roots and a four-package union
+closure (`och-core`, `och-runtime`, `tokio`, and `pin-project-lite`) while the
+measured `och-core` closure remains exactly one package. No runtime binary, RSS,
+latency, throughput, ingress, or durability measurement is claimed.
 
 The 1 MiB executable limit is a regression tripwire, not a performance target.
 If a later reviewed architecture change legitimately changes the baseline,

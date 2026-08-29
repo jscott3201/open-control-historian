@@ -19,10 +19,12 @@ REQUIRED_TEXT = {
     "docs/dependency-policy.md": ("package identity", "default-members"),
     "docs/implementation-brief.md": ("M00-PR01", "foundation"),
     "docs/implementation-brief-m00-pr02.md": ("M00-PR02", "canonical model"),
+    "docs/implementation-brief-m01-pr01.md": ("M01-PR01", "abort-only"),
     "docs/model-contract.md": ("UUIDv7", "CollectionEnvelope", "256", "64"),
     "docs/baseline.md": ("Idle RSS", "N/A"),
     "docs/continuation-m00-pr02.md": ("M00-PR02", "semantic"),
     "docs/continuation-m00-pr03.md": ("M00-PR03", "independent oracle"),
+    "docs/continuation-m01-pr02.md": ("M01-PR02", "bounded ingress"),
 }
 SECRET_PATTERNS = {
     "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/och-core", "tools/och-policy"]
-default-members = ["crates/och-core"]
+members = ["crates/och-core", "crates/och-runtime", "tools/och-policy"]
+default-members = ["crates/och-core", "crates/och-runtime"]
 
 [workspace.package]
 version = "0.0.0"
@@ -43,10 +43,14 @@ strip = false
 # are explicit so workspace membership cannot silently make tooling or a future
 # adapter part of the default native product boundary.
 [workspace.metadata.och-policy]
-schema = 1
-native-packages = ["och-core"]
+schema = 2
+native-packages = ["och-core", "och-runtime"]
 adapter-packages = []
 tool-packages = ["och-policy"]
+dependency-free-native-packages = ["och-core"]
+forbidden-dependency-exceptions = [
+    { source = "och-runtime", target = "tokio" },
+]
 forbidden-packages = [
     "arrow",
     "arrow-array",

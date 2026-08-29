@@ -2,11 +2,11 @@
 #![deny(missing_docs)]
 //! Enforcement for the `OpenControl` Historian workspace dependency boundary.
 //!
-//! The checker deliberately starts from Cargo's default workspace members and
-//! follows package identities from `cargo metadata`. Dependency aliases are
-//! retained only for diagnostics, so renaming a forbidden crate cannot bypass
-//! the policy. Tool packages remain visible for ownership validation but are not
-//! roots of the native product closure.
+//! The checker deliberately starts from explicitly configured native workspace
+//! members and follows package identities from `cargo metadata`. Dependency
+//! aliases are retained only for diagnostics, so renaming a forbidden crate
+//! cannot bypass the policy. Tool packages remain visible for ownership
+//! validation but are not roots of the native product closure.
 
 use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, PackageId};
 use serde_json::{Map, Value};
@@ -141,8 +141,16 @@ struct PolicyConfig {
     native: BTreeSet<String>,
     adapters: BTreeSet<String>,
     tools: BTreeSet<String>,
+    dependency_free_native: BTreeSet<String>,
+    forbidden_exceptions: BTreeSet<ForbiddenDependencyException>,
     forbidden: BTreeSet<String>,
     forbidden_prefixes: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ForbiddenDependencyException {
+    source: String,
+    target: String,
 }
 
 #[derive(Debug)]
@@ -221,15 +229,17 @@ fn parse_policy_config(metadata: &Value) -> Result<PolicyConfig, PolicyError> {
                 "workspace metadata is missing table `workspace.metadata.och-policy`",
             )
         })?;
-    if object.get("schema").and_then(Value::as_u64) != Some(1) {
+    if object.get("schema").and_then(Value::as_u64) != Some(2) {
         return Err(PolicyError::single(
-            "workspace dependency policy must declare integer `schema = 1`",
+            "workspace dependency policy must declare integer `schema = 2`",
         ));
     }
     Ok(PolicyConfig {
         native: required_string_set(object, "native-packages")?,
         adapters: required_string_set(object, "adapter-packages")?,
         tools: required_string_set(object, "tool-packages")?,
+        dependency_free_native: required_string_set(object, "dependency-free-native-packages")?,
+        forbidden_exceptions: required_exception_set(object, "forbidden-dependency-exceptions")?,
         forbidden: required_string_set(object, "forbidden-packages")?,
         forbidden_prefixes: required_string_set(object, "forbidden-package-prefixes")?,
     })
@@ -254,6 +264,60 @@ fn required_string_set(
         if value.is_empty() || !result.insert(value.to_owned()) {
             return Err(PolicyError::single(format!(
                 "workspace dependency policy field `{key}` contains an empty or duplicate value"
+            )));
+        }
+    }
+    Ok(result)
+}
+
+fn required_exception_set(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<BTreeSet<ForbiddenDependencyException>, PolicyError> {
+    let values = object.get(key).and_then(Value::as_array).ok_or_else(|| {
+        PolicyError::single(format!(
+            "workspace dependency policy field `{key}` must be an array of source/target tables"
+        ))
+    })?;
+    let mut result = BTreeSet::new();
+    for value in values {
+        let exception = value.as_object().ok_or_else(|| {
+            PolicyError::single(format!(
+                "workspace dependency policy field `{key}` must contain only source/target tables"
+            ))
+        })?;
+        if exception.len() != 2
+            || !exception.contains_key("source")
+            || !exception.contains_key("target")
+        {
+            return Err(PolicyError::single(format!(
+                "workspace dependency policy field `{key}` entries must contain exactly `source` and `target`"
+            )));
+        }
+        let source = exception
+            .get("source")
+            .and_then(Value::as_str)
+            .filter(|source| !source.is_empty())
+            .ok_or_else(|| {
+                PolicyError::single(format!(
+                    "workspace dependency policy field `{key}` entry has an invalid `source`"
+                ))
+            })?;
+        let target = exception
+            .get("target")
+            .and_then(Value::as_str)
+            .filter(|target| !target.is_empty())
+            .ok_or_else(|| {
+                PolicyError::single(format!(
+                    "workspace dependency policy field `{key}` entry has an invalid `target`"
+                ))
+            })?;
+        if !result.insert(ForbiddenDependencyException {
+            source: source.to_owned(),
+            target: target.to_owned(),
+        }) {
+            return Err(PolicyError::single(format!(
+                "workspace dependency policy field `{key}` contains a duplicate exception"
             )));
         }
     }
@@ -287,12 +351,30 @@ fn check_graph(graph: &PackageGraph) -> Result<PolicySummary, PolicyError> {
         .collect();
 
     validate_ownership(graph, &workspace_by_name, &mut violations);
+    validate_dependency_laws(graph, &workspace_by_name, &mut violations);
 
     let mut closure = BTreeSet::new();
+    let mut used_exceptions = BTreeSet::new();
     for native_name in &graph.config.native {
         if let Some(root) = workspace_by_name.get(native_name.as_str()) {
-            walk_native_closure(graph, root, &mut closure, &mut violations);
+            walk_native_closure(
+                graph,
+                root,
+                &mut closure,
+                &mut used_exceptions,
+                &mut violations,
+            );
         }
+    }
+    for exception in graph
+        .config
+        .forbidden_exceptions
+        .difference(&used_exceptions)
+    {
+        violations.insert(format!(
+            "forbidden dependency exception `{} -> {}` is unused",
+            exception.source, exception.target
+        ));
     }
 
     if violations.is_empty() {
@@ -302,6 +384,48 @@ fn check_graph(graph: &PackageGraph) -> Result<PolicySummary, PolicyError> {
         })
     } else {
         Err(PolicyError::from_messages(violations))
+    }
+}
+
+fn validate_dependency_laws(
+    graph: &PackageGraph,
+    workspace_by_name: &BTreeMap<&str, &PackageNode>,
+    violations: &mut BTreeSet<String>,
+) {
+    if graph.config.dependency_free_native.is_empty() {
+        violations.insert(
+            "policy must explicitly name at least one dependency-free native package".to_owned(),
+        );
+    }
+    for name in &graph.config.dependency_free_native {
+        if !graph.config.native.contains(name) {
+            violations.insert(format!(
+                "dependency-free package `{name}` is not configured as native"
+            ));
+            continue;
+        }
+        if let Some(package) = workspace_by_name.get(name.as_str())
+            && !package.dependencies.is_empty()
+        {
+            violations.insert(format!(
+                "dependency-free native package `{name}` has resolved dependencies"
+            ));
+        }
+    }
+
+    for exception in &graph.config.forbidden_exceptions {
+        if !graph.config.native.contains(&exception.source) {
+            violations.insert(format!(
+                "forbidden dependency exception source `{}` is not a native package",
+                exception.source
+            ));
+        }
+        if !is_forbidden(&exception.target, &graph.config) {
+            violations.insert(format!(
+                "forbidden dependency exception target `{}` is not forbidden",
+                exception.target
+            ));
+        }
     }
 }
 
@@ -398,6 +522,7 @@ fn walk_native_closure(
     graph: &PackageGraph,
     root: &PackageNode,
     closure: &mut BTreeSet<String>,
+    used_exceptions: &mut BTreeSet<ForbiddenDependencyException>,
     violations: &mut BTreeSet<String>,
 ) {
     let mut visited = BTreeSet::from([root.id.clone()]);
@@ -443,10 +568,21 @@ fn walk_native_closure(
                 ));
             }
             if is_forbidden(&target.name, &graph.config) {
-                violations.insert(format!(
-                    "forbidden package identity `{}` is in the native closure: {rendered_path}",
-                    target.name
-                ));
+                let exception = ForbiddenDependencyException {
+                    source: root.name.clone(),
+                    target: target.name.clone(),
+                };
+                let is_exact_direct_exception = path.len() == 1
+                    && package.id == root.id
+                    && graph.config.forbidden_exceptions.contains(&exception);
+                if is_exact_direct_exception {
+                    used_exceptions.insert(exception);
+                } else {
+                    violations.insert(format!(
+                        "forbidden package identity `{}` is in the native closure: {rendered_path}",
+                        target.name
+                    ));
+                }
             }
 
             closure.insert(target.id.clone());
@@ -467,8 +603,12 @@ fn is_forbidden(package_name: &str, config: &PolicyConfig) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DependencyEdge, PackageGraph, PackageNode, PolicyConfig, Role, check_graph};
+    use super::{
+        DependencyEdge, ForbiddenDependencyException, PackageGraph, PackageNode, PolicyConfig,
+        Role, check_graph, parse_policy_config,
+    };
     use serde::Deserialize;
+    use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
 
     #[derive(Debug, Deserialize)]
@@ -488,9 +628,19 @@ mod tests {
         #[serde(default)]
         tools: Vec<String>,
         #[serde(default)]
+        dependency_free_native: Vec<String>,
+        #[serde(default)]
+        forbidden_exceptions: Vec<FixtureException>,
+        #[serde(default)]
         forbidden: Vec<String>,
         #[serde(default)]
         forbidden_prefixes: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixtureException {
+        source: String,
+        target: String,
     }
 
     #[derive(Debug, Deserialize)]
@@ -525,7 +675,7 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/policy-cases.json"))
                 .expect("fixture JSON should parse");
         assert!(
-            cases.len() >= 9,
+            cases.len() >= 18,
             "the policy fixture suite must remain broad"
         );
 
@@ -602,6 +752,21 @@ mod tests {
                 native: case.policy.native.iter().cloned().collect(),
                 adapters: case.policy.adapters.iter().cloned().collect(),
                 tools: case.policy.tools.iter().cloned().collect(),
+                dependency_free_native: case
+                    .policy
+                    .dependency_free_native
+                    .iter()
+                    .cloned()
+                    .collect(),
+                forbidden_exceptions: case
+                    .policy
+                    .forbidden_exceptions
+                    .iter()
+                    .map(|exception| ForbiddenDependencyException {
+                        source: exception.source.clone(),
+                        target: exception.target.clone(),
+                    })
+                    .collect(),
                 forbidden: case.policy.forbidden.iter().cloned().collect(),
                 forbidden_prefixes: case.policy.forbidden_prefixes.iter().cloned().collect(),
             },
@@ -626,6 +791,8 @@ mod tests {
                 native: BTreeSet::from(["native-root".to_owned()]),
                 adapters: BTreeSet::from(["native-root".to_owned()]),
                 tools: BTreeSet::new(),
+                dependency_free_native: BTreeSet::from(["native-root".to_owned()]),
+                forbidden_exceptions: BTreeSet::new(),
                 forbidden: BTreeSet::new(),
                 forbidden_prefixes: BTreeSet::new(),
             },
@@ -633,5 +800,92 @@ mod tests {
 
         let error = check_graph(&graph).expect_err("duplicate ownership must fail");
         assert!(error.to_string().contains("assigned to both"));
+    }
+
+    #[test]
+    fn policy_schema_and_exception_shape_fail_closed() {
+        let wrong_schema = json!({
+            "och-policy": {
+                "schema": 1,
+                "native-packages": ["core"],
+                "adapter-packages": [],
+                "tool-packages": [],
+                "dependency-free-native-packages": ["core"],
+                "forbidden-dependency-exceptions": [],
+                "forbidden-packages": ["tokio"],
+                "forbidden-package-prefixes": []
+            }
+        });
+        assert!(
+            parse_policy_config(&wrong_schema)
+                .expect_err("old schemas must fail")
+                .to_string()
+                .contains("schema = 2")
+        );
+
+        let malformed_exception = json!({
+            "och-policy": {
+                "schema": 2,
+                "native-packages": ["core"],
+                "adapter-packages": [],
+                "tool-packages": [],
+                "dependency-free-native-packages": ["core"],
+                "forbidden-dependency-exceptions": [
+                    { "source": "core", "target": "tokio", "reason": "too broad" }
+                ],
+                "forbidden-packages": ["tokio"],
+                "forbidden-package-prefixes": []
+            }
+        });
+        assert!(
+            parse_policy_config(&malformed_exception)
+                .expect_err("extra exception fields must fail")
+                .to_string()
+                .contains("exactly `source` and `target`")
+        );
+    }
+
+    #[test]
+    fn duplicate_policy_values_and_exceptions_fail_closed() {
+        let duplicate_exception = json!({
+            "och-policy": {
+                "schema": 2,
+                "native-packages": ["core"],
+                "adapter-packages": [],
+                "tool-packages": [],
+                "dependency-free-native-packages": ["core"],
+                "forbidden-dependency-exceptions": [
+                    { "source": "core", "target": "tokio" },
+                    { "source": "core", "target": "tokio" }
+                ],
+                "forbidden-packages": ["tokio"],
+                "forbidden-package-prefixes": []
+            }
+        });
+        assert!(
+            parse_policy_config(&duplicate_exception)
+                .expect_err("duplicate exceptions must fail")
+                .to_string()
+                .contains("duplicate exception")
+        );
+
+        let duplicate_root = json!({
+            "och-policy": {
+                "schema": 2,
+                "native-packages": ["core"],
+                "adapter-packages": [],
+                "tool-packages": [],
+                "dependency-free-native-packages": ["core", "core"],
+                "forbidden-dependency-exceptions": [],
+                "forbidden-packages": ["tokio"],
+                "forbidden-package-prefixes": []
+            }
+        });
+        assert!(
+            parse_policy_config(&duplicate_root)
+                .expect_err("duplicate dependency-free roots must fail")
+                .to_string()
+                .contains("empty or duplicate value")
+        );
     }
 }
