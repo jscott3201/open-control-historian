@@ -89,8 +89,9 @@ registry or retry authority.
 
 Open-existing retains the writer lock, bounds journal bytes/records/payload before
 allocation, scans the checkpoint prefix exactly, and refuses interior corruption
-or ambiguous/non-progressing checkpoint fallback. Missing checkpoint genesis is
-recreated only for an exact valid header-only journal under that lock. A proven
+or ambiguous/non-progressing checkpoint fallback. A missing or zero-byte
+checkpoint is initialized only for an exact valid header-only journal under that
+lock; every nonzero wrong checkpoint length refuses unchanged. A proven
 terminal invalid unacknowledged suffix is truncated and synchronized; a complete
 malformed frame with later bytes refuses unchanged, while a proven valid suffix
 may be synchronized and adopted before readiness. The active scan exposes bounded
@@ -148,9 +149,12 @@ The caller owns the active executor. Open uses `Handle::try_current`, never
 constructs a Tokio runtime, and fails without panic when no executor is active.
 Filesystem work is isolated on one long-lived standard-library blocking thread;
 the Tokio coordinator only exchanges bounded messages and awaits readiness or
-completion. A fixed reaper owns the blocking-thread join. Startup cancellation,
-runtime Drop, or shutdown cancellation signals fail-stop without joining in Drop;
-the reaper supplies observable eventual lock release. Graceful shutdown awaits
+completion. A fixed reaper owns the blocking-thread join. Every coordinator exit,
+panic, cancellation, and publication failure sets the shared stop signal and
+nonblocking-wakes the store worker even while another sender remains retained.
+Startup cancellation, runtime Drop, or shutdown cancellation signals fail-stop
+without joining in Drop; the reaper supplies observable eventual lock release.
+Graceful shutdown awaits
 both coordinator and reaper. Closed errors sanitize early exit, cancellation,
 panic, and path-free store I/O evidence; the release profile's `panic=abort`
 means panic classification is test/debug evidence, not a release recovery
@@ -206,7 +210,9 @@ cancellation/panic/early exit, write/sync/checkpoint/publication fault, and
 admission-lock poison close admission, single-assign unresolved stages to
 `WriterStopped`, report sanitized fault health unless a typed rotation demand is
 already established, and advance no false cutoff. Previously acquired snapshots
-remain immutable. A preparation rollback likewise stops and wakes any equivalent
+remain immutable. An append I/O failure that may have changed bytes terminally
+poisons that open store authority; later append, sequence assignment, and sync
+refuse until drop plus validated reopen. A preparation rollback likewise stops and wakes any equivalent
 receipt that coalesced during the preparation window while releasing exact bytes.
 Caller-supplied content identity is trusted only for core retry classification
 and is never recomputed from admission or envelope content.

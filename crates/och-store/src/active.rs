@@ -231,6 +231,8 @@ pub enum ActiveJournalError {
     RotationRequired,
     /// Append sequence is not the exact writer-owned successor.
     SequenceMismatch,
+    /// A prior append I/O failure may have changed bytes, so this handle is unusable.
+    Faulted,
     /// Journal V1 framing or semantic decode refused the bytes.
     Journal(JournalV1Error),
     /// Generic path-free standard-library I/O evidence.
@@ -248,6 +250,7 @@ impl fmt::Display for ActiveJournalError {
             Self::StoreMismatch => "active journal store identity mismatch",
             Self::RotationRequired => "active journal rotation is required",
             Self::SequenceMismatch => "active journal append sequence mismatch",
+            Self::Faulted => "active journal authority is faulted",
             Self::Journal(_) => "invalid Journal V1 evidence",
             Self::Io(_) => "active journal I/O failed",
         })
@@ -411,6 +414,7 @@ pub struct ActiveJournal {
     active_bytes: u64,
     records: Vec<RecoveredAdmissionV1>,
     sync_count: u64,
+    faulted: bool,
     #[cfg(test)]
     faults: Faults,
 }
@@ -484,6 +488,7 @@ impl ActiveJournal {
             active_bytes: JOURNAL_V1_HEADER_LEN as u64,
             records: Vec::new(),
             sync_count: 0,
+            faulted: false,
             #[cfg(test)]
             faults: Faults::default(),
         })
@@ -518,7 +523,7 @@ impl ActiveJournal {
             store_id,
             generation: ACTIVE_JOURNAL_GENERATION,
         };
-        let (checkpoint, initialized_state) = match open_artifact(checkpoint_path) {
+        let (checkpoint, mut initialized_state) = match open_artifact(checkpoint_path) {
             Ok(checkpoint) => (checkpoint, None),
             Err(ActiveJournalError::MissingArtifact)
                 if journal_len == JOURNAL_V1_HEADER_LEN as u64 =>
@@ -533,7 +538,11 @@ impl ActiveJournal {
             .metadata()
             .map_err(|error| io_error(StoreIoOperation::Metadata, error))?
             .len();
-        if checkpoint_len != CHECKPOINT_FILE_LEN as u64 {
+        if checkpoint_len == 0 && journal_len == JOURNAL_V1_HEADER_LEN as u64 {
+            if initialized_state.is_none() {
+                initialized_state = Some(initialize_checkpoint(&checkpoint, directory, identity)?);
+            }
+        } else if checkpoint_len != CHECKPOINT_FILE_LEN as u64 {
             return Err(ActiveJournalError::InvalidLayout);
         }
         let checkpoint_state = match initialized_state {
@@ -601,6 +610,7 @@ impl ActiveJournal {
             active_bytes,
             records: scan.records,
             sync_count: 0,
+            faulted: false,
             #[cfg(test)]
             faults: Faults::default(),
         })
@@ -632,8 +642,9 @@ impl ActiveJournal {
     ///
     /// # Errors
     ///
-    /// Refuses sequence exhaustion.
+    /// Refuses sequence exhaustion or a terminally faulted handle.
     pub fn next_append_sequence(&self) -> Result<AppendSequenceV1, ActiveJournalError> {
+        self.ensure_usable()?;
         let last = self
             .records
             .last()
@@ -654,6 +665,7 @@ impl ActiveJournal {
     ///
     /// Refuses invalid scope/sequence/layout, rotation demand, or write failure.
     pub fn append(&mut self, frame: &PreparedFrameV1) -> Result<u64, ActiveJournalError> {
+        self.ensure_usable()?;
         if frame.append_sequence() != self.next_append_sequence()? {
             return Err(ActiveJournalError::SequenceMismatch);
         }
@@ -690,18 +702,21 @@ impl ActiveJournal {
         #[cfg(test)]
         if let Some(length) = self.faults.short_write.take() {
             let partial = length.min(frame.bytes().len());
-            self.journal
-                .write_all(&frame.bytes()[..partial])
-                .map_err(|error| io_error(StoreIoOperation::Write, error))?;
+            if let Err(error) = self.journal.write_all(&frame.bytes()[..partial]) {
+                self.faulted = true;
+                return Err(io_error(StoreIoOperation::Write, error));
+            }
+            self.faulted = true;
             return Err(ActiveJournalError::Io(StoreIoEvidence {
                 operation: StoreIoOperation::Write,
                 kind: ErrorKind::WriteZero,
                 raw_os_error: None,
             }));
         }
-        self.journal
-            .write_all(frame.bytes())
-            .map_err(|error| io_error(StoreIoOperation::Write, error))?;
+        if let Err(error) = self.journal.write_all(frame.bytes()) {
+            self.faulted = true;
+            return Err(io_error(StoreIoOperation::Write, error));
+        }
         self.active_bytes = end_offset;
         self.records.push(RecoveredAdmissionV1 {
             end_offset,
@@ -715,8 +730,10 @@ impl ActiveJournal {
     ///
     /// # Errors
     ///
-    /// On failure the in-memory durable cutoff is not advanced.
+    /// On failure the in-memory durable cutoff is not advanced. A handle whose
+    /// append may have partially changed bytes refuses all synchronization.
     pub fn sync_pending(&mut self) -> Result<DurableCutoff, ActiveJournalError> {
+        self.ensure_usable()?;
         let last_sequence = self
             .records
             .last()
@@ -765,6 +782,14 @@ impl ActiveJournal {
             checkpoint_generation: self.checkpoint_state.slot_generation,
             append_sequence: self.checkpoint_state.append_sequence,
             end_offset: self.checkpoint_state.end_offset,
+        }
+    }
+
+    fn ensure_usable(&self) -> Result<(), ActiveJournalError> {
+        if self.faulted {
+            Err(ActiveJournalError::Faulted)
+        } else {
+            Ok(())
         }
     }
 }
@@ -1110,8 +1135,8 @@ struct Faults {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveJournal, ActiveJournalConfig, ActiveJournalError, ActiveJournalLimits,
-        ActiveJournalOpenMode, StoreIoOperation,
+        ACTIVE_JOURNAL_FILE_NAME, ActiveJournal, ActiveJournalConfig, ActiveJournalError,
+        ActiveJournalLimits, ActiveJournalOpenMode, StoreIoOperation,
     };
     use crate::{AppendSequenceV1, MAX_ADMISSION_PAYLOAD_V1, PreparedAdmissionV1, test_support};
     use std::fs;
@@ -1170,10 +1195,33 @@ mod tests {
         assert_eq!(evidence.operation(), StoreIoOperation::Write);
         assert_eq!(evidence.raw_os_error(), None);
         assert_eq!(journal.inspection(), before);
+        let journal_path = directory.0.join(ACTIVE_JOURNAL_FILE_NAME);
+        let torn_len = fs::metadata(&journal_path)
+            .expect("torn journal metadata")
+            .len();
+        assert!(torn_len > before.active_bytes());
+        assert_eq!(
+            journal.next_append_sequence(),
+            Err(ActiveJournalError::Faulted)
+        );
+        assert_eq!(journal.append(&frame()), Err(ActiveJournalError::Faulted));
+        assert_eq!(journal.sync_pending(), Err(ActiveJournalError::Faulted));
+        assert_eq!(journal.inspection(), before);
+        assert_eq!(
+            fs::metadata(&journal_path)
+                .expect("faulted journal metadata")
+                .len(),
+            torn_len
+        );
         drop(journal);
-        let reopened = ActiveJournal::open(config(&directory, ActiveJournalOpenMode::OpenExisting))
-            .expect("truncate and sync torn suffix");
+        let mut reopened =
+            ActiveJournal::open(config(&directory, ActiveJournalOpenMode::OpenExisting))
+                .expect("truncate and sync torn suffix");
         assert_eq!(reopened.inspection(), before);
+        let end_offset = reopened.append(&frame()).expect("reopened append");
+        let cutoff = reopened.sync_pending().expect("reopened sync");
+        assert_eq!(cutoff.append_sequence(), 1);
+        assert_eq!(cutoff.end_offset(), end_offset);
     }
 
     #[test]

@@ -111,6 +111,7 @@ impl HistorianRuntime {
             ingress.shared(),
             store_sender.clone(),
             inspection.clone(),
+            Arc::clone(&stop),
         ));
         let mut startup = StartupGuard::new(writer);
 
@@ -270,7 +271,11 @@ impl Drop for HistorianRuntime {
         // Resolve receipts before aborting so cancellation cannot strand work if
         // the caller's executor never polls the writer again.
         self.ingress.stop();
-        self.stop.store(true, Ordering::Release);
+        if let Some(store_sender) = &self.store_sender {
+            signal_store_worker_stop(&self.stop, store_sender);
+        } else {
+            self.stop.store(true, Ordering::Release);
+        }
         self.store_sender = None;
         if let Some(writer) = self.writer.take() {
             writer.abort();
@@ -337,9 +342,8 @@ impl OpenGuard {
 
 impl Drop for OpenGuard {
     fn drop(&mut self) {
-        if self.sender.is_some() {
-            self.stop.store(true, Ordering::Release);
-            self.sender = None;
+        if let Some(sender) = self.sender.take() {
+            signal_store_worker_stop(&self.stop, &sender);
         }
     }
 }
@@ -513,12 +517,14 @@ async fn run_writer(
     ingress: Arc<IngressShared>,
     store_sender: SyncSender<WorkerMessage>,
     inspection: InspectionShared,
+    stop: Arc<AtomicBool>,
 ) -> WriterExit {
     #[cfg(test)]
     let mut options = options;
     #[cfg(test)]
     let _task_guard = TaskGuard::new(options.probe.clone());
-    let mut failure_guard = WriterFailureGuard::new(Arc::clone(&ingress), inspection);
+    let mut failure_guard =
+        WriterFailureGuard::new(Arc::clone(&ingress), inspection, stop, store_sender.clone());
 
     let store_ready = match store_readiness.await {
         Ok(Ok(ready)) => ready,
@@ -748,14 +754,23 @@ async fn writer_loop(
 struct WriterFailureGuard {
     ingress: Arc<IngressShared>,
     inspection: InspectionShared,
+    stop: Arc<AtomicBool>,
+    store_sender: SyncSender<WorkerMessage>,
     armed: bool,
 }
 
 impl WriterFailureGuard {
-    fn new(ingress: Arc<IngressShared>, inspection: InspectionShared) -> Self {
+    fn new(
+        ingress: Arc<IngressShared>,
+        inspection: InspectionShared,
+        stop: Arc<AtomicBool>,
+        store_sender: SyncSender<WorkerMessage>,
+    ) -> Self {
         Self {
             ingress,
             inspection,
+            stop,
+            store_sender,
             armed: true,
         }
     }
@@ -770,8 +785,14 @@ impl Drop for WriterFailureGuard {
         if self.armed {
             self.inspection.coordinator_fault();
             self.ingress.stop();
+            signal_store_worker_stop(&self.stop, &self.store_sender);
         }
     }
+}
+
+fn signal_store_worker_stop(stop: &AtomicBool, store_sender: &SyncSender<WorkerMessage>) {
+    stop.store(true, Ordering::Release);
+    let _ = try_send(store_sender, WorkerMessage::Abort);
 }
 
 fn classify_start_join_error(error: &JoinError) -> StartError {
@@ -868,7 +889,7 @@ mod tests {
     };
     use std::fs;
     use std::future::{Future, poll_fn};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
@@ -878,7 +899,7 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task::yield_now;
 
-    const MAX_YIELDS: usize = 4_096;
+    const TEST_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     fn harness() -> Runtime {
         Builder::new_current_thread()
@@ -1257,25 +1278,85 @@ mod tests {
 
     async fn complete_bounded<F: Future>(future: F) -> F::Output {
         let mut future = Box::pin(future);
-        for _ in 0..MAX_YIELDS {
+        let started = std::time::Instant::now();
+        loop {
             if let Poll::Ready(output) = poll_once(future.as_mut()).await {
                 return output;
             }
+            assert!(
+                started.elapsed() < TEST_WAIT_TIMEOUT,
+                "lifecycle future did not complete within the elapsed-time bound"
+            );
             std::thread::sleep(std::time::Duration::from_micros(50));
             yield_now().await;
         }
-        panic!("lifecycle future did not complete within the deterministic yield bound");
     }
 
     async fn wait_until(mut condition: impl FnMut() -> bool) {
-        for _ in 0..MAX_YIELDS {
+        let started = std::time::Instant::now();
+        loop {
             if condition() {
                 return;
             }
+            assert!(
+                started.elapsed() < TEST_WAIT_TIMEOUT,
+                "condition did not hold within the elapsed-time bound"
+            );
             std::thread::sleep(std::time::Duration::from_micros(50));
             yield_now().await;
         }
-        assert!(condition(), "condition did not hold within the yield bound");
+    }
+
+    async fn assert_worker_reaped_and_lock_reopens(
+        runtime: &mut HistorianRuntime,
+        directory: &Path,
+    ) {
+        let reaped = runtime
+            .reaped
+            .take()
+            .expect("failed runtime should retain its reaper completion");
+        complete_bounded(reaped)
+            .await
+            .expect("coordinator failure must wake and reap the store worker");
+        assert_eq!(runtime.inspection().health(), RuntimeHealth::Faulted);
+        assert_eq!(
+            runtime.read_handle().snapshot(),
+            Err(LatestReadError::unavailable())
+        );
+        let config = och_store::ActiveJournalConfig::new(
+            directory.to_path_buf(),
+            runtime.store_id(),
+            och_store::ActiveJournalOpenMode::OpenExisting,
+            och_store::ActiveJournalLimits::new(
+                och_store::MAX_ADMISSION_PAYLOAD_V1,
+                64 * 1_024 * 1_024,
+                4_096,
+            )
+            .expect("reopen journal limits"),
+        )
+        .expect("reopen configuration");
+        let reopened = och_store::ActiveJournal::open(config)
+            .expect("reaped coordinator failure must release the store lock");
+        drop(reopened);
+    }
+
+    #[test]
+    fn completion_helper_is_not_limited_by_the_legacy_poll_count() {
+        harness().block_on(async {
+            let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = Arc::clone(&polls);
+            complete_bounded(poll_fn(move |context| {
+                let poll = observed.fetch_add(1, Ordering::SeqCst);
+                if poll > 4_096 {
+                    Poll::Ready(())
+                } else {
+                    context.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }))
+            .await;
+            assert!(polls.load(Ordering::SeqCst) > 4_096);
+        });
     }
 
     #[test]
@@ -2171,6 +2252,109 @@ mod tests {
             assert_eq!(panic_error, ShutdownError::WriterTaskPanicked);
             assert!(!panic_error.to_string().contains("hostile"));
             assert_eq!(panic_read.snapshot(), Err(LatestReadError::unavailable()));
+        });
+    }
+
+    #[test]
+    fn every_coordinator_failure_class_wakes_and_reaps_the_store_worker() {
+        harness().block_on(async {
+            let byte_limits =
+                ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("byte limits");
+            let group = group_policy(
+                std::time::Duration::from_millis(2),
+                MAX_OUTSTANDING_COMMANDS,
+                64 * 1_024 * 1_024,
+            );
+
+            for (label, behavior, expected_shutdown) in [
+                (
+                    "exit",
+                    TestBehavior::ExitBeforeShutdown,
+                    ShutdownError::WriterExitedBeforeShutdown,
+                ),
+                (
+                    "panic",
+                    TestBehavior::PanicBeforeShutdown,
+                    ShutdownError::WriterTaskPanicked,
+                ),
+            ] {
+                let directory = test_directory();
+                let probe = Arc::new(LifecycleProbe::default());
+                let mut runtime = complete_bounded(HistorianRuntime::open_inner(
+                    durable_options(
+                        directory.clone(),
+                        store_id(1),
+                        och_store::ActiveJournalOpenMode::CreateNew,
+                        byte_limits,
+                        group,
+                    ),
+                    options(&probe, behavior),
+                ))
+                .await
+                .unwrap_or_else(|error| panic!("{label} runtime should start: {error:?}"));
+                assert_worker_reaped_and_lock_reopens(&mut runtime, &directory).await;
+                assert_eq!(
+                    complete_bounded(runtime.shutdown()).await,
+                    Err(expected_shutdown)
+                );
+                fs::remove_dir_all(directory).expect("remove coordinator failure directory");
+            }
+
+            let directory = test_directory();
+            let probe = Arc::new(LifecycleProbe::default());
+            let mut cancelled = complete_bounded(HistorianRuntime::open_inner(
+                durable_options(
+                    directory.clone(),
+                    store_id(1),
+                    och_store::ActiveJournalOpenMode::CreateNew,
+                    byte_limits,
+                    group,
+                ),
+                options(&probe, TestBehavior::Normal),
+            ))
+            .await
+            .expect("cancelled runtime should start");
+            cancelled
+                .writer
+                .as_ref()
+                .expect("runtime retains coordinator")
+                .abort();
+            assert_worker_reaped_and_lock_reopens(&mut cancelled, &directory).await;
+            assert_eq!(
+                complete_bounded(cancelled.shutdown()).await,
+                Err(ShutdownError::WriterTaskCancelled)
+            );
+            fs::remove_dir_all(directory).expect("remove cancelled coordinator directory");
+
+            let directory = test_directory();
+            let probe = Arc::new(LifecycleProbe::default());
+            let mut publication = complete_bounded(HistorianRuntime::open_inner(
+                durable_options(
+                    directory.clone(),
+                    store_id(1),
+                    och_store::ActiveJournalOpenMode::CreateNew,
+                    byte_limits,
+                    group,
+                ),
+                options(&probe, TestBehavior::FaultBeforePublicationSwap),
+            ))
+            .await
+            .expect("publication-fault runtime should start");
+            let receipt = publication
+                .ingress()
+                .try_submit(command("publication-reap", 10, 0))
+                .expect("publication-fault command should queue")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(receipt.wait()).await,
+                ReceiptOutcome::WriterStopped
+            );
+            assert_worker_reaped_and_lock_reopens(&mut publication, &directory).await;
+            assert_eq!(
+                complete_bounded(publication.shutdown()).await,
+                Err(ShutdownError::WriterExitedBeforeShutdown)
+            );
+            fs::remove_dir_all(directory).expect("remove publication-fault directory");
         });
     }
 
@@ -3724,7 +3908,8 @@ mod tests {
                 drop(runtime);
 
                 let mut reopened = None;
-                for _ in 0..MAX_YIELDS {
+                let started = std::time::Instant::now();
+                while started.elapsed() < TEST_WAIT_TIMEOUT {
                     let config = och_store::ActiveJournalConfig::new(
                         directory.clone(),
                         store_id(1),
@@ -3738,7 +3923,7 @@ mod tests {
                             break;
                         }
                         Err(och_store::ActiveJournalError::AlreadyOpen) => {
-                            std::thread::yield_now();
+                            std::thread::sleep(std::time::Duration::from_micros(50));
                         }
                         Err(error) => panic!("unexpected reopen error: {error:?}"),
                     }

@@ -528,6 +528,89 @@ fn interrupted_genesis_recovers_only_an_exact_header_only_journal() {
 }
 
 #[test]
+fn zero_byte_checkpoint_genesis_recovers_but_nonzero_short_refuses() {
+    let limits = limits(4 * 1_024 * 1_024, 8);
+    let zero_checkpoint = TestDirectory::new("zero-checkpoint-genesis");
+    let journal_path = zero_checkpoint.path().join(ACTIVE_JOURNAL_FILE_NAME);
+    let checkpoint_path = zero_checkpoint.path().join(ACTIVE_CHECKPOINT_FILE_NAME);
+    let mut journal_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&journal_path)
+        .expect("create zero-checkpoint journal");
+    journal_file
+        .write_all(&JournalHeaderV1::new(support::store_id(1)).encode())
+        .expect("write zero-checkpoint journal header");
+    journal_file
+        .sync_all()
+        .expect("sync zero-checkpoint journal");
+    drop(journal_file);
+    drop(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&checkpoint_path)
+            .expect("create zero-byte checkpoint"),
+    );
+    let journal = ActiveJournal::open(config(
+        &zero_checkpoint,
+        1,
+        ActiveJournalOpenMode::OpenExisting,
+        limits,
+    ))
+    .expect("initialize existing zero-byte checkpoint after exact header");
+    assert_eq!(journal.inspection().active_records(), 0);
+    assert_eq!(
+        journal
+            .inspection()
+            .durable_cutoff()
+            .checkpoint_generation(),
+        1
+    );
+    assert_eq!(
+        fs::metadata(&checkpoint_path)
+            .expect("initialized checkpoint metadata")
+            .len(),
+        128
+    );
+    drop(journal);
+
+    let short_checkpoint = TestDirectory::new("short-checkpoint-genesis");
+    let journal_path = short_checkpoint.path().join(ACTIVE_JOURNAL_FILE_NAME);
+    let checkpoint_path = short_checkpoint.path().join(ACTIVE_CHECKPOINT_FILE_NAME);
+    let mut journal_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&journal_path)
+        .expect("create short-checkpoint journal");
+    journal_file
+        .write_all(&JournalHeaderV1::new(support::store_id(1)).encode())
+        .expect("write short-checkpoint journal header");
+    journal_file
+        .sync_all()
+        .expect("sync short-checkpoint journal");
+    drop(journal_file);
+    let short_bytes = vec![0x5a; 64];
+    fs::write(&checkpoint_path, &short_bytes).expect("write nonzero short checkpoint");
+    assert!(matches!(
+        ActiveJournal::open(config(
+            &short_checkpoint,
+            1,
+            ActiveJournalOpenMode::OpenExisting,
+            limits,
+        )),
+        Err(ActiveJournalError::InvalidLayout)
+    ));
+    assert_eq!(
+        fs::read(&checkpoint_path).expect("short checkpoint remains unchanged"),
+        short_bytes
+    );
+}
+
+#[test]
 fn exact_counting_preflight_matches_prepared_frame_and_recovers_admission() {
     let admission = support::observed_admission(
         vec![och_core::ExactValue::Boolean(true)],

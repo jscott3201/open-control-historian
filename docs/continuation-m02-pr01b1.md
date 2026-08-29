@@ -37,12 +37,16 @@ checkpoint sync → durable receipt/reservation release. Any write, sync,
 checkpoint, publication, or worker fault advances no false cutoff. An invalid
 durable prefix, non-progressing consecutive checkpoint, or ambiguous nonzero
 checkpoint refuses. Public cutoffs distinguish mechanical checkpoint generation
-from journal generation. Missing-checkpoint genesis is recreated only for an
-exact valid header-only journal. A proven terminal invalid unacknowledged suffix
+from journal generation. Missing or existing zero-byte checkpoint genesis is
+initialized only for an exact valid header-only journal; every nonzero wrong
+checkpoint length refuses unchanged. A proven terminal invalid unacknowledged suffix
 may be truncated and synchronized; a complete malformed frame with later bytes
 refuses unchanged, while a proven valid suffix is synchronized and checkpointed
 before readiness. Timeout barriers never cover an append awaiting publication
-acknowledgement.
+acknowledgement. A potentially mutating append I/O failure terminally poisons the
+open journal handle until validated reopen. Every coordinator fault signals and
+wakes the blocking worker even while the runtime retains another sender, so the
+fixed reaper can release the writer lock without waiting for runtime Drop.
 
 This durable claim is exact and narrow: the active journal and mechanical
 checkpoint cover the named append on the qualified platform/filesystem contract.
@@ -62,11 +66,13 @@ Focused store and runtime tests cover:
 - handled-before-durable staging and time/record/byte/immediate/protected/shutdown
   barrier triggers with group-sync reduction and unpublished-frame exclusion;
 - injected short/partial write, journal sync, checkpoint write/sync, publication,
-  task and worker failures with no false durable cutoff;
+  task and worker failures with no false durable cutoff, including terminal
+  post-write handle poisoning and coordinator fault/cancel/panic worker reaping;
 - committed-prefix reopen, valid suffix adoption, terminal torn-suffix truncation,
   malformed-plus-later-candidate refusal without mutation, durable interior
   corruption refusal, recomputed-CRC non-progressing checkpoint refusal, and
-  missing-checkpoint interrupted-genesis recovery;
+  missing/zero-byte-checkpoint interrupted-genesis recovery plus nonzero-short
+  checkpoint refusal without mutation;
 - real child-process kill after durable receipt and after handled-before-barrier,
   followed by bounded truthful reopen with empty latest;
 - graceful final barrier/join, 16-cycle observable Drop/reaper lock release, path

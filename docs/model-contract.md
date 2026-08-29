@@ -224,8 +224,11 @@ inside the durable prefix, any ambiguous newer nonzero checkpoint slot, and any
 complete malformed suffix followed by later bytes. A proven terminal invalid
 unacknowledged suffix may be truncated and synchronized; a proven valid suffix
 may be synchronized and checkpointed before readiness. A missing checkpoint is
-created only for an exact valid header-only journal under the retained lock.
-Returned
+created, or an existing zero-byte checkpoint initialized, only for an exact valid
+header-only journal under the retained lock; every nonzero wrong length refuses
+unchanged. An append I/O failure that may have changed bytes terminally faults
+that open journal handle, which cannot assign another sequence, append, or sync
+until validated reopen. Returned
 reopen records remain `DecodedAdmissionV1` inspection evidence, never seed a
 completed retry cache, and do not rebuild volatile latest. Journal persistence is
 therefore bounded to this active generation and cutoff; manifests, rotation,

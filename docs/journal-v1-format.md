@@ -110,11 +110,12 @@ and strict consecutive generations. Two valid consecutive slots must also advanc
 both append sequence and end offset strictly. Any invalid or non-progressing
 nonzero slot refuses; an invalid apparently newer slot never falls back to an
 older valid cutoff. A lone valid slot is accepted only for generation one with an
-unused zero alternate. If the checkpoint artifact is missing, open-existing may
-create and initialize it only after validating an exact header-only journal under
-the retained lock. A nonempty or invalid journal without a checkpoint refuses
-without creating one. An existing all-zero checkpoint has the same header-only
-genesis restriction.
+unused zero alternate. If the checkpoint artifact is missing or exists with
+exactly zero bytes, open-existing may create or initialize it only after validating
+an exact header-only journal under the retained lock. A nonempty or invalid journal
+without a checkpoint refuses without creating one. Every nonzero wrong checkpoint
+length refuses unchanged. An existing 128-byte all-zero checkpoint has the same
+header-only genesis restriction.
 
 The scan is limited by configured payload, journal-byte, and record bounds before
 allocation. Every frame StoreId and governing declaration StoreId must equal the
@@ -125,6 +126,10 @@ is provably terminal; a complete malformed frame followed by any bytes or later
 candidate makes recovery ambiguous and refuses without changing the file. Every
 allowed truncation is synchronized before readiness. The scan never fabricates
 `CanonicalAdmission`, registry history, latest state, or a completed retry cache.
+If an append I/O failure may have changed journal bytes, that open
+`ActiveJournal` is terminally faulted: it refuses later sequence assignment,
+append, and synchronization. Only drop plus this validated reopen path may
+truncate a proven torn terminal suffix and establish a new writer authority.
 
 ## Primitive encoding
 

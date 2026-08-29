@@ -353,6 +353,7 @@ pub(crate) enum WorkerMessage {
     Shutdown {
         response: oneshot::Sender<Result<(), ActiveJournalError>>,
     },
+    Abort,
 }
 
 struct PendingDurable {
@@ -548,6 +549,10 @@ pub(crate) fn run_store_worker(
                 }
                 return;
             }
+            Ok(WorkerMessage::Abort) | Err(RecvTimeoutError::Disconnected) => {
+                ingress.stop();
+                return;
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if !pending.is_empty()
                     && flush_pending(&mut journal, &mut pending, &ingress, &inspection).is_err()
@@ -555,10 +560,6 @@ pub(crate) fn run_store_worker(
                     return;
                 }
                 pending_since = None;
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                ingress.stop();
-                return;
             }
         }
     }

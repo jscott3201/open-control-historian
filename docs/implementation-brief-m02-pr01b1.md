@@ -82,8 +82,10 @@ decoded frame and declaration StoreId must equal the header. Corruption before
 the durable cutoff refuses without mutation. Any invalid nonzero checkpoint slot
 refuses instead of falling back ambiguously. Header-only interrupted genesis may
 be initialized, including safe creation of its missing checkpoint after the exact
-header is validated under lock; otherwise a nonempty or invalid journal without a
-checkpoint refuses without creating one.
+header is validated under lock. An existing zero-byte checkpoint may be initialized
+under the same exact header-only rule; every nonzero wrong length refuses without
+mutation. Otherwise a nonempty or invalid journal without a checkpoint refuses
+without creating one.
 
 A proven valid suffix beyond an unambiguous checkpoint is synchronized and
 checkpointed before readiness. Only a proven terminal invalid unacknowledged
@@ -99,7 +101,12 @@ advance a false durable cutoff. Generic I/O evidence retains only operation,
 `ErrorKind`, and optional raw OS error—never paths or caller content. Graceful
 shutdown closes admission, drains FIFO, forces a final barrier, seals latest, and
 joins coordinator and worker. Drop/cancellation signals fail-stop without joining;
-the fixed reaper owns eventual worker join and lock release.
+the fixed reaper owns eventual worker join and lock release. Every coordinator
+failure uses the same nonblocking stop plus worker-wake path, so a retained runtime
+sender cannot strand the blocking worker or its file lock. An append I/O failure
+that may have changed bytes terminally poisons the open `ActiveJournal`; it refuses
+later sequence assignment, append, and synchronization until drop and validated
+reopen.
 
 ## Receipt and inspection contract
 
