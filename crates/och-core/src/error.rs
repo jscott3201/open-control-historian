@@ -78,6 +78,50 @@ pub enum ModelError {
     SeriesMetadataMismatch,
     /// An observation value does not match the active declared value family.
     ObservationValueFamilyMismatch,
+    /// Source schema version zero is reserved and invalid.
+    InvalidSourceSchemaVersion,
+    /// Capture completion precedes capture start.
+    CaptureRunTimeOrder,
+    /// Endpoint evidence does not link to its system evidence.
+    SourceEndpointSystemMismatch,
+    /// Capture-run evidence does not link to its endpoint evidence.
+    CaptureRunEndpointMismatch,
+    /// Snapshot evidence does not link to its capture-run evidence.
+    SourceSnapshotRunMismatch,
+    /// Canonical source admission requires a projection-bearing declaration.
+    SourceProjectionRequired,
+    /// Source interval classification differs from canonical envelope evidence.
+    SourceIntervalMismatch,
+    /// Capture lifecycle source fields differ from the declaration binding.
+    SourceLifecycleBindingMismatch,
+    /// Admission retry series or producer scope differs from the bound envelope.
+    AdmissionRetryScopeMismatch,
+    /// Source observation contexts exceed their fixed bound.
+    TooManySourceObservationContexts,
+    /// Source observation context count differs from canonical observations.
+    SourceObservationCountMismatch,
+    /// Source observation context names a different canonical observation.
+    SourceObservationAssociationMismatch,
+    /// Source gap contexts exceed their fixed bound.
+    TooManySourceGapContexts,
+    /// Source gap context count differs from canonical gaps.
+    SourceGapCountMismatch,
+    /// Source record ordinals are not strictly increasing.
+    MisorderedSourceRecordOrdinals,
+    /// Two source or capture roles reuse one evidence identity.
+    DuplicateSourceEvidenceId,
+    /// A raw record does not link to the retained capture snapshot.
+    SourceRawSnapshotMismatch,
+    /// A normalized record does not link to its paired raw record.
+    SourceNormalizedRawMismatch,
+    /// A normalized record does not link to its paired source observation.
+    SourceNormalizedObservationMismatch,
+    /// Raw-record idempotency content differs from the raw artifact content.
+    SourceRawIdempotencyMismatch,
+    /// Observation interpretation context differs from the bound declaration.
+    SourceInterpretationMismatch,
+    /// Source gap range or order differs from canonical gap evidence.
+    SourceGapMismatch,
 }
 
 impl fmt::Display for ModelError {
@@ -118,6 +162,30 @@ impl fmt::Display for ModelError {
             Self::DeclarationUnchanged => "declaration payload is unchanged",
             Self::SeriesMetadataMismatch => "envelope series metadata mismatch",
             Self::ObservationValueFamilyMismatch => "observation value family mismatch",
+            Self::InvalidSourceSchemaVersion => "invalid source schema version",
+            Self::CaptureRunTimeOrder => "capture completion precedes capture start",
+            Self::SourceEndpointSystemMismatch => "source endpoint system link mismatch",
+            Self::CaptureRunEndpointMismatch => "capture run endpoint link mismatch",
+            Self::SourceSnapshotRunMismatch => "source snapshot run link mismatch",
+            Self::SourceProjectionRequired => "source projection is required",
+            Self::SourceIntervalMismatch => "source interval classification mismatch",
+            Self::SourceLifecycleBindingMismatch => "source lifecycle binding mismatch",
+            Self::AdmissionRetryScopeMismatch => "admission retry scope mismatch",
+            Self::TooManySourceObservationContexts => "source observation context bound exceeded",
+            Self::SourceObservationCountMismatch => "source observation count mismatch",
+            Self::SourceObservationAssociationMismatch => "source observation association mismatch",
+            Self::TooManySourceGapContexts => "source gap context bound exceeded",
+            Self::SourceGapCountMismatch => "source gap count mismatch",
+            Self::MisorderedSourceRecordOrdinals => "source record ordinals are misordered",
+            Self::DuplicateSourceEvidenceId => "duplicate source evidence identity",
+            Self::SourceRawSnapshotMismatch => "source raw record snapshot link mismatch",
+            Self::SourceNormalizedRawMismatch => "normalized record raw link mismatch",
+            Self::SourceNormalizedObservationMismatch => {
+                "normalized record observation link mismatch"
+            }
+            Self::SourceRawIdempotencyMismatch => "source raw idempotency content mismatch",
+            Self::SourceInterpretationMismatch => "source interpretation context mismatch",
+            Self::SourceGapMismatch => "source gap evidence mismatch",
         })
     }
 }

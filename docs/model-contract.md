@@ -6,7 +6,9 @@ M00-PR02 defines the original dependency-free public model in `och-core`, and
 M00-PR03 supplies independent evidence for that contract. M00-PR04 is its
 explicit reviewed successor for store identity, bounded series declaration
 revision/retirement authority, historical resolution, and registry-issued active
-envelope binding. All pre-existing exact value, time, quality, order, collection,
+envelope binding. M00-PR05 is the reviewed successor for source projection,
+capture/batch provenance, and the final bounded declaration-authorized canonical
+admission record. All pre-existing exact value, time, quality, order, collection,
 gap/no-change, envelope, and retry semantics remain unchanged. The model is native
 Historian authority rather than a serialization of a Studio, Engine, transport,
 or persistence schema. Future adapters must preserve supported values exactly and
@@ -30,6 +32,8 @@ license.
 | Declaration reference | 1–1,024 non-control Unicode scalar values |
 | Observations per atomic envelope | 256 |
 | Gaps per atomic envelope | 64 |
+| Source observation contexts per admission | exact envelope count, at most 256 |
+| Source gap contexts per admission | exact envelope count, at most 64 |
 | Series and retained declaration revisions | exact finite caller-supplied registry limits |
 
 Inputs are caller-owned `String` or `Vec` values. Constructors reject oversize
@@ -41,8 +45,11 @@ zero, and caller-controlled spare capacity is not retained.
 
 ### Identity
 
-`StoreId`, `SeriesId`, `ProducerId`, `ObservationId`, and `ArtifactId` are distinct nominal
-families over validated RFC 9562 `UUIDv7` bytes. Parsing accepts only canonical
+`StoreId`, `SeriesId`, `ProducerId`, `ObservationId`, `ArtifactId`, and `EvidenceId`
+are distinct nominal families over validated RFC 9562 `UUIDv7` bytes. `EvidenceId`
+is intentionally one family shared by source system, endpoint, run, snapshot,
+source observation, raw record, and normalized record roles; containing structs
+preserve those roles. Parsing accepts only canonical
 lowercase hyphenated text and checks version 7 plus the RFC variant. Construction
 from bytes performs the same version/variant checks. There is no generation,
 clock, randomness, serde, or cross-family equality.
@@ -68,8 +75,11 @@ unchanged revision payload is refused without mutation. Every accepted correctio
 requires the exact active predecessor and issues the next revision. The total
 history bound is checked before mutation.
 
-`SeriesBinding` contains the provider and provider-scoped source locator of one
-logical point. It cannot be revised. Reusing a `SeriesId` for a different logical
+`SeriesBinding` contains the provider, optional opaque source projection, and
+provider-scoped source locator of one logical point. Its two-argument
+`SourceReference` constructor retains a projection-absent PR04 declaration, but
+canonical source admission requires the projection-bearing constructor. It cannot
+be revised. Reusing a `SeriesId` for a different logical
 point is refused; the old identity must be terminally retired and a new `SeriesId`
 registered. Provider, locator, quantity, unit, and application references use one
 compact exact `DeclarationReference`; it is bounded, rejects controls, and is not
@@ -101,10 +111,64 @@ All registry refusal paths preserve equality with the pre-call state. Registry
 iteration and snapshots order series by nominal `SeriesId` and declarations by
 revision.
 
-The current `och-runtime` does not consume `SeriesRegistry` or
-`DeclaredCollectionEnvelope`. Its existing volatile `SeriesMetadata` equality
+The current `och-runtime` does not consume `SeriesRegistry`,
+`DeclaredCollectionEnvelope`, or `CanonicalAdmission`. Its existing volatile `SeriesMetadata` equality
 check remains a read-optimization invariant only and gains no declaration,
 historical, or durable-admission authority.
+
+## Source/capture provenance and canonical admission
+
+`SourceSchemaIdentity` and non-zero `SourceSchemaVersion` retain a bounded native
+schema reference without importing Studio serialization. `SourceIntervalKind` is
+only `Observed` or `NoChange` and carries no timestamp; the real no-change
+`TimeInterval` remains in `CollectionEnvelope`. Studio V1 maps losslessly to
+version one, while JSON names, tags, casing, and codec choices are non-semantic.
+
+`CaptureLifecycle` validates and retains system → endpoint → capture run →
+snapshot links. System evidence holds the exact declaration provider/projection,
+endpoint evidence holds the exact locator, run evidence holds start and optional
+completion (`completion >= start`), and snapshot evidence holds the exact
+`ArtifactReference`. `Timestamp` represents Studio Unix milliseconds losslessly.
+Every lifecycle and record role uses the shared nominal `EvidenceId`; identities
+must be unique within one admission.
+
+Every observed envelope observation has exactly one ordered
+`SourceObservationContext` and linked raw/normalized record pair. Each context
+explicitly names the canonical `ObservationId`, which must equal the envelope
+observation at the same position before retention; source `EvidenceId` remains a
+distinct identity and is never inferred from it. Before retaining the compact
+lineage, admission validates provider/projection/locator, optional
+application reference, and exact absent/resolved/unresolved quantity and unit
+evidence against the governing declaration. It retains the original `u8` source
+record ordinal, source observation identity, optional distinct provenance
+artifact, new/redelivered transport evidence, optional observation source
+idempotency, raw identity/snapshot link/artifact/optional idempotency, and
+normalized identity/content/raw and observation links. Raw idempotency content
+must equal raw artifact content. Source identity is never inferred from
+`ObservationId`.
+
+Observed gaps have exactly one ordered `SourceGapEvidence` for each canonical
+gap, with the same epoch and half-open producer range plus an independent closed
+source reason. This source reason is not coerced into `GapReason`. No-change
+admission structurally holds no observations, gaps, or record lineages while
+retaining schema and the shared capture lifecycle.
+
+Only `CanonicalAdmission::observed` and `CanonicalAdmission::no_change` create the
+final record. They consume one non-cloneable registry-issued
+`DeclaredCollectionEnvelope`, verify exact request retry series/producer scope,
+and retain the declaration snapshot, original envelope, `RetryQualification`,
+batch metadata, lifecycle, and closed evidence. Authorization happens when the
+active registry issues the consumed binding; correction or retirement cannot
+issue another binding for an old declaration. The final admission is cloneable
+immutable evidence. Source transport redelivery and both source idempotency
+records remain evidence only and are never derived from, equated with, or used to
+classify `RetryQualification`.
+
+`CanonicalAdmission` is the exact native semantic input that M02-PR01 may encode.
+It defines no frame, codec, persistence, group commit, receipt, recovery, or
+adapter behavior. A future adapter may split one Studio batch into per-series
+admissions by copying the shared lifecycle and preserving original ordinals;
+cross-series atomicity and active binding uniqueness are deliberately absent.
 
 ### Values and content
 
@@ -204,7 +268,7 @@ the top-level adapter constructs and calls the public model. The adapter compare
 actual accessors, ordering, validation errors, and retry classifications with
 primitive expected facts computed by the oracle. Twelve atomic negative builders
 each prove exactly one independent violation before comparison, and a complete
-35-variant inventory covers every current sanitized `ModelError`.
+57-variant inventory covers every current sanitized `ModelError`.
 
 M00-PR04 adds `series_oracle.rs`, a primitive bounded lifecycle state machine that
 does not import implementation types or constants. The top-level public adapter
@@ -212,6 +276,15 @@ runs the same registration, revision replay/refusal, binding, retirement, capaci
 and deterministic-order script against both models after every transition. It
 also proves equality-preserving refusals and independently inventories every new
 sanitized lifecycle error.
+
+M00-PR05 adds `source_oracle.rs`, which represents the source/capture crosswalk
+using standard-library primitives only. It independently validates schema, links,
+source binding, scope, counts, ordinals, unique evidence IDs, record links,
+idempotency content, interpretation evidence, and gaps. The top-level public
+adapter constructs the corresponding real `CanonicalAdmission` and compares a
+complete normalized retained-state record for exact structural equality; focused
+public tests separately exercise refusals and exact bounds. The exhaustive error
+map and nominal identity inventory include every M00-PR05 addition.
 
 The checked-in `crates/och-core/tests/fixtures/m00-pr03-evidence-v1.txt` ledger has
 22 stable case rows, ASCII/LF schema 1, deterministic order, canonical decimal
