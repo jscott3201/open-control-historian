@@ -22,6 +22,7 @@ use och_core::{
     SourceSystemEvidence, SourceTransport, StateClass, StateMember, StateValue, StoreId,
     TimeInterval, Timestamp, Unavailable, UnavailableReason, UnitEvidence, ValueFamily,
 };
+use std::fmt;
 
 const HEADER_LENGTH_OFFSET: usize = 10;
 const FRAME_KIND_ADMISSION: u8 = 1;
@@ -187,6 +188,222 @@ pub fn encode_admission_frame_v1(
     frame_bytes(append_sequence, encoder.finish())
 }
 
+/// Counts the exact Journal V1 frame bytes without allocating encoded storage.
+///
+/// # Errors
+///
+/// Returns the same bounded representation refusals as frame encoding.
+pub fn admission_frame_len_v1(admission: &CanonicalAdmission) -> Result<usize, JournalV1Error> {
+    let mut encoder = Encoder::counting();
+    encode_canonical_payload(&mut encoder, admission)?;
+    let payload_len = encoder.len();
+    if payload_len > MAX_ADMISSION_PAYLOAD_V1 {
+        return Err(JournalV1Error::PayloadTooLarge);
+    }
+    JOURNAL_V1_FRAME_PREFIX_LEN
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(JOURNAL_V1_FRAME_CRC_LEN))
+        .ok_or(JournalV1Error::PayloadTooLarge)
+}
+
+/// An admission encoded only after exact byte reservation.
+///
+/// Append sequence remains absent until the sole writer constructs a frame.
+pub struct PreparedAdmissionV1 {
+    admission: CanonicalAdmission,
+    payload: Vec<u8>,
+    frame_len: usize,
+}
+
+impl PreparedAdmissionV1 {
+    /// Encodes an owned admission after its non-allocating counting pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns a recoverable error carrying the exact admission.
+    pub fn new(admission: CanonicalAdmission) -> Result<Self, PrepareAdmissionError> {
+        let frame_len = match admission_frame_len_v1(&admission) {
+            Ok(length) => length,
+            Err(error) => {
+                return Err(PrepareAdmissionError {
+                    error,
+                    admission: Box::new(admission),
+                });
+            }
+        };
+        let mut encoder = Encoder::new();
+        if let Err(error) = encode_canonical_payload(&mut encoder, &admission) {
+            return Err(PrepareAdmissionError {
+                error,
+                admission: Box::new(admission),
+            });
+        }
+        let payload = encoder.finish();
+        let actual = JOURNAL_V1_FRAME_PREFIX_LEN + payload.len() + JOURNAL_V1_FRAME_CRC_LEN;
+        if actual != frame_len {
+            return Err(PrepareAdmissionError {
+                error: JournalV1Error::InvalidCanonicalData,
+                admission: Box::new(admission),
+            });
+        }
+        Ok(Self {
+            admission,
+            payload,
+            frame_len,
+        })
+    }
+
+    /// Returns the exact future frame length.
+    #[must_use]
+    pub const fn frame_len(&self) -> usize {
+        self.frame_len
+    }
+
+    /// Borrows the complete authorized admission.
+    #[must_use]
+    pub const fn admission(&self) -> &CanonicalAdmission {
+        &self.admission
+    }
+
+    /// Recovers the complete admission before writer sequencing.
+    #[must_use]
+    pub fn into_admission(self) -> CanonicalAdmission {
+        self.admission
+    }
+
+    /// Applies the writer-owned append sequence and constructs exact frame bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a recoverable framing error carrying the exact admission.
+    pub fn into_frame(
+        self,
+        append_sequence: AppendSequenceV1,
+    ) -> Result<PreparedFrameV1, PrepareAdmissionError> {
+        let Self {
+            admission,
+            payload,
+            frame_len,
+        } = self;
+        match frame_bytes(append_sequence, payload) {
+            Ok(bytes) if bytes.len() == frame_len => Ok(PreparedFrameV1 {
+                admission,
+                append_sequence,
+                bytes,
+            }),
+            Ok(_) => Err(PrepareAdmissionError {
+                error: JournalV1Error::InvalidCanonicalData,
+                admission: Box::new(admission),
+            }),
+            Err(error) => Err(PrepareAdmissionError {
+                error,
+                admission: Box::new(admission),
+            }),
+        }
+    }
+}
+
+impl fmt::Debug for PreparedAdmissionV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedAdmissionV1")
+            .field("frame_len", &self.frame_len)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Recoverable failure to prepare or sequence an admission frame.
+pub struct PrepareAdmissionError {
+    error: JournalV1Error,
+    admission: Box<CanonicalAdmission>,
+}
+
+impl PrepareAdmissionError {
+    /// Returns the closed framing refusal.
+    #[must_use]
+    pub const fn error(&self) -> JournalV1Error {
+        self.error
+    }
+
+    /// Recovers the exact authorized admission.
+    #[must_use]
+    pub fn into_admission(self) -> CanonicalAdmission {
+        *self.admission
+    }
+}
+
+impl fmt::Debug for PrepareAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrepareAdmissionError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for PrepareAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for PrepareAdmissionError {}
+
+/// One complete writer-sequenced frame with its authorized admission.
+pub struct PreparedFrameV1 {
+    admission: CanonicalAdmission,
+    append_sequence: AppendSequenceV1,
+    bytes: Vec<u8>,
+}
+
+impl PreparedFrameV1 {
+    /// Returns the writer-assigned append sequence.
+    #[must_use]
+    pub const fn append_sequence(&self) -> AppendSequenceV1 {
+        self.append_sequence
+    }
+
+    /// Borrows exact frame bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns exact frame length.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Reports whether the frame is empty. Prepared frames are never empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Borrows the complete authorized admission.
+    #[must_use]
+    pub const fn admission(&self) -> &CanonicalAdmission {
+        &self.admission
+    }
+
+    /// Recovers the complete authorized admission after append handling.
+    #[must_use]
+    pub fn into_admission(self) -> CanonicalAdmission {
+        self.admission
+    }
+}
+
+impl fmt::Debug for PreparedFrameV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedFrameV1")
+            .field("append_sequence", &self.append_sequence)
+            .field("length", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Deterministically re-encodes one decoded non-authorizing admission frame.
 ///
 /// # Errors
@@ -278,7 +495,7 @@ pub fn decode_admission_frame_v1(
 
 fn frame_bytes(
     append_sequence: AppendSequenceV1,
-    payload: Vec<u8>,
+    mut payload: Vec<u8>,
 ) -> Result<Vec<u8>, JournalV1Error> {
     if payload.len() > MAX_ADMISSION_PAYLOAD_V1 {
         return Err(JournalV1Error::PayloadTooLarge);
@@ -288,20 +505,23 @@ fn frame_bytes(
         .checked_add(payload.len())
         .and_then(|value| value.checked_add(JOURNAL_V1_FRAME_CRC_LEN))
         .ok_or(JournalV1Error::PayloadTooLarge)?;
-    let mut frame = Vec::with_capacity(capacity);
-    frame.extend_from_slice(&JOURNAL_V1_FRAME_MAGIC);
-    frame.extend_from_slice(&JOURNAL_V1_VERSION.to_be_bytes());
-    frame.push(FRAME_KIND_ADMISSION);
-    frame.push(FRAME_FLAGS_NONE);
-    frame.extend_from_slice(&append_sequence.get().to_be_bytes());
-    frame.extend_from_slice(&payload_len.to_be_bytes());
-    frame.extend(payload);
-    let crc = crc32c(&frame);
-    frame.extend_from_slice(&crc.to_be_bytes());
-    Ok(frame)
+    let original_len = payload.len();
+    payload.reserve_exact(capacity - original_len);
+    payload.resize(capacity, 0);
+    payload.copy_within(0..original_len, JOURNAL_V1_FRAME_PREFIX_LEN);
+    payload[..4].copy_from_slice(&JOURNAL_V1_FRAME_MAGIC);
+    payload[4..6].copy_from_slice(&JOURNAL_V1_VERSION.to_be_bytes());
+    payload[6] = FRAME_KIND_ADMISSION;
+    payload[7] = FRAME_FLAGS_NONE;
+    payload[8..16].copy_from_slice(&append_sequence.get().to_be_bytes());
+    payload[16..20].copy_from_slice(&payload_len.to_be_bytes());
+    let checksum_offset = JOURNAL_V1_FRAME_PREFIX_LEN + original_len;
+    let crc = crc32c(&payload[..checksum_offset]);
+    payload[checksum_offset..].copy_from_slice(&crc.to_be_bytes());
+    Ok(payload)
 }
 
-fn crc32c(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = u32::MAX;
     for byte in bytes {
         crc ^= u32::from(*byte);
@@ -313,45 +533,110 @@ fn crc32c(bytes: &[u8]) -> u32 {
     !crc
 }
 
+pub(crate) fn frame_len_from_prefix_v1(
+    prefix: &[u8],
+    limits: DecodeLimitsV1,
+) -> Result<usize, JournalV1Error> {
+    if prefix.len() != JOURNAL_V1_FRAME_PREFIX_LEN {
+        return Err(JournalV1Error::Truncated);
+    }
+    if prefix[..4] != JOURNAL_V1_FRAME_MAGIC {
+        return Err(JournalV1Error::InvalidFrameMagic);
+    }
+    if u16::from_be_bytes([prefix[4], prefix[5]]) != JOURNAL_V1_VERSION {
+        return Err(JournalV1Error::UnsupportedFrameVersion);
+    }
+    if prefix[6] != FRAME_KIND_ADMISSION {
+        return Err(JournalV1Error::UnsupportedFrameKind);
+    }
+    if prefix[7] != FRAME_FLAGS_NONE {
+        return Err(JournalV1Error::InvalidFrameFlags);
+    }
+    let _sequence = AppendSequenceV1::new(u64::from_be_bytes(
+        prefix[8..16]
+            .try_into()
+            .map_err(|_| JournalV1Error::Truncated)?,
+    ))?;
+    let payload_len = usize::try_from(u32::from_be_bytes(
+        prefix[16..20]
+            .try_into()
+            .map_err(|_| JournalV1Error::Truncated)?,
+    ))
+    .map_err(|_| JournalV1Error::InvalidLength)?;
+    if payload_len > MAX_ADMISSION_PAYLOAD_V1 || payload_len > limits.max_payload_len() {
+        return Err(JournalV1Error::PayloadTooLarge);
+    }
+    JOURNAL_V1_FRAME_PREFIX_LEN
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(JOURNAL_V1_FRAME_CRC_LEN))
+        .ok_or(JournalV1Error::InvalidLength)
+}
+
 fn read_array<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
     bytes.try_into().ok()
 }
 
+enum EncoderOutput {
+    Bytes(Vec<u8>),
+    Count(usize),
+}
+
 struct Encoder {
-    bytes: Vec<u8>,
+    output: EncoderOutput,
 }
 
 impl Encoder {
     const fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            output: EncoderOutput::Bytes(Vec::new()),
+        }
+    }
+
+    const fn counting() -> Self {
+        Self {
+            output: EncoderOutput::Count(0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match &self.output {
+            EncoderOutput::Bytes(bytes) => bytes.len(),
+            EncoderOutput::Count(length) => *length,
+        }
     }
 
     fn finish(self) -> Vec<u8> {
-        self.bytes
+        match self.output {
+            EncoderOutput::Bytes(bytes) => bytes,
+            EncoderOutput::Count(_) => Vec::new(),
+        }
     }
 
     fn u8(&mut self, value: u8) {
-        self.bytes.push(value);
+        self.bytes(&[value]);
     }
 
     fn u32(&mut self, value: u32) {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
+        self.bytes(&value.to_be_bytes());
     }
 
     fn u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
+        self.bytes(&value.to_be_bytes());
     }
 
     fn u128(&mut self, value: u128) {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
+        self.bytes(&value.to_be_bytes());
     }
 
     fn i64(&mut self, value: i64) {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
+        self.bytes(&value.to_be_bytes());
     }
 
     fn bytes(&mut self, bytes: &[u8]) {
-        self.bytes.extend_from_slice(bytes);
+        match &mut self.output {
+            EncoderOutput::Bytes(output) => output.extend_from_slice(bytes),
+            EncoderOutput::Count(length) => *length = length.saturating_add(bytes.len()),
+        }
     }
 
     fn string(&mut self, value: &str) -> Result<(), JournalV1Error> {

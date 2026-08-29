@@ -1,47 +1,58 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
-//! Caller-executor lifecycle, bounded volatile ingress, and latest-observation
-//! snapshots for the `OpenControl` Historian writer.
+//! Bounded durable active-journal ingress and volatile latest snapshots.
 //!
-//! Each [`HistorianRuntime`] owns one immutable store scope, exactly one private
-//! writer task, and a fixed 16-command canonical-admission window on the caller's
-//! active Tokio executor. Eligible positioned observations publish into a
-//! separate fixed 16-series volatile registry. Neither handling nor publication
-//! implies persistence, current/held value, query, or restart semantics.
+//! Each [`HistorianRuntime`] owns one immutable store scope, one Tokio
+//! coordinator, and one dedicated blocking active-journal writer joined by a
+//! fixed reaper. Handled and durable receipt stages are distinct. Latest state
+//! remains volatile and restarts empty.
 
 mod ingress;
 mod latest;
+mod store_worker;
 
 pub use ingress::{
-    HistorianIngress, IngressCommand, MAX_OUTSTANDING_COMMANDS, Receipt, ReceiptOutcome,
-    Submission, SubmissionDisposition, TrySubmitError, TrySubmitErrorKind,
+    AdmissionPriority, AppendIdentity, BarrierDemand, ByteReservationLimits, DurableCommit,
+    DurableOutcome, HandledOutcome, HistorianIngress, IngressCommand, MAX_OUTSTANDING_COMMANDS,
+    Receipt, ReceiptOutcome, ReservationOptionsError, Submission, SubmissionDisposition,
+    TrySubmitError, TrySubmitErrorKind,
 };
 pub use latest::{
     LatestReadError, LatestReadHandle, LatestSnapshot, MAX_PUBLISHED_SERIES, PublishedObservation,
 };
+pub use store_worker::{
+    GroupCommitPolicy, RuntimeHealth, RuntimeInspection, StoreOptions, StoreOptionsError,
+};
 
 use ingress::{CompletionFaultInjection, IngressShared, NextWork};
 use och_core::StoreId;
+use och_store::{ActiveJournalError, RecoveredAdmissionV1};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
+use store_worker::{
+    AppendResult, InspectionShared, WorkerMessage, spawn_worker_and_reaper, try_send,
+};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tokio::task::{JoinError, JoinHandle};
 
-/// A running private Historian writer task.
+/// One open filesystem-backed Historian runtime.
 ///
-/// Each handle owns one writer task and one isolated ingress state. Independent
-/// instances are valid concurrently; there is no global runtime registry. A
-/// stopped or failed instance cannot be restarted—call [`HistorianRuntime::start`]
-/// to construct a new one.
-///
-/// Dropping this handle requests task cancellation without blocking. Call
-/// [`HistorianRuntime::shutdown`] and await its result when joined normal
-/// termination is required.
+/// Drop signals fail-stop without joining. The fixed reaper remains responsible
+/// for eventually joining the blocking writer. Use [`HistorianRuntime::shutdown`]
+/// for FIFO drain, forced durability, sealed latest state, and joined completion.
 pub struct HistorianRuntime {
     ingress: HistorianIngress,
     writer: Option<JoinHandle<WriterExit>>,
+    store_sender: Option<SyncSender<WorkerMessage>>,
+    stop: Arc<AtomicBool>,
+    reaped: Option<oneshot::Receiver<()>>,
+    inspection: InspectionShared,
+    initial_inspection: och_store::ActiveJournalInspection,
+    recovered: Arc<[RecoveredAdmissionV1]>,
     shutdown_complete: bool,
 }
 
@@ -54,29 +65,54 @@ impl fmt::Debug for HistorianRuntime {
 }
 
 impl HistorianRuntime {
-    /// Starts one store-scoped private writer task on the active Tokio executor.
+    /// Opens one fixed active journal and its durable runtime authority.
     ///
-    /// The future returns only after the writer's private mutable state has been
-    /// initialized for `store_id`. The scope cannot change during the instance's
-    /// lifetime. The caller remains responsible for the executor; this method
-    /// never constructs an executor, starts a thread, or blocks.
+    /// All filesystem activity occurs on the dedicated blocking writer. This
+    /// future returns only after create/open, lock, scan, recovery convergence,
+    /// and coordinator readiness complete.
     ///
     /// # Errors
     ///
-    /// Returns a sanitized [`StartError`] when there is no active Tokio runtime
-    /// or the writer fails before readiness. Dropping this future after it has
-    /// spawned the writer aborts that writer rather than detaching it.
-    pub async fn start(store_id: StoreId) -> Result<Self, StartError> {
-        Self::start_inner(store_id, WriterOptions::production()).await
+    /// Returns a sanitized [`StartError`] for executor, worker, or store refusal.
+    pub async fn open(options: StoreOptions) -> Result<Self, StartError> {
+        Self::open_inner(options, WriterOptions::production()).await
     }
 
-    async fn start_inner(store_id: StoreId, options: WriterOptions) -> Result<Self, StartError> {
+    async fn open_inner(
+        store_options: StoreOptions,
+        options: WriterOptions,
+    ) -> Result<Self, StartError> {
         let executor = Handle::try_current().map_err(|_| StartError::NoActiveRuntime)?;
+        let store_id = store_options.store_id();
+        let ingress = HistorianIngress::new_with_limits(store_id, store_options.byte_limits());
+        let inspection = InspectionShared::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (store_sender, store_receiver) = sync_channel(MAX_OUTSTANDING_COMMANDS);
+        let (store_ready_tx, store_ready_rx) = oneshot::channel();
+        let (reaped_tx, reaped_rx) = oneshot::channel();
+        spawn_worker_and_reaper(
+            store_options,
+            store_receiver,
+            store_ready_tx,
+            ingress.shared(),
+            inspection.clone(),
+            Arc::clone(&stop),
+            reaped_tx,
+        )
+        .map_err(|_| StartError::WorkerThreadUnavailable)?;
+        let mut open_guard = OpenGuard::new(Arc::clone(&stop), store_sender.clone());
         let (readiness_tx, readiness_rx) = oneshot::channel();
-        let ingress = HistorianIngress::new(store_id);
         #[cfg(test)]
         let cancel_before_readiness = options.behavior == TestBehavior::CancelBeforeReadiness;
-        let writer = executor.spawn(run_writer(options, readiness_tx, ingress.shared()));
+        let writer = executor.spawn(run_writer(
+            options,
+            readiness_tx,
+            store_ready_rx,
+            ingress.shared(),
+            store_sender.clone(),
+            inspection.clone(),
+            Arc::clone(&stop),
+        ));
         let mut startup = StartupGuard::new(writer);
 
         #[cfg(test)]
@@ -84,23 +120,34 @@ impl HistorianRuntime {
             startup.abort();
         }
 
-        if readiness_rx.await.is_ok() {
-            Ok(Self {
-                ingress,
-                writer: Some(startup.transfer()),
-                shutdown_complete: false,
-            })
-        } else {
-            let result = startup.join().await;
-            startup.disarm();
-            match result {
-                Ok(_) => Err(StartError::WriterExitedBeforeReadiness),
-                Err(error) => Err(classify_start_join_error(&error)),
+        match readiness_rx.await {
+            Ok(Ok(ready)) => {
+                open_guard.disarm();
+                Ok(Self {
+                    ingress,
+                    writer: Some(startup.transfer()),
+                    store_sender: Some(store_sender),
+                    stop,
+                    reaped: Some(reaped_rx),
+                    inspection,
+                    initial_inspection: ready.inspection,
+                    recovered: ready.recovered.into(),
+                    shutdown_complete: false,
+                })
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                let result = startup.join().await;
+                startup.disarm();
+                match result {
+                    Ok(_) => Err(StartError::WriterExitedBeforeReadiness),
+                    Err(error) => Err(classify_start_join_error(&error)),
+                }
             }
         }
     }
 
-    /// Returns a cloneable handle to this instance's bounded volatile ingress.
+    /// Returns a cloneable handle to bounded durable ingress.
     ///
     /// The handle contains no executor or public Tokio primitive. It may outlive
     /// this runtime, but after shutdown or Drop it rejects commands as closed.
@@ -125,14 +172,25 @@ impl HistorianRuntime {
         LatestReadHandle::new(self.ingress.shared())
     }
 
+    /// Returns current bounded path-free store and reservation inspection.
+    #[must_use]
+    pub fn inspection(&self) -> RuntimeInspection {
+        self.inspection
+            .snapshot(&self.ingress.shared(), self.initial_inspection)
+    }
+
+    /// Returns bounded decoded reopen evidence without authorizing it.
+    #[must_use]
+    pub fn recovered_records(&self) -> &[RecoveredAdmissionV1] {
+        &self.recovered
+    }
+
     /// Gracefully stops and joins this instance's private writer task.
     ///
     /// Admission closes synchronously when this future is first polled. Commands
-    /// accepted before that close are drained FIFO, each publication decision is
-    /// completed before its receipt resolves as [`ReceiptOutcome::WriterHandled`],
-    /// the final registry is sealed, and then the retained task is joined.
-    /// `Ok(())` proves volatile handling, publication decision, and join only; it
-    /// is not persistence, durability, queryability, or restart evidence.
+    /// accepted before that close are appended and published FIFO, a final
+    /// journal/checkpoint barrier covers them, latest state is sealed, and both
+    /// coordinator and blocking writer are joined.
     ///
     /// # Errors
     ///
@@ -150,6 +208,13 @@ impl HistorianRuntime {
 
         match result {
             Ok(WriterExit::Shutdown) => {
+                self.store_sender = None;
+                let Some(reaped) = self.reaped.take() else {
+                    return Err(ShutdownError::WriterExitedBeforeShutdown);
+                };
+                if reaped.await.is_err() {
+                    return Err(ShutdownError::WriterExitedBeforeShutdown);
+                }
                 self.shutdown_complete = true;
                 Ok(())
             }
@@ -159,11 +224,42 @@ impl HistorianRuntime {
     }
 
     #[cfg(test)]
+    async fn start(store_id: StoreId) -> Result<Self, StartError> {
+        Self::start_with_options(store_id, WriterOptions::production()).await
+    }
+
+    #[cfg(test)]
     async fn start_with_options(
         store_id: StoreId,
         options: WriterOptions,
     ) -> Result<Self, StartError> {
-        Self::start_inner(store_id, options).await
+        let directory = test_directory();
+        let journal_limits = och_store::ActiveJournalLimits::new(
+            och_store::MAX_ADMISSION_PAYLOAD_V1,
+            64 * 1_024 * 1_024,
+            4_096,
+        )
+        .expect("test journal limits");
+        let byte_limits =
+            ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("test byte limits");
+        let group = GroupCommitPolicy::new(
+            std::time::Duration::from_millis(1),
+            MAX_OUTSTANDING_COMMANDS,
+            64 * 1_024 * 1_024,
+            std::time::Duration::from_secs(3_600),
+        )
+        .expect("test group policy");
+        let store = StoreOptions::new(
+            directory,
+            store_id,
+            och_store::ActiveJournalOpenMode::CreateNew,
+            journal_limits,
+            byte_limits,
+            group,
+        )
+        .expect("test store options")
+        .with_test_cleanup();
+        Self::open_inner(store, options).await
     }
 }
 
@@ -175,6 +271,12 @@ impl Drop for HistorianRuntime {
         // Resolve receipts before aborting so cancellation cannot strand work if
         // the caller's executor never polls the writer again.
         self.ingress.stop();
+        if let Some(store_sender) = &self.store_sender {
+            signal_store_worker_stop(&self.stop, store_sender);
+        } else {
+            self.stop.store(true, Ordering::Release);
+        }
+        self.store_sender = None;
         if let Some(writer) = self.writer.take() {
             writer.abort();
         }
@@ -196,6 +298,12 @@ pub enum StartError {
     WriterTaskCancelled,
     /// Tokio reported that the writer task panicked before readiness.
     WriterTaskPanicked,
+    /// The dedicated reaper thread could not be created.
+    WorkerThreadUnavailable,
+    /// The blocking worker exited before store readiness.
+    WorkerExitedBeforeReadiness,
+    /// Active-journal create/open/scan/lock refused.
+    Store(ActiveJournalError),
 }
 
 impl fmt::Display for StartError {
@@ -205,11 +313,40 @@ impl fmt::Display for StartError {
             Self::WriterExitedBeforeReadiness => "writer exited before readiness",
             Self::WriterTaskCancelled => "writer task was cancelled before readiness",
             Self::WriterTaskPanicked => "writer task panicked before readiness",
+            Self::WorkerThreadUnavailable => "journal worker thread unavailable",
+            Self::WorkerExitedBeforeReadiness => "journal worker exited before readiness",
+            Self::Store(_) => "active journal open failed",
         })
     }
 }
 
 impl Error for StartError {}
+
+struct OpenGuard {
+    stop: Arc<AtomicBool>,
+    sender: Option<SyncSender<WorkerMessage>>,
+}
+
+impl OpenGuard {
+    fn new(stop: Arc<AtomicBool>, sender: SyncSender<WorkerMessage>) -> Self {
+        Self {
+            stop,
+            sender: Some(sender),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.sender = None;
+    }
+}
+
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            signal_store_worker_stop(&self.stop, &sender);
+        }
+    }
+}
 
 /// Sanitized failures that can prevent graceful writer shutdown.
 ///
@@ -289,6 +426,7 @@ enum WriterExit {
     StartupReceiverClosed,
     IngressFailed,
     PublicationFault,
+    StoreFault,
     #[cfg(test)]
     BeforeReadiness,
     #[cfg(test)]
@@ -334,6 +472,8 @@ struct WriterOptions {
     #[cfg(test)]
     publication_gate: Option<oneshot::Receiver<()>>,
     #[cfg(test)]
+    publication_gate_after: usize,
+    #[cfg(test)]
     behavior: TestBehavior,
     #[cfg(test)]
     probe: Option<Arc<LifecycleProbe>>,
@@ -351,6 +491,8 @@ impl WriterOptions {
             #[cfg(test)]
             publication_gate: None,
             #[cfg(test)]
+            publication_gate_after: 0,
+            #[cfg(test)]
             behavior: TestBehavior::Normal,
             #[cfg(test)]
             probe: None,
@@ -358,16 +500,43 @@ impl WriterOptions {
     }
 }
 
+#[cfg(test)]
+fn test_directory() -> std::path::PathBuf {
+    static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(1);
+    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let directory =
+        std::env::temp_dir().join(format!("och-runtime-{}-{sequence}", std::process::id()));
+    std::fs::create_dir(&directory).expect("unique runtime test directory");
+    directory
+}
+
 async fn run_writer(
     options: WriterOptions,
-    readiness: oneshot::Sender<()>,
+    readiness: oneshot::Sender<Result<store_worker::WorkerReady, StartError>>,
+    store_readiness: oneshot::Receiver<Result<store_worker::WorkerReady, ActiveJournalError>>,
     ingress: Arc<IngressShared>,
+    store_sender: SyncSender<WorkerMessage>,
+    inspection: InspectionShared,
+    stop: Arc<AtomicBool>,
 ) -> WriterExit {
     #[cfg(test)]
     let mut options = options;
     #[cfg(test)]
     let _task_guard = TaskGuard::new(options.probe.clone());
-    let mut failure_guard = WriterFailureGuard::new(Arc::clone(&ingress));
+    let mut failure_guard =
+        WriterFailureGuard::new(Arc::clone(&ingress), inspection, stop, store_sender.clone());
+
+    let store_ready = match store_readiness.await {
+        Ok(Ok(ready)) => ready,
+        Ok(Err(error)) => {
+            let _ = readiness.send(Err(StartError::Store(error)));
+            return WriterExit::StoreFault;
+        }
+        Err(_) => {
+            let _ = readiness.send(Err(StartError::WorkerExitedBeforeReadiness));
+            return WriterExit::StoreFault;
+        }
+    };
 
     #[cfg(test)]
     let initialization_failed = match options.initialization_gate.take() {
@@ -393,7 +562,7 @@ async fn run_writer(
     }
 
     let _state = WriterState::initialize(&options);
-    if readiness.send(()).is_err() {
+    if readiness.send(Ok(store_ready)).is_err() {
         return WriterExit::StartupReceiverClosed;
     }
 
@@ -411,16 +580,20 @@ async fn run_writer(
         | TestBehavior::FaultAfterPublicationSwap => {}
     }
 
-    writer_loop(options, ingress, &mut failure_guard).await
+    writer_loop(options, ingress, store_sender, &mut failure_guard).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn writer_loop(
     options: WriterOptions,
     ingress: Arc<IngressShared>,
+    store_sender: SyncSender<WorkerMessage>,
     failure_guard: &mut WriterFailureGuard,
 ) -> WriterExit {
     #[cfg(test)]
     let mut options = options;
+    #[cfg(test)]
+    let mut appended_count = 0_usize;
     #[cfg(not(test))]
     let _ = options;
 
@@ -429,7 +602,7 @@ async fn writer_loop(
         // retained permit closes the submit-between-check-and-await race.
         let notified = ingress.notified();
         match ingress.take_next() {
-            NextWork::Work(work) => {
+            NextWork::Work(mut work) => {
                 #[cfg(test)]
                 if let Some(probe) = &options.probe {
                     probe.commands_started.fetch_add(1, Ordering::SeqCst);
@@ -461,14 +634,42 @@ async fn writer_loop(
                         .expect("test handled-order probe should not be poisoned")
                         .push(work.test_tag());
                 }
-                let Ok(preparation) = work.prepare_publication() else {
+                let frame_bytes = work.frame_len();
+                let Some(prepared) = work.take_prepared() else {
+                    return WriterExit::StoreFault;
+                };
+                let slot = work.slot_index();
+                let priority = work.priority();
+                let barrier = work.barrier();
+                let (append_tx, append_rx) = oneshot::channel();
+                if try_send(
+                    &store_sender,
+                    WorkerMessage::Append {
+                        slot,
+                        prepared: Box::new(prepared),
+                        response: append_tx,
+                    },
+                )
+                .is_err()
+                {
+                    return WriterExit::StoreFault;
+                }
+                let Ok(Ok(AppendResult { admission, append })) = append_rx.await else {
+                    return WriterExit::StoreFault;
+                };
+                let Ok(preparation) = work.prepare_publication(&admission) else {
                     return WriterExit::PublicationFault;
                 };
                 #[cfg(test)]
-                if let Some(publication_gate) = options.publication_gate.take()
-                    && publication_gate.await.is_err()
                 {
-                    return WriterExit::BeforeShutdown;
+                    let gate_this_append = appended_count == options.publication_gate_after;
+                    appended_count = appended_count.saturating_add(1);
+                    if gate_this_append
+                        && let Some(publication_gate) = options.publication_gate.take()
+                        && publication_gate.await.is_err()
+                    {
+                        return WriterExit::BeforeShutdown;
+                    }
                 }
                 #[cfg(test)]
                 let fault_injection = match options.behavior {
@@ -480,8 +681,35 @@ async fn writer_loop(
                 };
                 #[cfg(not(test))]
                 let fault_injection = CompletionFaultInjection::None;
-                if !(*work).finish_handled(preparation, fault_injection) {
+                if !(*work).finish_handled(admission, append, preparation, fault_injection) {
                     return WriterExit::PublicationFault;
+                }
+                if try_send(
+                    &store_sender,
+                    WorkerMessage::Published {
+                        slot,
+                        priority,
+                        barrier,
+                        frame_bytes,
+                    },
+                )
+                .is_err()
+                {
+                    return WriterExit::StoreFault;
+                }
+            }
+            NextWork::BarrierRequired => {
+                let (barrier_tx, barrier_rx) = oneshot::channel();
+                if try_send(
+                    &store_sender,
+                    WorkerMessage::Barrier {
+                        response: barrier_tx,
+                    },
+                )
+                .is_err()
+                    || !matches!(barrier_rx.await, Ok(Ok(())))
+                {
+                    return WriterExit::StoreFault;
                 }
             }
             NextWork::Empty => notified.await,
@@ -503,6 +731,18 @@ async fn writer_loop(
                 if let Some(probe) = &options.probe {
                     probe.normal_exits.fetch_add(1, Ordering::SeqCst);
                 }
+                let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                if try_send(
+                    &store_sender,
+                    WorkerMessage::Shutdown {
+                        response: shutdown_tx,
+                    },
+                )
+                .is_err()
+                    || !matches!(shutdown_rx.await, Ok(Ok(())))
+                {
+                    return WriterExit::StoreFault;
+                }
                 failure_guard.disarm();
                 return WriterExit::Shutdown;
             }
@@ -513,13 +753,24 @@ async fn writer_loop(
 
 struct WriterFailureGuard {
     ingress: Arc<IngressShared>,
+    inspection: InspectionShared,
+    stop: Arc<AtomicBool>,
+    store_sender: SyncSender<WorkerMessage>,
     armed: bool,
 }
 
 impl WriterFailureGuard {
-    fn new(ingress: Arc<IngressShared>) -> Self {
+    fn new(
+        ingress: Arc<IngressShared>,
+        inspection: InspectionShared,
+        stop: Arc<AtomicBool>,
+        store_sender: SyncSender<WorkerMessage>,
+    ) -> Self {
         Self {
             ingress,
+            inspection,
+            stop,
+            store_sender,
             armed: true,
         }
     }
@@ -532,9 +783,16 @@ impl WriterFailureGuard {
 impl Drop for WriterFailureGuard {
     fn drop(&mut self) {
         if self.armed {
+            self.inspection.coordinator_fault();
             self.ingress.stop();
+            signal_store_worker_stop(&self.stop, &self.store_sender);
         }
     }
+}
+
+fn signal_store_worker_stop(stop: &AtomicBool, store_sender: &SyncSender<WorkerMessage>) {
+    stop.store(true, Ordering::Release);
+    let _ = try_send(store_sender, WorkerMessage::Abort);
 }
 
 fn classify_start_join_error(error: &JoinError) -> StartError {
@@ -554,7 +812,7 @@ fn classify_shutdown_join_error(error: &JoinError) -> ShutdownError {
 }
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -609,10 +867,11 @@ enum TestBehavior {
 #[cfg(test)]
 mod tests {
     use super::{
-        HistorianIngress, HistorianRuntime, IngressCommand, LatestReadError, LatestReadHandle,
-        LifecycleProbe, MAX_OUTSTANDING_COMMANDS, MAX_PUBLISHED_SERIES, ReceiptOutcome,
-        ShutdownError, StartError, SubmissionDisposition, TestBehavior, TrySubmitErrorKind,
-        WriterOptions,
+        AdmissionPriority, BarrierDemand, ByteReservationLimits, DurableOutcome, GroupCommitPolicy,
+        HandledOutcome, HistorianIngress, HistorianRuntime, IngressCommand, LatestReadError,
+        LatestReadHandle, LifecycleProbe, MAX_OUTSTANDING_COMMANDS, MAX_PUBLISHED_SERIES,
+        ReceiptOutcome, RuntimeHealth, ShutdownError, StartError, StoreOptions, StoreOptionsError,
+        SubmissionDisposition, TestBehavior, TrySubmitErrorKind, WriterOptions, test_directory,
     };
     use och_core::{
         ArtifactId, ArtifactReference, CanonicalAdmission, CaptureLifecycle, CaptureRunEvidence,
@@ -628,8 +887,11 @@ mod tests {
         SourceSchemaIdentity, SourceSchemaVersion, SourceSnapshotEvidence, SourceSystemEvidence,
         SourceTransport, StoreId, TimeInterval, Timestamp, UnitEvidence, ValueFamily,
     };
+    use std::fs;
     use std::future::{Future, poll_fn};
+    use std::path::{Path, PathBuf};
     use std::pin::Pin;
+    use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::task::{Context, Poll, Waker};
@@ -637,12 +899,40 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task::yield_now;
 
-    const MAX_YIELDS: usize = 64;
+    const TEST_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     fn harness() -> Runtime {
         Builder::new_current_thread()
             .build()
             .expect("current-thread Tokio test harness should build")
+    }
+
+    fn durable_options(
+        directory: PathBuf,
+        store: StoreId,
+        mode: och_store::ActiveJournalOpenMode,
+        byte_limits: ByteReservationLimits,
+        group: GroupCommitPolicy,
+    ) -> StoreOptions {
+        StoreOptions::new(
+            directory,
+            store,
+            mode,
+            och_store::ActiveJournalLimits::new(
+                och_store::MAX_ADMISSION_PAYLOAD_V1,
+                64 * 1_024 * 1_024,
+                4_096,
+            )
+            .expect("test journal limits"),
+            byte_limits,
+            group,
+        )
+        .expect("test durable options")
+    }
+
+    fn group_policy(delay: std::time::Duration, records: usize, bytes: usize) -> GroupCommitPolicy {
+        GroupCommitPolicy::new(delay, records, bytes, std::time::Duration::from_secs(3_600))
+            .expect("test group policy")
     }
 
     fn options(probe: &Arc<LifecycleProbe>, behavior: TestBehavior) -> WriterOptions {
@@ -651,6 +941,7 @@ mod tests {
             shutdown_gate: None,
             command_gate: None,
             publication_gate: None,
+            publication_gate_after: 0,
             behavior,
             probe: Some(Arc::clone(probe)),
         }
@@ -987,23 +1278,85 @@ mod tests {
 
     async fn complete_bounded<F: Future>(future: F) -> F::Output {
         let mut future = Box::pin(future);
-        for _ in 0..MAX_YIELDS {
+        let started = std::time::Instant::now();
+        loop {
             if let Poll::Ready(output) = poll_once(future.as_mut()).await {
                 return output;
             }
+            assert!(
+                started.elapsed() < TEST_WAIT_TIMEOUT,
+                "lifecycle future did not complete within the elapsed-time bound"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(50));
             yield_now().await;
         }
-        panic!("lifecycle future did not complete within the deterministic yield bound");
     }
 
     async fn wait_until(mut condition: impl FnMut() -> bool) {
-        for _ in 0..MAX_YIELDS {
+        let started = std::time::Instant::now();
+        loop {
             if condition() {
                 return;
             }
+            assert!(
+                started.elapsed() < TEST_WAIT_TIMEOUT,
+                "condition did not hold within the elapsed-time bound"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(50));
             yield_now().await;
         }
-        assert!(condition(), "condition did not hold within the yield bound");
+    }
+
+    async fn assert_worker_reaped_and_lock_reopens(
+        runtime: &mut HistorianRuntime,
+        directory: &Path,
+    ) {
+        let reaped = runtime
+            .reaped
+            .take()
+            .expect("failed runtime should retain its reaper completion");
+        complete_bounded(reaped)
+            .await
+            .expect("coordinator failure must wake and reap the store worker");
+        assert_eq!(runtime.inspection().health(), RuntimeHealth::Faulted);
+        assert_eq!(
+            runtime.read_handle().snapshot(),
+            Err(LatestReadError::unavailable())
+        );
+        let config = och_store::ActiveJournalConfig::new(
+            directory.to_path_buf(),
+            runtime.store_id(),
+            och_store::ActiveJournalOpenMode::OpenExisting,
+            och_store::ActiveJournalLimits::new(
+                och_store::MAX_ADMISSION_PAYLOAD_V1,
+                64 * 1_024 * 1_024,
+                4_096,
+            )
+            .expect("reopen journal limits"),
+        )
+        .expect("reopen configuration");
+        let reopened = och_store::ActiveJournal::open(config)
+            .expect("reaped coordinator failure must release the store lock");
+        drop(reopened);
+    }
+
+    #[test]
+    fn completion_helper_is_not_limited_by_the_legacy_poll_count() {
+        harness().block_on(async {
+            let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = Arc::clone(&polls);
+            complete_bounded(poll_fn(move |context| {
+                let poll = observed.fetch_add(1, Ordering::SeqCst);
+                if poll > 4_096 {
+                    Poll::Ready(())
+                } else {
+                    context.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }))
+            .await;
+            assert!(polls.load(Ordering::SeqCst) > 4_096);
+        });
     }
 
     #[test]
@@ -1899,6 +2252,109 @@ mod tests {
             assert_eq!(panic_error, ShutdownError::WriterTaskPanicked);
             assert!(!panic_error.to_string().contains("hostile"));
             assert_eq!(panic_read.snapshot(), Err(LatestReadError::unavailable()));
+        });
+    }
+
+    #[test]
+    fn every_coordinator_failure_class_wakes_and_reaps_the_store_worker() {
+        harness().block_on(async {
+            let byte_limits =
+                ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("byte limits");
+            let group = group_policy(
+                std::time::Duration::from_millis(2),
+                MAX_OUTSTANDING_COMMANDS,
+                64 * 1_024 * 1_024,
+            );
+
+            for (label, behavior, expected_shutdown) in [
+                (
+                    "exit",
+                    TestBehavior::ExitBeforeShutdown,
+                    ShutdownError::WriterExitedBeforeShutdown,
+                ),
+                (
+                    "panic",
+                    TestBehavior::PanicBeforeShutdown,
+                    ShutdownError::WriterTaskPanicked,
+                ),
+            ] {
+                let directory = test_directory();
+                let probe = Arc::new(LifecycleProbe::default());
+                let mut runtime = complete_bounded(HistorianRuntime::open_inner(
+                    durable_options(
+                        directory.clone(),
+                        store_id(1),
+                        och_store::ActiveJournalOpenMode::CreateNew,
+                        byte_limits,
+                        group,
+                    ),
+                    options(&probe, behavior),
+                ))
+                .await
+                .unwrap_or_else(|error| panic!("{label} runtime should start: {error:?}"));
+                assert_worker_reaped_and_lock_reopens(&mut runtime, &directory).await;
+                assert_eq!(
+                    complete_bounded(runtime.shutdown()).await,
+                    Err(expected_shutdown)
+                );
+                fs::remove_dir_all(directory).expect("remove coordinator failure directory");
+            }
+
+            let directory = test_directory();
+            let probe = Arc::new(LifecycleProbe::default());
+            let mut cancelled = complete_bounded(HistorianRuntime::open_inner(
+                durable_options(
+                    directory.clone(),
+                    store_id(1),
+                    och_store::ActiveJournalOpenMode::CreateNew,
+                    byte_limits,
+                    group,
+                ),
+                options(&probe, TestBehavior::Normal),
+            ))
+            .await
+            .expect("cancelled runtime should start");
+            cancelled
+                .writer
+                .as_ref()
+                .expect("runtime retains coordinator")
+                .abort();
+            assert_worker_reaped_and_lock_reopens(&mut cancelled, &directory).await;
+            assert_eq!(
+                complete_bounded(cancelled.shutdown()).await,
+                Err(ShutdownError::WriterTaskCancelled)
+            );
+            fs::remove_dir_all(directory).expect("remove cancelled coordinator directory");
+
+            let directory = test_directory();
+            let probe = Arc::new(LifecycleProbe::default());
+            let mut publication = complete_bounded(HistorianRuntime::open_inner(
+                durable_options(
+                    directory.clone(),
+                    store_id(1),
+                    och_store::ActiveJournalOpenMode::CreateNew,
+                    byte_limits,
+                    group,
+                ),
+                options(&probe, TestBehavior::FaultBeforePublicationSwap),
+            ))
+            .await
+            .expect("publication-fault runtime should start");
+            let receipt = publication
+                .ingress()
+                .try_submit(command("publication-reap", 10, 0))
+                .expect("publication-fault command should queue")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(receipt.wait()).await,
+                ReceiptOutcome::WriterStopped
+            );
+            assert_worker_reaped_and_lock_reopens(&mut publication, &directory).await;
+            assert_eq!(
+                complete_bounded(publication.shutdown()).await,
+                Err(ShutdownError::WriterExitedBeforeShutdown)
+            );
+            fs::remove_dir_all(directory).expect("remove publication-fault directory");
         });
     }
 
@@ -2880,6 +3336,7 @@ mod tests {
                     complete_bounded(receipt.wait()).await,
                     ReceiptOutcome::WriterStopped
                 );
+                assert_eq!(runtime.inspection().health(), RuntimeHealth::Faulted);
                 let error = read
                     .snapshot()
                     .expect_err("future snapshots must be unavailable");
@@ -2897,5 +3354,741 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn handled_and_durable_stages_reopen_without_restart_retry_authority() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("byte limits");
+            let runtime = complete_bounded(HistorianRuntime::open(durable_options(
+                directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                bytes,
+                group_policy(
+                    std::time::Duration::from_secs(5),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                ),
+            )))
+            .await
+            .expect("create durable runtime");
+            let read = runtime.read_handle();
+            let receipt = runtime
+                .ingress()
+                .try_submit(command("durable-reopen", 42, 10))
+                .expect("queue durable admission")
+                .into_receipt();
+            let handled = complete_bounded(receipt.clone().wait_handled()).await;
+            let HandledOutcome::WriterHandled(append) = handled else {
+                panic!("writer should reach handled stage");
+            };
+            assert_eq!(append.append_sequence(), 1);
+            let mut durable = Box::pin(receipt.clone().wait_durable());
+            assert!(poll_once(durable.as_mut()).await.is_pending());
+            assert_eq!(runtime.inspection().pending_count(), 1);
+            assert!(runtime.inspection().pending_bytes() > 0);
+            assert_eq!(runtime.inspection().store().sync_count(), 0);
+
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("shutdown forces final barrier and joins");
+            let DurableOutcome::Durable(commit) = complete_bounded(durable).await else {
+                panic!("shutdown should make accepted work durable");
+            };
+            assert_eq!(commit.append(), append);
+            assert!(commit.durable_cutoff().append_sequence() >= append.append_sequence());
+            assert_eq!(commit.durable_cutoff().checkpoint_generation(), 2);
+            let _sealed = read
+                .snapshot()
+                .expect("sealed snapshot remains readable after shutdown");
+
+            let reopened = complete_bounded(HistorianRuntime::open(durable_options(
+                directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::OpenExisting,
+                bytes,
+                group_policy(
+                    std::time::Duration::from_secs(5),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                ),
+            )))
+            .await
+            .expect("reopen durable prefix");
+            assert_eq!(reopened.recovered_records().len(), 1);
+            assert_eq!(
+                reopened
+                    .inspection()
+                    .store()
+                    .durable_cutoff()
+                    .checkpoint_generation(),
+                2
+            );
+            assert_eq!(
+                reopened.recovered_records()[0].retry(),
+                command("durable-reopen", 42, 10).admission().retry()
+            );
+            assert!(
+                reopened
+                    .read_handle()
+                    .snapshot()
+                    .expect("latest restarts available and empty")
+                    .is_empty()
+            );
+            let equivalent = reopened
+                .ingress()
+                .try_submit(IngressCommand::with_policy(
+                    command("durable-reopen", 42, 10).into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Immediate,
+                ))
+                .expect("restart does not seed completed retry cache");
+            assert_eq!(equivalent.disposition(), SubmissionDisposition::Queued);
+            let DurableOutcome::Durable(second) =
+                complete_bounded(equivalent.into_receipt().wait_durable()).await
+            else {
+                panic!("second active-scope admission should become durable");
+            };
+            assert_eq!(second.append().append_sequence(), 2);
+            assert_eq!(second.durable_cutoff().checkpoint_generation(), 3);
+            complete_bounded(reopened.shutdown())
+                .await
+                .expect("reopened runtime shutdown");
+            fs::remove_dir_all(directory).expect("remove durable test directory");
+        });
+    }
+
+    #[test]
+    fn exact_class_and_global_byte_reservations_refuse_without_mutation() {
+        harness().block_on(async {
+            let first = command("class-0", 1, 0);
+            let second = command("class-1", 2, 1);
+            let third = command("class-2", 3, 2);
+            let fourth = command("class-3", 4, 3);
+            let frame_bytes =
+                och_store::admission_frame_len_v1(first.admission()).expect("count first frame");
+            assert_eq!(
+                och_store::admission_frame_len_v1(second.admission()),
+                Ok(frame_bytes)
+            );
+            let limits = ByteReservationLimits::new(frame_bytes * 3, frame_bytes, frame_bytes)
+                .expect("nested class law");
+            let ingress = HistorianIngress::new_with_limits(store_id(1), limits);
+            let first_receipt = ingress
+                .try_submit(IngressCommand::with_policy(
+                    first.into_admission(),
+                    AdmissionPriority::Bulk,
+                    BarrierDemand::Group,
+                ))
+                .expect("bulk exact class maximum")
+                .into_receipt();
+            let error = ingress
+                .try_submit(IngressCommand::with_policy(
+                    second.into_admission(),
+                    AdmissionPriority::Bulk,
+                    BarrierDemand::Group,
+                ))
+                .expect_err("bulk max plus one refuses");
+            assert_eq!(error.kind(), TrySubmitErrorKind::ByteCapacity);
+            let second = error.into_command();
+            let second_receipt = ingress
+                .try_submit(IngressCommand::with_policy(
+                    second.into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Group,
+                ))
+                .expect("normal reserve remains available")
+                .into_receipt();
+            let third_receipt = ingress
+                .try_submit(IngressCommand::with_policy(
+                    third.into_admission(),
+                    AdmissionPriority::Protected,
+                    BarrierDemand::Group,
+                ))
+                .expect("protected reserve reaches exact global max")
+                .into_receipt();
+            assert_eq!(ingress.shared().pending_counts(), (3, frame_bytes * 3));
+            let error = ingress
+                .try_submit(IngressCommand::with_policy(
+                    fourth.into_admission(),
+                    AdmissionPriority::Protected,
+                    BarrierDemand::Group,
+                ))
+                .expect_err("global byte max plus one refuses");
+            assert_eq!(error.kind(), TrySubmitErrorKind::ByteCapacity);
+            assert_eq!(ingress.shared().pending_counts(), (3, frame_bytes * 3));
+            ingress.stop();
+            for receipt in [first_receipt, second_receipt, third_receipt] {
+                assert_eq!(
+                    complete_bounded(receipt.wait_durable()).await,
+                    DurableOutcome::WriterStopped
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn record_time_explicit_and_protected_barriers_are_bounded_and_fifo() {
+        harness().block_on(async {
+            let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("byte limits");
+
+            let records_directory = test_directory();
+            let records_runtime = complete_bounded(HistorianRuntime::open(durable_options(
+                records_directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                bytes,
+                group_policy(std::time::Duration::from_secs(5), 2, 64 * 1_024 * 1_024),
+            )))
+            .await
+            .expect("record-trigger runtime");
+            let first = records_runtime
+                .ingress()
+                .try_submit(command("records-0", 1, 0))
+                .expect("first record")
+                .into_receipt();
+            let second = records_runtime
+                .ingress()
+                .try_submit(command("records-1", 2, 1))
+                .expect("second record")
+                .into_receipt();
+            let DurableOutcome::Durable(first_commit) =
+                complete_bounded(first.wait_durable()).await
+            else {
+                panic!("record threshold should make first durable");
+            };
+            let DurableOutcome::Durable(second_commit) =
+                complete_bounded(second.wait_durable()).await
+            else {
+                panic!("record threshold should make second durable");
+            };
+            assert_eq!(first_commit.append().append_sequence(), 1);
+            assert_eq!(second_commit.append().append_sequence(), 2);
+            assert_eq!(records_runtime.inspection().store().sync_count(), 1);
+            complete_bounded(records_runtime.shutdown())
+                .await
+                .expect("record runtime shutdown");
+            fs::remove_dir_all(records_directory).expect("remove record directory");
+
+            let bytes_directory = test_directory();
+            let first_bytes = command("bytes-0", 6, 5);
+            let second_bytes = command("bytes-1", 7, 6);
+            let frame_bytes = och_store::admission_frame_len_v1(first_bytes.admission())
+                .expect("count byte-trigger frame");
+            assert_eq!(
+                och_store::admission_frame_len_v1(second_bytes.admission()),
+                Ok(frame_bytes)
+            );
+            let bytes_runtime = complete_bounded(HistorianRuntime::open(durable_options(
+                bytes_directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                bytes,
+                group_policy(
+                    std::time::Duration::from_secs(5),
+                    MAX_OUTSTANDING_COMMANDS,
+                    frame_bytes * 2,
+                ),
+            )))
+            .await
+            .expect("byte-trigger runtime");
+            let first = bytes_runtime
+                .ingress()
+                .try_submit(first_bytes)
+                .expect("first byte-trigger frame")
+                .into_receipt();
+            let second = bytes_runtime
+                .ingress()
+                .try_submit(second_bytes)
+                .expect("second byte-trigger frame")
+                .into_receipt();
+            assert!(matches!(
+                complete_bounded(first.wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
+            assert!(matches!(
+                complete_bounded(second.wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
+            assert_eq!(bytes_runtime.inspection().store().sync_count(), 1);
+            complete_bounded(bytes_runtime.shutdown())
+                .await
+                .expect("byte runtime shutdown");
+            fs::remove_dir_all(bytes_directory).expect("remove byte directory");
+
+            let time_directory = test_directory();
+            let time_runtime = complete_bounded(HistorianRuntime::open(durable_options(
+                time_directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                bytes,
+                group_policy(
+                    std::time::Duration::from_millis(2),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                ),
+            )))
+            .await
+            .expect("time-trigger runtime");
+            let timed = time_runtime
+                .ingress()
+                .try_submit(command("time-barrier", 3, 2))
+                .expect("timed admission")
+                .into_receipt();
+            assert!(matches!(
+                complete_bounded(timed.wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
+            assert_eq!(time_runtime.inspection().store().sync_count(), 1);
+
+            let immediate = time_runtime
+                .ingress()
+                .try_submit(IngressCommand::with_policy(
+                    command("explicit-barrier", 4, 3).into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Immediate,
+                ))
+                .expect("explicit barrier")
+                .into_receipt();
+            assert!(matches!(
+                complete_bounded(immediate.wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
+            let protected = time_runtime
+                .ingress()
+                .try_submit(IngressCommand::with_policy(
+                    command("protected-barrier", 5, 4).into_admission(),
+                    AdmissionPriority::Protected,
+                    BarrierDemand::Group,
+                ))
+                .expect("protected barrier")
+                .into_receipt();
+            assert!(matches!(
+                complete_bounded(protected.wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
+            assert_eq!(time_runtime.inspection().store().sync_count(), 3);
+            complete_bounded(time_runtime.shutdown())
+                .await
+                .expect("time runtime shutdown");
+            fs::remove_dir_all(time_directory).expect("remove time directory");
+        });
+    }
+
+    #[test]
+    fn group_timeout_never_checkpoints_an_unpublished_append() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let probe = Arc::new(LifecycleProbe::default());
+            let (release_publication, publication_gate) = oneshot::channel();
+            let mut writer_options = options(&probe, TestBehavior::Normal);
+            writer_options.publication_gate = Some(publication_gate);
+            writer_options.publication_gate_after = 1;
+            let group_delay = std::time::Duration::from_millis(500);
+            let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                .expect("unpublished byte limits");
+            let runtime = complete_bounded(HistorianRuntime::open_inner(
+                durable_options(
+                    directory.clone(),
+                    store_id(1),
+                    och_store::ActiveJournalOpenMode::CreateNew,
+                    bytes,
+                    group_policy(group_delay, MAX_OUTSTANDING_COMMANDS, 64 * 1_024 * 1_024),
+                ),
+                writer_options,
+            ))
+            .await
+            .expect("unpublished-cutoff runtime");
+            let ingress = runtime.ingress();
+            let first = ingress
+                .try_submit(command("published-first", 90, 90))
+                .expect("queue first group member")
+                .into_receipt();
+            assert!(matches!(
+                complete_bounded(first.clone().wait_handled()).await,
+                HandledOutcome::WriterHandled(_)
+            ));
+            let second = ingress
+                .try_submit(command("unpublished-second", 91, 91))
+                .expect("queue gated second group member")
+                .into_receipt();
+            wait_until(|| runtime.inspection().store().last_append_sequence() == 2).await;
+            assert_eq!(
+                runtime
+                    .inspection()
+                    .store()
+                    .durable_cutoff()
+                    .append_sequence(),
+                0
+            );
+            let started = std::time::Instant::now();
+            while started.elapsed() <= group_delay {
+                yield_now().await;
+            }
+            assert_eq!(runtime.inspection().store().sync_count(), 0);
+            assert_eq!(
+                runtime
+                    .inspection()
+                    .store()
+                    .durable_cutoff()
+                    .append_sequence(),
+                0,
+                "timeout cannot cover a frame awaiting publication acknowledgement"
+            );
+            let mut first_durable = Box::pin(first.wait_durable());
+            assert!(poll_once(first_durable.as_mut()).await.is_pending());
+
+            release_publication
+                .send(())
+                .expect("release second publication acknowledgement");
+            let DurableOutcome::Durable(first_commit) = complete_bounded(first_durable).await
+            else {
+                panic!("first group member becomes durable after publication");
+            };
+            let DurableOutcome::Durable(second_commit) =
+                complete_bounded(second.wait_durable()).await
+            else {
+                panic!("second group member becomes durable after publication");
+            };
+            assert_eq!(first_commit.durable_cutoff().append_sequence(), 2);
+            assert_eq!(second_commit.durable_cutoff().append_sequence(), 2);
+            assert_eq!(second_commit.durable_cutoff().checkpoint_generation(), 2);
+            assert_eq!(runtime.inspection().store().sync_count(), 1);
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("unpublished-cutoff shutdown");
+            fs::remove_dir_all(directory).expect("remove unpublished-cutoff directory");
+        });
+    }
+
+    #[test]
+    fn option_relationships_and_active_age_rotation_fail_closed() {
+        assert_eq!(
+            GroupCommitPolicy::new(
+                std::time::Duration::ZERO,
+                1,
+                1,
+                std::time::Duration::from_secs(1),
+            ),
+            Err(StoreOptionsError::InvalidRelationships)
+        );
+        assert_eq!(
+            GroupCommitPolicy::new(
+                std::time::Duration::from_secs(1),
+                MAX_OUTSTANDING_COMMANDS + 1,
+                1,
+                std::time::Duration::from_secs(1),
+            ),
+            Err(StoreOptionsError::InvalidRelationships)
+        );
+        harness().block_on(async {
+            let directory = test_directory();
+            let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                .expect("age rotation byte limits");
+            let options = durable_options(
+                directory,
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                bytes,
+                GroupCommitPolicy::new(
+                    std::time::Duration::from_secs(1),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                    std::time::Duration::from_nanos(1),
+                )
+                .expect("finite age rotation policy"),
+            )
+            .with_test_cleanup();
+            let runtime = complete_bounded(HistorianRuntime::open(options))
+                .await
+                .expect("age rotation runtime opens at genesis");
+            assert_eq!(
+                runtime.inspection().health(),
+                RuntimeHealth::RotationRequired
+            );
+            let ingress = runtime.ingress();
+            let receipt = ingress
+                .try_submit(command("age-rotation", 88, 80))
+                .expect("rotation demand is decided by the sole worker")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(receipt.wait_durable()).await,
+                DurableOutcome::WriterStopped
+            );
+            assert_eq!(
+                runtime.inspection().health(),
+                RuntimeHealth::RotationRequired
+            );
+            assert_eq!(
+                ingress
+                    .try_submit(command("closed-after-age", 89, 81))
+                    .expect_err("rotation demand closes admission")
+                    .kind(),
+                TrySubmitErrorKind::Closed
+            );
+            assert_eq!(
+                complete_bounded(runtime.shutdown()).await,
+                Err(ShutdownError::WriterExitedBeforeShutdown)
+            );
+        });
+    }
+
+    #[test]
+    fn store_options_validate_borrowed_path_before_cloning() {
+        let journal_limits = och_store::ActiveJournalLimits::new(
+            och_store::MAX_ADMISSION_PAYLOAD_V1,
+            64 * 1_024 * 1_024,
+            4_096,
+        )
+        .expect("path-bound journal limits");
+        let byte_limits = ByteReservationLimits::new(1_024, 0, 0).expect("path-bound byte limits");
+        let group = GroupCommitPolicy::new(
+            std::time::Duration::from_secs(1),
+            1,
+            1_024,
+            std::time::Duration::from_secs(60),
+        )
+        .expect("path-bound group policy");
+        assert!(
+            StoreOptions::new(
+                PathBuf::from("x".repeat(och_store::MAX_STORE_DIRECTORY_BYTES)),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                journal_limits,
+                byte_limits,
+                group,
+            )
+            .is_ok(),
+            "exact path bound is retained"
+        );
+        assert!(matches!(
+            StoreOptions::new(
+                PathBuf::from("x".repeat(och_store::MAX_STORE_DIRECTORY_BYTES + 1)),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                journal_limits,
+                byte_limits,
+                group,
+            ),
+            Err(StoreOptionsError::Journal(
+                och_store::ActiveJournalError::InvalidOptions
+            ))
+        ));
+    }
+
+    #[test]
+    fn nonblocking_drop_has_a_concrete_reaper_that_releases_the_lock() {
+        harness().block_on(async {
+            for _ in 0..16 {
+                let directory = test_directory();
+                let journal_limits = och_store::ActiveJournalLimits::new(
+                    och_store::MAX_ADMISSION_PAYLOAD_V1,
+                    64 * 1_024 * 1_024,
+                    4_096,
+                )
+                .expect("journal limits");
+                let bytes =
+                    ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("byte limits");
+                let runtime = complete_bounded(HistorianRuntime::open(durable_options(
+                    directory.clone(),
+                    store_id(1),
+                    och_store::ActiveJournalOpenMode::CreateNew,
+                    bytes,
+                    group_policy(
+                        std::time::Duration::from_millis(2),
+                        MAX_OUTSTANDING_COMMANDS,
+                        64 * 1_024 * 1_024,
+                    ),
+                )))
+                .await
+                .expect("drop runtime");
+                drop(runtime);
+
+                let mut reopened = None;
+                let started = std::time::Instant::now();
+                while started.elapsed() < TEST_WAIT_TIMEOUT {
+                    let config = och_store::ActiveJournalConfig::new(
+                        directory.clone(),
+                        store_id(1),
+                        och_store::ActiveJournalOpenMode::OpenExisting,
+                        journal_limits,
+                    )
+                    .expect("reopen config");
+                    match och_store::ActiveJournal::open(config) {
+                        Ok(journal) => {
+                            reopened = Some(journal);
+                            break;
+                        }
+                        Err(och_store::ActiveJournalError::AlreadyOpen) => {
+                            std::thread::sleep(std::time::Duration::from_micros(50));
+                        }
+                        Err(error) => panic!("unexpected reopen error: {error:?}"),
+                    }
+                }
+                assert!(reopened.is_some(), "reaper must eventually release lock");
+                drop(reopened);
+                fs::remove_dir_all(directory).expect("remove drop directory");
+            }
+        });
+    }
+
+    #[test]
+    fn inspection_and_failures_do_not_expose_store_paths_or_canonical_content() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("byte limits");
+            let runtime = complete_bounded(HistorianRuntime::open(durable_options(
+                directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                bytes,
+                group_policy(
+                    std::time::Duration::from_millis(2),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                ),
+            )))
+            .await
+            .expect("inspection runtime");
+            let debug = format!("{runtime:?} {:?}", runtime.inspection());
+            assert!(!debug.contains(directory.to_string_lossy().as_ref()));
+            assert!(!debug.contains("historian-request"));
+            assert_eq!(runtime.inspection().health(), RuntimeHealth::Healthy);
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("inspection shutdown");
+            fs::remove_dir_all(directory).expect("remove inspection directory");
+        });
+    }
+
+    #[test]
+    fn child_process_kill_helper() {
+        let Ok(directory) = std::env::var("OCH_RUNTIME_KILL_DIRECTORY") else {
+            return;
+        };
+        let stage = std::env::var("OCH_RUNTIME_KILL_STAGE").expect("child kill stage");
+        harness().block_on(async {
+            let bytes =
+                ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("child byte limits");
+            let runtime = complete_bounded(HistorianRuntime::open(durable_options(
+                PathBuf::from(&directory),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                bytes,
+                group_policy(
+                    std::time::Duration::from_secs(60),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                ),
+            )))
+            .await
+            .expect("child runtime open");
+            let barrier = if stage == "durable" {
+                BarrierDemand::Immediate
+            } else {
+                BarrierDemand::Group
+            };
+            let receipt = runtime
+                .ingress()
+                .try_submit(IngressCommand::with_policy(
+                    command("child-kill", 77, 70).into_admission(),
+                    AdmissionPriority::Normal,
+                    barrier,
+                ))
+                .expect("child admission")
+                .into_receipt();
+            if stage == "durable" {
+                assert!(matches!(
+                    complete_bounded(receipt.wait_durable()).await,
+                    DurableOutcome::Durable(_)
+                ));
+            } else {
+                assert!(matches!(
+                    complete_bounded(receipt.wait_handled()).await,
+                    HandledOutcome::WriterHandled(_)
+                ));
+            }
+            fs::write(
+                PathBuf::from(directory).join("child-ready"),
+                stage.as_bytes(),
+            )
+            .expect("publish child readiness marker");
+            loop {
+                std::thread::park();
+            }
+        });
+    }
+
+    #[test]
+    fn real_process_kill_reopens_durable_and_handled_suffixes_truthfully() {
+        for stage in ["durable", "handled"] {
+            let directory = test_directory();
+            let marker = directory.join("child-ready");
+            let mut child = Command::new(std::env::current_exe().expect("runtime test executable"))
+                .args(["--exact", "tests::child_process_kill_helper", "--nocapture"])
+                .env("OCH_RUNTIME_KILL_DIRECTORY", &directory)
+                .env("OCH_RUNTIME_KILL_STAGE", stage)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn child runtime");
+            let mut ready = false;
+            for _ in 0..5_000 {
+                if marker.is_file() {
+                    ready = true;
+                    break;
+                }
+                assert!(
+                    child.try_wait().expect("inspect child").is_none(),
+                    "child exited before readiness"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(ready, "child must report the requested receipt stage");
+            child.kill().expect("kill child after receipt stage");
+            let status = child.wait().expect("reap killed child");
+            assert!(!status.success());
+
+            harness().block_on(async {
+                let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                    .expect("reopen byte limits");
+                let reopened = complete_bounded(HistorianRuntime::open(durable_options(
+                    directory.clone(),
+                    store_id(1),
+                    och_store::ActiveJournalOpenMode::OpenExisting,
+                    bytes,
+                    group_policy(
+                        std::time::Duration::from_millis(2),
+                        MAX_OUTSTANDING_COMMANDS,
+                        64 * 1_024 * 1_024,
+                    ),
+                )))
+                .await
+                .expect("bounded reopen after process kill");
+                assert_eq!(reopened.recovered_records().len(), 1);
+                assert_eq!(
+                    reopened
+                        .inspection()
+                        .store()
+                        .durable_cutoff()
+                        .append_sequence(),
+                    1
+                );
+                assert!(
+                    reopened
+                        .read_handle()
+                        .snapshot()
+                        .expect("empty latest")
+                        .is_empty()
+                );
+                complete_bounded(reopened.shutdown())
+                    .await
+                    .expect("shutdown reopened child journal");
+            });
+            fs::remove_dir_all(directory).expect("remove child-kill directory");
+        }
     }
 }

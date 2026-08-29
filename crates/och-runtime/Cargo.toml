@@ -1,6 +1,6 @@
 [package]
 name = "och-runtime"
-description = "Caller-executor lifecycle and bounded volatile ingress for OpenControl Historian"
+description = "Bounded durable active-journal runtime for OpenControl Historian"
 readme = "../../README.md"
 keywords = ["historian", "industrial", "opencontrol"]
 categories = ["asynchronous"]
@@ -19,6 +19,7 @@ missing-docs-policy = "deny"
 
 [dependencies]
 och-core = { version = "=0.0.0", path = "../och-core" }
+och-store = { version = "=0.0.0", path = "../och-store" }
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "sync"] }
 
 [lints]

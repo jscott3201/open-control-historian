@@ -1,5 +1,10 @@
 # M02-PR01b0 continuation: Journal V1 semantic frames
 
+> **Successor note:** M02-PR01b1 now supplies the sole active-journal durable
+> runtime vertical described as the hard boundary below. This file remains the
+> historical framing record; current ownership and deferrals are in
+> [M02-PR01b1](continuation-m02-pr01b1.md).
+
 ## Live outcome
 
 M02-PR01b0 adds `och-store` as the third default native root with the sole inward
@@ -48,21 +53,21 @@ parser are independently reviewable load-bearing authority, so PR01b0 freezes
 those semantics first. This split is not a delivered journal and does not permit
 a second callable path beside the runtime writer.
 
-M02-PR01b1 remains the first complete active-journal durable vertical. It must
-connect the only runtime writer path to journal create/open/append, group commit,
-barriers, durable cutoffs and receipts, and reopen/recovery as one coherent
-vertical using Journal V1. Until that successor is reviewed, `WriterHandled`
-remains non-durable and Journal V1 bytes are only in-memory format evidence.
+M02-PR01b1 is the first complete active-journal durable vertical. It connects the
+only runtime writer path to journal create/open/append, group commit, barriers,
+durable cutoffs and receipts, and bounded reopen as one coherent vertical using
+Journal V1. `WriterHandled` remains deliberately non-durable; the new distinct
+durable stage is covered by the mechanical journal/checkpoint cutoff.
 
 ## Deferred ledger
 
-- filesystem layout; journal create/open/append/sync/lock and the dedicated
-  blocking writer thread;
-- group commit, barriers, durable cutoffs/receipts, close/seal, and reopen;
 - registry persistence/bootstrap, manifest generation, rotation, and handoff;
-- recovery scanning, truncation/corruption policy, full-disk and partial-write
-  behavior, and durable retry horizons;
-- byte/priority admission budgeting and platform qualification;
+- successor generation/range publication, immutable artifacts, and physical
+  reclamation;
+- broad recovery events, full-disk qualification, durable retry horizons, and
+  cross-platform power-loss qualification;
 - query, rollup, retention/priority execution, adapters, and Studio/Engine work.
 
-No item in this ledger is silently implemented or claimed by M02-PR01b0.
+The removed historical bullets are delivered only by the reviewed PR01b1
+successor, not retroactively by M02-PR01b0. No remaining ledger item is silently
+implemented or claimed by either slice.

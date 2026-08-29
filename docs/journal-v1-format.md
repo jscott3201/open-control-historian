@@ -1,9 +1,10 @@
 # Journal V1 semantic format
 
 Journal V1 is the first canonical byte representation of one already-authorized
-`och_core::CanonicalAdmission`. It is an inspection and future-storage format,
-not authorization, persistence, or durability. All multibyte integers use
-network byte order (big-endian). No value is inferred, normalized, generated,
+`och_core::CanonicalAdmission`. M02-PR01b1 stores it in one bounded, locked,
+generation-one active journal with a mechanical durable-high-water checkpoint.
+The bytes and decoded records never grant authorization. All multibyte integers
+use network byte order (big-endian). No value is inferred, normalized, generated,
 compressed, dictionary-encoded, or hashed with a platform-dependent algorithm.
 
 ## Fixed header
@@ -46,6 +47,89 @@ CRC-32C uses the Castagnoli polynomial in reflected form `0x82f63b78`, initial
 register `0xffffffff`, byte-wise reflected processing, and final XOR
 `0xffffffff`. The stored checksum is big-endian. The standard `123456789` check
 value is `0xe3069283`.
+
+## Active artifacts and bounds
+
+The pre-manifest active generation is exactly unsigned `1` and uses exactly two
+files in one caller-supplied existing directory:
+
+- `active-journal-v1.och`: one header followed by independent frames;
+- `active-journal-v1.checkpoint`: exactly two 64-byte checkpoint slots.
+
+Create-new follows one exact order: exclusively create and lock the single
+read/write journal, write and synchronize its header, exclusively create the
+checkpoint, initialize its 128 bytes with generation-one genesis in slot zero and
+an all-zero alternate slot, synchronize the checkpoint, then synchronize the
+directory before readiness. Append mode is not used: every frame write seeks
+explicitly to journal end on the retained locked handle.
+
+Configured limits are checked before I/O and may only narrow these hard bounds:
+
+| Contract | Hard V1 active bound |
+| --- | ---: |
+| Directory encoded path | 4,096 bytes |
+| Frame payload | 8,388,608 bytes |
+| Active journal including header | 536,870,912 bytes |
+| Active admission records | 4,096 |
+
+The runtime separately retains a fixed 16-command count window and explicit
+finite outstanding encoded-byte limits. It computes the exact frame length with
+the same canonical traversal but no frame allocation, atomically reserves count
+and bytes first, then allocates/encodes and checks that the prepared length is
+exact. Protected, normal, and bulk classes change reservation ceilings and
+barrier demand only; append order stays FIFO.
+
+## Durable checkpoint
+
+Each 64-byte checkpoint slot is self-contained:
+
+| Offset | Length | Field | V1 value |
+| ---: | ---: | --- | --- |
+| 0 | 8 | magic | ASCII `OCHCP001` |
+| 8 | 2 | version | unsigned `1` |
+| 10 | 2 | slot length | unsigned `64` |
+| 12 | 16 | store identity | Journal header `StoreId` |
+| 28 | 8 | journal generation | unsigned `1` |
+| 36 | 8 | slot generation | positive, strict monotonic |
+| 44 | 8 | durable append sequence | zero only at genesis |
+| 52 | 8 | durable end offset | exact frame boundary |
+| 60 | 4 | checksum | CRC-32C over bytes 0..60 |
+
+Slot generation one occupies slot zero; each barrier increments generation and
+writes `(generation - 1) mod 2`. A barrier's required order is journal sync,
+alternate checkpoint-slot write, checkpoint sync, then in-memory cutoff advance
+and durable receipt resolution. Public `DurableCutoff` evidence carries this
+mechanical checkpoint generation separately from the fixed journal generation.
+The checkpoint is only store/journal binding and mechanical cutoff evidence. It
+carries no declaration registry, retry outcome, latest state, or source
+interpretation authority.
+
+Open-existing requires exact fixed artifacts and a retained writer lock. It
+validates the header, checkpoint length, StoreId/generation/checksums, slot parity,
+and strict consecutive generations. Two valid consecutive slots must also advance
+both append sequence and end offset strictly. Any invalid or non-progressing
+nonzero slot refuses; an invalid apparently newer slot never falls back to an
+older valid cutoff. A lone valid slot is accepted only for generation one with an
+unused zero alternate. If the checkpoint artifact is missing or exists with
+exactly zero bytes, open-existing may create or initialize it only after validating
+an exact header-only journal under the retained lock. A nonempty or invalid journal
+without a checkpoint refuses without creating one. Every nonzero wrong checkpoint
+length refuses unchanged. An existing 128-byte all-zero checkpoint has the same
+header-only genesis restriction.
+
+The scan is limited by configured payload, journal-byte, and record bounds before
+allocation. Every frame StoreId and governing declaration StoreId must equal the
+header. Invalid bytes inside the checkpoint cutoff refuse without mutation. A
+valid suffix beyond an unambiguous cutoff is journal-synchronized and checkpointed
+before readiness. An invalid unacknowledged suffix may be truncated only when it
+is provably terminal; a complete malformed frame followed by any bytes or later
+candidate makes recovery ambiguous and refuses without changing the file. Every
+allowed truncation is synchronized before readiness. The scan never fabricates
+`CanonicalAdmission`, registry history, latest state, or a completed retry cache.
+If an append I/O failure may have changed journal bytes, that open
+`ActiveJournal` is terminally faulted: it refuses later sequence assignment,
+append, and synchronization. Only drop plus this validated reopen path may
+truncate a proven torn terminal suffix and establish a new writer authority.
 
 ## Primitive encoding
 

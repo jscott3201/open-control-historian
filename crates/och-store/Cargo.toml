@@ -1,6 +1,6 @@
 [package]
 name = "och-store"
-description = "Bounded Journal V1 semantic framing for OpenControl Historian"
+description = "Bounded Journal V1 framing and active-journal ownership for OpenControl Historian"
 readme = "../../README.md"
 keywords = ["historian", "industrial", "opencontrol"]
 categories = ["encoding"]
