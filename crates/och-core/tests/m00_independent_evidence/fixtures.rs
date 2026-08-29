@@ -182,6 +182,7 @@ pub enum RawError {
     AdmissionRetryScopeMismatch,
     TooManySourceObservationContexts,
     SourceObservationCountMismatch,
+    SourceObservationAssociationMismatch,
     TooManySourceGapContexts,
     SourceGapCountMismatch,
     MisorderedSourceRecordOrdinals,
@@ -243,6 +244,7 @@ impl RawError {
             Self::AdmissionRetryScopeMismatch => "AdmissionRetryScopeMismatch",
             Self::TooManySourceObservationContexts => "TooManySourceObservationContexts",
             Self::SourceObservationCountMismatch => "SourceObservationCountMismatch",
+            Self::SourceObservationAssociationMismatch => "SourceObservationAssociationMismatch",
             Self::TooManySourceGapContexts => "TooManySourceGapContexts",
             Self::SourceGapCountMismatch => "SourceGapCountMismatch",
             Self::MisorderedSourceRecordOrdinals => "MisorderedSourceRecordOrdinals",
@@ -257,7 +259,7 @@ impl RawError {
     }
 }
 
-pub const ALL_ERROR_CODES: [RawError; 56] = [
+pub const ALL_ERROR_CODES: [RawError; 57] = [
     RawError::InvalidIdentity,
     RawError::InvalidExactText,
     RawError::InvalidPortableToken,
@@ -304,6 +306,7 @@ pub const ALL_ERROR_CODES: [RawError; 56] = [
     RawError::AdmissionRetryScopeMismatch,
     RawError::TooManySourceObservationContexts,
     RawError::SourceObservationCountMismatch,
+    RawError::SourceObservationAssociationMismatch,
     RawError::TooManySourceGapContexts,
     RawError::SourceGapCountMismatch,
     RawError::MisorderedSourceRecordOrdinals,

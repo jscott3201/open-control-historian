@@ -45,11 +45,15 @@ real half-open `TimeInterval`.
 - snapshot evidence identity, run link, and exact snapshot `ArtifactReference`.
 
 For every canonical observation, observed admission requires one ordered source
-context and one linked raw/normalized pair. It validates transient source,
+context that explicitly names the canonical `ObservationId` plus one linked
+raw/normalized pair. The named identity must equal the envelope observation at
+the same position, so counts and ordinals cannot associate swapped or unrelated
+lineage. Admission also validates transient source,
 application, quantity, and unit interpretation against the exact governing
 declaration before removing that duplication. The retained lineage includes:
 
-- original `0..=255` source record ordinal;
+- exact canonical `ObservationId` association and original `0..=255` source
+  record ordinal;
 - source-observation `EvidenceId`, optional distinct provenance
   `ArtifactReference`, `New`/`Redelivered`, and optional source idempotency
   `{RetryKey, ContentIdentity}`;
@@ -72,10 +76,11 @@ No-change structurally retains zero observations, gaps, and lineages while still
 retaining schema and the complete capture lifecycle.
 
 All lifecycle and per-record `EvidenceId` values must be unique within one
-admission. Counts, fixed maxima (256 observation contexts and 64 gap contexts),
-strict ordinal order, lifecycle/record links, raw-idempotency content, declaration
-interpretation, interval class, gap ranges, and retry series/producer scope are
-validated before compact retention. Every refusal returns one closed sanitized
+admission. Counts, exact envelope-order `ObservationId` association, fixed maxima
+(256 observation contexts and 64 gap contexts), strict ordinal order,
+lifecycle/record links, raw-idempotency content, declaration interpretation,
+interval class, gap ranges, and retry series/producer scope are validated before
+compact retention. Every refusal returns one closed sanitized
 `ModelError`, creates no admission, and does not mutate the registry or immutable
 declaration snapshot.
 
@@ -131,7 +136,7 @@ computes each M00-PR05 violation and a complete normalized retained-admission
 record. The top-level public-model adapter constructs the corresponding real
 `CanonicalAdmission`, normalizes every retained declaration, source/capture,
 retry, lineage, and gap field through public accessors, and compares that record
-for exact structural equality. The nominal identity and complete 56-variant
+for exact structural equality. The nominal identity and complete 57-variant
 sanitized error inventories include this successor.
 
 ## M02-PR01 input and hard boundary

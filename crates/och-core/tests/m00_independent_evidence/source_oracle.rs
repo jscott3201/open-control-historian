@@ -5,7 +5,7 @@
 use super::fixtures::RawError;
 use std::collections::BTreeSet;
 
-pub const SOURCE_ERROR_INVENTORY: [RawError; 21] = [
+pub const SOURCE_ERROR_INVENTORY: [RawError; 22] = [
     RawError::InvalidSourceSchemaVersion,
     RawError::CaptureRunTimeOrder,
     RawError::SourceEndpointSystemMismatch,
@@ -17,6 +17,7 @@ pub const SOURCE_ERROR_INVENTORY: [RawError; 21] = [
     RawError::AdmissionRetryScopeMismatch,
     RawError::TooManySourceObservationContexts,
     RawError::SourceObservationCountMismatch,
+    RawError::SourceObservationAssociationMismatch,
     RawError::TooManySourceGapContexts,
     RawError::SourceGapCountMismatch,
     RawError::MisorderedSourceRecordOrdinals,
@@ -46,6 +47,7 @@ pub struct RawLifecycle {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawLineage {
     pub ordinal: u16,
+    pub canonical_observation: u16,
     pub source_observation: u16,
     pub provenance_artifact: Option<(u16, &'static str, u128, [u8; 32])>,
     pub redelivered: bool,
@@ -98,6 +100,7 @@ pub struct RawAdmission {
     pub declaration_unit: Option<Result<&'static str, &'static str>>,
     pub lifecycle: RawLifecycle,
     pub envelope_observation_count: usize,
+    pub canonical_observations: Vec<u16>,
     pub lineages: Vec<RawLineage>,
     pub canonical_gaps: Vec<(u128, u128, u128)>,
     pub gaps: Vec<RawGapContext>,
@@ -139,8 +142,10 @@ pub fn valid_observed() -> RawAdmission {
             snapshot_artifact: (20, "application/json", 1, [6; 32]),
         },
         envelope_observation_count: 1,
+        canonical_observations: vec![60],
         lineages: vec![RawLineage {
             ordinal: 0,
+            canonical_observation: 60,
             source_observation: 30,
             provenance_artifact: Some((21, "application/octet-stream", 1, [5; 32])),
             redelivered: true,
@@ -216,6 +221,14 @@ pub fn violations(raw: &RawAdmission) -> Vec<RawError> {
         errors.push(RawError::TooManySourceObservationContexts);
     } else if raw.lineages.len() != raw.envelope_observation_count {
         errors.push(RawError::SourceObservationCountMismatch);
+    }
+    if raw
+        .lineages
+        .iter()
+        .zip(&raw.canonical_observations)
+        .any(|(lineage, canonical)| lineage.canonical_observation != *canonical)
+    {
+        errors.push(RawError::SourceObservationAssociationMismatch);
     }
     if raw.gaps.len() > 64 {
         errors.push(RawError::TooManySourceGapContexts);
@@ -313,6 +326,7 @@ pub struct NormalizedLifecycle {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NormalizedLineage {
     pub ordinal: u8,
+    pub canonical_observation: u16,
     pub source_observation: u16,
     pub provenance_artifact: Option<NormalizedArtifact>,
     pub redelivered: bool,
@@ -358,6 +372,7 @@ pub struct NormalizedAdmission {
     pub retry_key: String,
     pub retry_content: NormalizedContent,
     pub envelope_observation_count: usize,
+    pub canonical_observations: Vec<u16>,
     pub canonical_gaps: Vec<(u128, u128, u128)>,
     pub lineages: Vec<NormalizedLineage>,
     pub gaps: Vec<NormalizedGap>,
@@ -431,12 +446,14 @@ pub fn expected_retained(raw: &RawAdmission) -> NormalizedAdmission {
         retry_key: raw.retry_key.to_owned(),
         retry_content: content(raw.retry_content),
         envelope_observation_count: raw.envelope_observation_count,
+        canonical_observations: raw.canonical_observations.clone(),
         canonical_gaps: raw.canonical_gaps.clone(),
         lineages: raw
             .lineages
             .iter()
             .map(|lineage| NormalizedLineage {
                 ordinal: u8::try_from(lineage.ordinal).expect("valid fixture ordinal"),
+                canonical_observation: lineage.canonical_observation,
                 source_observation: lineage.source_observation,
                 provenance_artifact: lineage.provenance_artifact.map(artifact),
                 redelivered: lineage.redelivered,

@@ -7,9 +7,9 @@ use crate::collection::{MAX_GAPS, MAX_OBSERVATIONS};
 use crate::compact::compact_vec;
 use crate::{
     ArtifactReference, CollectionEnvelope, ContentIdentity, DeclarationReference,
-    DeclaredCollectionEnvelope, EvidenceId, EvidenceKind, ModelError, ProducerEpoch,
-    ProducerSequence, QuantityEvidence, RetryKey, RetryQualification, SeriesDeclaration,
-    SourceProjection, SourceReference, StoreId, Timestamp, UnitEvidence,
+    DeclaredCollectionEnvelope, EvidenceId, EvidenceKind, ModelError, Observation, ObservationId,
+    ProducerEpoch, ProducerSequence, QuantityEvidence, RetryKey, RetryQualification,
+    SeriesDeclaration, SourceProjection, SourceReference, StoreId, Timestamp, UnitEvidence,
 };
 use core::fmt;
 use std::collections::HashSet;
@@ -628,10 +628,12 @@ impl NormalizedRecordEvidence {
     }
 }
 
-/// One source observation's transient context and linked record pair.
+/// One canonical observation's explicit source association, transient context,
+/// and linked record pair.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SourceObservationContext {
     ordinal: u8,
+    canonical_observation_id: ObservationId,
     interpretation: SourceInterpretation,
     observation: SourceObservationEvidence,
     raw: RawRecordEvidence,
@@ -643,6 +645,7 @@ impl SourceObservationContext {
     #[must_use]
     pub const fn new(
         ordinal: u8,
+        canonical_observation_id: ObservationId,
         interpretation: SourceInterpretation,
         observation: SourceObservationEvidence,
         raw: RawRecordEvidence,
@@ -650,6 +653,7 @@ impl SourceObservationContext {
     ) -> Self {
         Self {
             ordinal,
+            canonical_observation_id,
             interpretation,
             observation,
             raw,
@@ -661,6 +665,12 @@ impl SourceObservationContext {
     #[must_use]
     pub const fn ordinal(&self) -> u8 {
         self.ordinal
+    }
+
+    /// Returns the exact canonical observation associated in envelope order.
+    #[must_use]
+    pub const fn canonical_observation_id(&self) -> ObservationId {
+        self.canonical_observation_id
     }
 
     /// Returns the transient interpretation context.
@@ -688,10 +698,12 @@ impl SourceObservationContext {
     }
 }
 
-/// Retained source observation lineage after declaration context validation.
+/// Retained canonical/source observation association and lineage after
+/// declaration context validation.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SourceObservationLineage {
     ordinal: u8,
+    canonical_observation_id: ObservationId,
     observation: SourceObservationEvidence,
     raw: RawRecordEvidence,
     normalized: NormalizedRecordEvidence,
@@ -702,6 +714,12 @@ impl SourceObservationLineage {
     #[must_use]
     pub const fn ordinal(&self) -> u8 {
         self.ordinal
+    }
+
+    /// Returns the retained canonical observation association.
+    #[must_use]
+    pub const fn canonical_observation_id(&self) -> ObservationId {
+        self.canonical_observation_id
     }
 
     /// Returns retained source observation evidence.
@@ -862,6 +880,7 @@ impl CanonicalAdmission {
         validate_observations(
             declared.declaration(),
             &lifecycle,
+            envelope.observations(),
             &observations,
             &mut evidence_ids,
         )?;
@@ -871,6 +890,7 @@ impl CanonicalAdmission {
             .into_iter()
             .map(|context| SourceObservationLineage {
                 ordinal: context.ordinal,
+                canonical_observation_id: context.canonical_observation_id,
                 observation: context.observation,
                 raw: context.raw,
                 normalized: context.normalized,
@@ -1045,13 +1065,17 @@ fn lifecycle_evidence_ids(lifecycle: &CaptureLifecycle) -> Result<HashSet<Eviden
 fn validate_observations(
     declaration: &SeriesDeclaration,
     lifecycle: &CaptureLifecycle,
+    canonical_observations: &[Observation],
     observations: &[SourceObservationContext],
     evidence_ids: &mut HashSet<EvidenceId>,
 ) -> Result<(), ModelError> {
     let declaration_source = declaration.binding().source();
     let payload = declaration.payload();
     let mut previous_ordinal = None;
-    for context in observations {
+    for (context, canonical) in observations.iter().zip(canonical_observations) {
+        if context.canonical_observation_id != canonical.observation_id() {
+            return Err(ModelError::SourceObservationAssociationMismatch);
+        }
         if previous_ordinal.is_some_and(|previous| previous >= context.ordinal) {
             return Err(ModelError::MisorderedSourceRecordOrdinals);
         }

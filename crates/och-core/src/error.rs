@@ -100,6 +100,8 @@ pub enum ModelError {
     TooManySourceObservationContexts,
     /// Source observation context count differs from canonical observations.
     SourceObservationCountMismatch,
+    /// Source observation context names a different canonical observation.
+    SourceObservationAssociationMismatch,
     /// Source gap contexts exceed their fixed bound.
     TooManySourceGapContexts,
     /// Source gap context count differs from canonical gaps.
@@ -171,6 +173,7 @@ impl fmt::Display for ModelError {
             Self::AdmissionRetryScopeMismatch => "admission retry scope mismatch",
             Self::TooManySourceObservationContexts => "source observation context bound exceeded",
             Self::SourceObservationCountMismatch => "source observation count mismatch",
+            Self::SourceObservationAssociationMismatch => "source observation association mismatch",
             Self::TooManySourceGapContexts => "source gap context bound exceeded",
             Self::SourceGapCountMismatch => "source gap count mismatch",
             Self::MisorderedSourceRecordOrdinals => "source record ordinals are misordered",

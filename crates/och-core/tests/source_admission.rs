@@ -221,6 +221,8 @@ fn context(ordinal: u8, number: u64, lifecycle: &CaptureLifecycle) -> SourceObse
     );
     SourceObservationContext::new(
         ordinal,
+        ObservationId::from_bytes(uuid_bytes(10_000 + number))
+            .expect("UUIDv7 canonical observation"),
         SourceInterpretation::new(
             source(Some("projection:mqtt"), "locator:device-1"),
             Some(reference("application:ahu-1")),
@@ -342,6 +344,10 @@ fn observed_admission_retains_exact_lineage_and_keeps_retry_independent() {
     assert_eq!(admission.evidence_kind(), SourceIntervalKind::Observed);
     assert_eq!(admission.observations()[0].ordinal(), 7);
     assert_eq!(
+        admission.observations()[0].canonical_observation_id(),
+        admission.envelope().observations()[0].observation_id()
+    );
+    assert_eq!(
         admission.observations()[0].observation().transport(),
         SourceTransport::Redelivered
     );
@@ -382,6 +388,7 @@ fn observed_admission_retains_exact_lineage_and_keeps_retry_independent() {
     );
     let optional_absent = SourceObservationContext::new(
         0,
+        ObservationId::from_bytes(uuid_bytes(10_000)).expect("UUIDv7 canonical observation"),
         SourceInterpretation::new(
             source(Some("projection:mqtt"), "locator:device-1"),
             Some(reference("application:ahu-1")),
@@ -528,7 +535,28 @@ fn counts_ordinals_ids_snapshot_and_interpretation_fail_closed() {
             retry(series, producer, 1),
             batch(SourceIntervalKind::Observed),
             capture.clone(),
-            vec![context(0, 0, &capture), context(1, 0, &capture)],
+            vec![context(0, 1, &capture), context(1, 0, &capture)],
+            Vec::new(),
+        ),
+        Err(ModelError::SourceObservationAssociationMismatch)
+    );
+    let first = context(0, 0, &capture);
+    let second = context(1, 1, &capture);
+    let duplicate = SourceObservationContext::new(
+        second.ordinal(),
+        second.canonical_observation_id(),
+        second.interpretation().clone(),
+        first.observation().clone(),
+        first.raw().clone(),
+        first.normalized().clone(),
+    );
+    assert_eq!(
+        CanonicalAdmission::observed(
+            make_bound(),
+            retry(series, producer, 1),
+            batch(SourceIntervalKind::Observed),
+            capture.clone(),
+            vec![first, duplicate],
             Vec::new(),
         ),
         Err(ModelError::DuplicateSourceEvidenceId)
@@ -545,6 +573,7 @@ fn counts_ordinals_ids_snapshot_and_interpretation_fail_closed() {
     );
     let bad_snapshot = SourceObservationContext::new(
         0,
+        ObservationId::from_bytes(uuid_bytes(10_000)).expect("UUIDv7 canonical observation"),
         SourceInterpretation::new(
             source(Some("projection:mqtt"), "locator:device-1"),
             Some(reference("application:ahu-1")),
@@ -579,6 +608,7 @@ fn counts_ordinals_ids_snapshot_and_interpretation_fail_closed() {
     let valid = context(0, 0, &capture);
     let bad_interpretation = SourceObservationContext::new(
         0,
+        ObservationId::from_bytes(uuid_bytes(10_000)).expect("UUIDv7 canonical observation"),
         SourceInterpretation::new(
             source(Some("projection:mqtt"), "locator:other"),
             Some(reference("application:ahu-1")),
@@ -625,6 +655,7 @@ fn record_pair_link_and_raw_idempotency_mismatches_are_distinct() {
     );
     let case = SourceObservationContext::new(
         0,
+        ObservationId::from_bytes(uuid_bytes(10_000)).expect("UUIDv7 canonical observation"),
         base.interpretation().clone(),
         base.observation().clone(),
         base.raw().clone(),
@@ -649,6 +680,7 @@ fn record_pair_link_and_raw_idempotency_mismatches_are_distinct() {
     );
     let case = SourceObservationContext::new(
         0,
+        ObservationId::from_bytes(uuid_bytes(10_000)).expect("UUIDv7 canonical observation"),
         base.interpretation().clone(),
         base.observation().clone(),
         base.raw().clone(),
@@ -682,6 +714,7 @@ fn record_pair_link_and_raw_idempotency_mismatches_are_distinct() {
     );
     let case = SourceObservationContext::new(
         0,
+        ObservationId::from_bytes(uuid_bytes(10_000)).expect("UUIDv7 canonical observation"),
         base.interpretation().clone(),
         base.observation().clone(),
         raw,
@@ -866,19 +899,22 @@ fn source_context_and_gap_capacity_boundaries_are_exact() {
             )
         })
         .collect();
+    let maximum = CanonicalAdmission::observed(
+        declared,
+        retry(series, producer, 1),
+        batch(SourceIntervalKind::Observed),
+        capture.clone(),
+        contexts,
+        Vec::new(),
+    )
+    .expect("exact observation maximum");
     assert_eq!(
-        CanonicalAdmission::observed(
-            declared,
-            retry(series, producer, 1),
-            batch(SourceIntervalKind::Observed),
-            capture.clone(),
-            contexts,
-            Vec::new(),
-        )
-        .expect("exact observation maximum")
-        .observations()
-        .len(),
+        maximum.observations().len(),
         MAX_SOURCE_OBSERVATION_CONTEXTS
+    );
+    assert_eq!(
+        maximum.observations()[255].canonical_observation_id(),
+        maximum.envelope().observations()[255].observation_id()
     );
     let (_, declared) = registry_bound(
         series,

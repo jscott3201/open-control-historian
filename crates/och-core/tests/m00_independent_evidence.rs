@@ -135,7 +135,7 @@ fn actual_constructor(case: &ConstructorCase) -> Result<(), ModelError> {
     }
 }
 
-const fn actual_source_model_errors() -> [ModelError; 21] {
+const fn actual_source_model_errors() -> [ModelError; 22] {
     [
         ModelError::InvalidSourceSchemaVersion,
         ModelError::CaptureRunTimeOrder,
@@ -148,6 +148,7 @@ const fn actual_source_model_errors() -> [ModelError; 21] {
         ModelError::AdmissionRetryScopeMismatch,
         ModelError::TooManySourceObservationContexts,
         ModelError::SourceObservationCountMismatch,
+        ModelError::SourceObservationAssociationMismatch,
         ModelError::TooManySourceGapContexts,
         ModelError::SourceGapCountMismatch,
         ModelError::MisorderedSourceRecordOrdinals,
@@ -288,6 +289,8 @@ fn actual_source_admission() -> CanonicalAdmission {
     );
     let context = SourceObservationContext::new(
         0,
+        ObservationId::from_bytes(fixtures::uuid_bytes(60))
+            .expect("valid associated observation UUIDv7"),
         SourceInterpretation::new(
             source,
             Some(actual_declaration_reference("application".to_owned())),
@@ -442,6 +445,12 @@ fn normalize_source_admission(
         retry_key: admission.retry().key().as_str().to_owned(),
         retry_content: normalized_content(admission.retry().content()),
         envelope_observation_count: admission.envelope().observations().len(),
+        canonical_observations: admission
+            .envelope()
+            .observations()
+            .iter()
+            .map(|observation| identity_number(observation.observation_id().into_bytes()))
+            .collect(),
         canonical_gaps: admission
             .envelope()
             .gaps()
@@ -453,6 +462,9 @@ fn normalize_source_admission(
             .iter()
             .map(|lineage| source_oracle::NormalizedLineage {
                 ordinal: lineage.ordinal(),
+                canonical_observation: identity_number(
+                    lineage.canonical_observation_id().into_bytes(),
+                ),
                 source_observation: identity_number(
                     lineage.observation().evidence_id().into_bytes(),
                 ),
@@ -545,6 +557,9 @@ const fn error_code(error: ModelError) -> RawError {
         ModelError::AdmissionRetryScopeMismatch => RawError::AdmissionRetryScopeMismatch,
         ModelError::TooManySourceObservationContexts => RawError::TooManySourceObservationContexts,
         ModelError::SourceObservationCountMismatch => RawError::SourceObservationCountMismatch,
+        ModelError::SourceObservationAssociationMismatch => {
+            RawError::SourceObservationAssociationMismatch
+        }
         ModelError::TooManySourceGapContexts => RawError::TooManySourceGapContexts,
         ModelError::SourceGapCountMismatch => RawError::SourceGapCountMismatch,
         ModelError::MisorderedSourceRecordOrdinals => RawError::MisorderedSourceRecordOrdinals,
@@ -1600,6 +1615,9 @@ fn source_capture_crosswalk_matches_a_primitive_only_oracle() {
     let mut case = valid.clone();
     case.envelope_observation_count = 2;
     cases.push((case, RawError::SourceObservationCountMismatch));
+    let mut case = valid.clone();
+    case.lineages[0].canonical_observation = 99;
+    cases.push((case, RawError::SourceObservationAssociationMismatch));
     let mut case = valid.clone();
     case.gaps = vec![valid.gaps[0]; 65];
     cases.push((case, RawError::TooManySourceGapContexts));

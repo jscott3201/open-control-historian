@@ -133,8 +133,11 @@ Every lifecycle and record role uses the shared nominal `EvidenceId`; identities
 must be unique within one admission.
 
 Every observed envelope observation has exactly one ordered
-`SourceObservationContext` and linked raw/normalized record pair. Before retaining
-the compact lineage, admission validates provider/projection/locator, optional
+`SourceObservationContext` and linked raw/normalized record pair. Each context
+explicitly names the canonical `ObservationId`, which must equal the envelope
+observation at the same position before retention; source `EvidenceId` remains a
+distinct identity and is never inferred from it. Before retaining the compact
+lineage, admission validates provider/projection/locator, optional
 application reference, and exact absent/resolved/unresolved quantity and unit
 evidence against the governing declaration. It retains the original `u8` source
 record ordinal, source observation identity, optional distinct provenance
@@ -265,7 +268,7 @@ the top-level adapter constructs and calls the public model. The adapter compare
 actual accessors, ordering, validation errors, and retry classifications with
 primitive expected facts computed by the oracle. Twelve atomic negative builders
 each prove exactly one independent violation before comparison, and a complete
-56-variant inventory covers every current sanitized `ModelError`.
+57-variant inventory covers every current sanitized `ModelError`.
 
 M00-PR04 adds `series_oracle.rs`, a primitive bounded lifecycle state machine that
 does not import implementation types or constants. The top-level public adapter
