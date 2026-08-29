@@ -27,7 +27,9 @@ storage, persistence, query, wire, and adapter choices unmade.
 
 All constructors return the closed sanitized `ModelError` without retaining
 hostile input. Collection bounds are checked before secondary validation
-allocation; accepted traversals remain linear or tightly bounded.
+allocation; accepted strings and vectors are deterministically compacted through
+boxed ownership so retained capacity equals logical length; accepted traversals
+remain linear or tightly bounded.
 
 ## Excluded
 

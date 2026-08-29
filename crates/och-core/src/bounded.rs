@@ -1,6 +1,10 @@
 //! Bounded exact text and portable token primitives.
+//!
+//! Accepted owned strings are compacted to their validated byte length so a
+//! caller cannot transfer unrelated spare allocation capacity into the model.
 
 use crate::ModelError;
+use crate::compact::compact_string;
 use core::fmt;
 
 /// Maximum Unicode scalar values in [`ExactText`].
@@ -37,7 +41,7 @@ macro_rules! portable_token {
                 if !validate_printable_ascii(&value, MAX_PORTABLE_TOKEN_BYTES) {
                     return Err(ModelError::InvalidPortableToken);
                 }
-                Ok(Self(value))
+                Ok(Self(compact_string(value)))
             }
 
             /// Borrows the exact token.
@@ -97,7 +101,7 @@ impl ExactText {
         if value.chars().take(MAX_TEXT_SCALARS + 1).count() > MAX_TEXT_SCALARS {
             return Err(ModelError::InvalidExactText);
         }
-        Ok(Self(value))
+        Ok(Self(compact_string(value)))
     }
 
     /// Borrows the exact, unnormalized text.
@@ -153,7 +157,7 @@ impl ContentFormat {
         if !valid {
             return Err(ModelError::InvalidContentFormat);
         }
-        Ok(Self(value))
+        Ok(Self(compact_string(value)))
     }
 
     /// Borrows the exact format token.
@@ -200,7 +204,7 @@ impl RetryKey {
         if !validate_printable_ascii(&value, MAX_RETRY_KEY_BYTES) {
             return Err(ModelError::InvalidRetryKey);
         }
-        Ok(Self(value))
+        Ok(Self(compact_string(value)))
     }
 
     /// Borrows the exact key for explicit comparison or transport by its owner.
@@ -227,5 +231,63 @@ impl TryFrom<String> for RetryKey {
 impl fmt::Debug for RetryKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RetryKey([REDACTED])")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ATTACKER_SPARE_CAPACITY: usize = 4 * 1_024 * 1_024;
+
+    fn string_with_large_spare_capacity(value: &str) -> String {
+        let mut input = String::with_capacity(ATTACKER_SPARE_CAPACITY);
+        input.push_str(value);
+        assert!(input.capacity() > input.len());
+        input
+    }
+
+    #[test]
+    fn portable_token_types_discard_caller_spare_capacity() {
+        let class =
+            StateClass::new(string_with_large_spare_capacity("class")).expect("valid state class");
+        assert_eq!(class.0.capacity(), class.0.len());
+        drop(class);
+
+        let member = StateMember::new(string_with_large_spare_capacity("member"))
+            .expect("valid state member");
+        assert_eq!(member.0.capacity(), member.0.len());
+        drop(member);
+
+        let status = NativeStatusToken::new(string_with_large_spare_capacity("status"))
+            .expect("valid native status token");
+        assert_eq!(status.0.capacity(), status.0.len());
+        drop(status);
+
+        let reason = UnavailableReason::new(string_with_large_spare_capacity("reason"))
+            .expect("valid unavailable reason");
+        assert_eq!(reason.0.capacity(), reason.0.len());
+    }
+
+    #[test]
+    fn exact_text_format_and_retry_key_discard_caller_spare_capacity() {
+        let text =
+            ExactText::new(string_with_large_spare_capacity("🦀")).expect("valid exact text");
+        assert_eq!(text.0.capacity(), text.0.len());
+        drop(text);
+
+        let empty_text =
+            ExactText::new(string_with_large_spare_capacity("")).expect("valid empty text");
+        assert_eq!(empty_text.0.capacity(), 0);
+        drop(empty_text);
+
+        let format = ContentFormat::new(string_with_large_spare_capacity("application/octet"))
+            .expect("valid content format");
+        assert_eq!(format.0.capacity(), format.0.len());
+        drop(format);
+
+        let key =
+            RetryKey::new(string_with_large_spare_capacity("retry-key")).expect("valid retry key");
+        assert_eq!(key.0.capacity(), key.0.len());
     }
 }

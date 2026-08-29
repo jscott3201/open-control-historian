@@ -1,5 +1,6 @@
 //! Atomic bounded collection evidence and its cross-item validation.
 
+use crate::compact::compact_vec;
 use crate::{
     CollectionMode, ModelError, Observation, ProducerEpoch, ProducerSequence, SeriesMetadata,
     TimeInterval,
@@ -150,7 +151,8 @@ impl CollectionEnvelope {
     /// Validation rejects bounds before secondary model allocations, then checks
     /// mode-specific interval metadata, duplicate IDs, all-or-none producer
     /// positions, strictly increasing positions, ordered non-overlapping gaps,
-    /// and positioned observations inside gaps.
+    /// and positioned observations inside gaps. Only after validation succeeds
+    /// are both vectors compacted to capacity equal to their logical lengths.
     ///
     /// # Errors
     ///
@@ -161,6 +163,8 @@ impl CollectionEnvelope {
         gaps: Vec<Gap>,
     ) -> Result<Self, ModelError> {
         validate_observed(series.collection_mode(), &observations, &gaps)?;
+        let observations = compact_vec(observations);
+        let gaps = compact_vec(gaps);
         Ok(Self {
             series,
             evidence: Evidence::Observed { observations, gaps },
@@ -326,4 +330,96 @@ fn validate_observations_outside_gaps(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ExactValue, NativeStatus, ObservationId, ObservationTimes, ProducerId, Quality,
+        QualityFlags, QualityLevel, SeriesId, Timestamp,
+    };
+
+    const OBSERVATION_SPARE_CAPACITY: usize = 32_768;
+    const GAP_SPARE_CAPACITY: usize = 131_072;
+
+    fn series(mode: CollectionMode) -> SeriesMetadata {
+        SeriesMetadata::new(
+            SeriesId::parse("01941f29-7c00-7000-8000-000000000001").expect("valid series identity"),
+            ProducerId::parse("01941f29-7c00-7000-8000-000000000010")
+                .expect("valid producer identity"),
+            mode,
+        )
+    }
+
+    fn observation() -> Observation {
+        let timestamp = Timestamp::new(0, 0).expect("valid timestamp");
+        Observation::new(
+            ObservationId::parse("01941f29-7c00-7000-8000-000000000020")
+                .expect("valid observation identity"),
+            ExactValue::Boolean(true),
+            ObservationTimes::new(None, timestamp, timestamp),
+            Quality::new(QualityLevel::Unknown, QualityFlags::none()),
+            NativeStatus::absent(),
+            None,
+            None,
+        )
+    }
+
+    fn gap() -> Gap {
+        Gap::new(
+            ProducerEpoch::new(0),
+            ProducerSequence::new(0),
+            ProducerSequence::new(1),
+            GapReason::Unknown,
+        )
+        .expect("valid gap")
+    }
+
+    #[test]
+    fn observed_evidence_discards_nonempty_and_empty_vector_spare_capacity() {
+        let observations = Vec::with_capacity(OBSERVATION_SPARE_CAPACITY);
+        let mut gaps = Vec::with_capacity(GAP_SPARE_CAPACITY);
+        gaps.push(gap());
+        assert!(observations.capacity() > observations.len());
+        assert!(gaps.capacity() > gaps.len());
+        let gap_only =
+            CollectionEnvelope::observed(series(CollectionMode::Sampled), observations, gaps)
+                .expect("valid gap-only evidence");
+        let Evidence::Observed { observations, gaps } = &gap_only.evidence else {
+            panic!("observed constructor returned no-change evidence");
+        };
+        assert_eq!(observations.capacity(), 0);
+        assert_eq!(gaps.capacity(), gaps.len());
+
+        let mut observations = Vec::with_capacity(OBSERVATION_SPARE_CAPACITY);
+        observations.push(observation());
+        let gaps = Vec::with_capacity(GAP_SPARE_CAPACITY);
+        assert!(observations.capacity() > observations.len());
+        assert!(gaps.capacity() > gaps.len());
+        let observation_only =
+            CollectionEnvelope::observed(series(CollectionMode::Sampled), observations, gaps)
+                .expect("valid observation-only evidence");
+        let Evidence::Observed { observations, gaps } = &observation_only.evidence else {
+            panic!("observed constructor returned no-change evidence");
+        };
+        assert_eq!(observations.capacity(), observations.len());
+        assert_eq!(gaps.capacity(), 0);
+    }
+
+    #[test]
+    fn no_change_evidence_has_no_collection_vector_storage() {
+        let no_change = NoChange::new(
+            TimeInterval::new(
+                Timestamp::new(0, 0).expect("valid start"),
+                Timestamp::new(1, 0).expect("valid end"),
+            )
+            .expect("valid interval"),
+        );
+        let envelope = CollectionEnvelope::no_change(series(CollectionMode::ChangeOnly), no_change)
+            .expect("valid no-change evidence");
+        assert!(matches!(envelope.evidence, Evidence::NoChange(_)));
+        assert!(envelope.observations().is_empty());
+        assert!(envelope.gaps().is_empty());
+    }
 }

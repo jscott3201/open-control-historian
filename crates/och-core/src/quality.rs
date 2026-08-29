@@ -1,5 +1,6 @@
 //! Closed normalized quality and independent opaque native status.
 
+use crate::compact::compact_vec;
 use crate::{ModelError, NativeStatusToken};
 
 /// Maximum ordered tokens retained in [`NativeStatus`].
@@ -165,7 +166,8 @@ impl NativeStatus {
     /// Constructs ordered native status from at most 16 tokens.
     ///
     /// An empty vector represents absent native status. The length is rejected
-    /// before any model-owned secondary allocation.
+    /// before compaction, and accepted storage retains capacity equal to its
+    /// logical token count, including zero.
     ///
     /// # Errors
     ///
@@ -174,7 +176,7 @@ impl NativeStatus {
         if tokens.len() > MAX_NATIVE_STATUS_TOKENS {
             return Err(ModelError::TooManyNativeStatusTokens);
         }
-        Ok(Self(tokens))
+        Ok(Self(compact_vec(tokens)))
     }
 
     /// Constructs absent native status.
@@ -193,5 +195,27 @@ impl NativeStatus {
     #[must_use]
     pub fn is_absent(&self) -> bool {
         self.0.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ATTACKER_SPARE_CAPACITY: usize = 131_072;
+
+    #[test]
+    fn native_status_discards_nonempty_and_empty_vector_spare_capacity() {
+        let token = NativeStatusToken::new("status".to_owned()).expect("valid status token");
+        let mut tokens = Vec::with_capacity(ATTACKER_SPARE_CAPACITY);
+        tokens.push(token);
+        assert!(tokens.capacity() > tokens.len());
+        let status = NativeStatus::new(tokens).expect("valid native status");
+        assert_eq!(status.0.capacity(), status.0.len());
+
+        let empty = Vec::with_capacity(ATTACKER_SPARE_CAPACITY);
+        assert!(empty.capacity() > empty.len());
+        let absent = NativeStatus::new(empty).expect("valid absent native status");
+        assert_eq!(absent.0.capacity(), 0);
     }
 }

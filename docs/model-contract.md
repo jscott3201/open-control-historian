@@ -26,7 +26,10 @@ integrate a platform. MIT OR Apache-2.0 remains the repository license.
 
 Inputs are caller-owned `String` or `Vec` values. Constructors reject oversize
 collections before secondary model allocation, preserve accepted content exactly,
-and never include rejected input in `ModelError`.
+and never include rejected input in `ModelError`. Every accepted model-owned
+string and vector is rebuilt through a boxed string or slice after validation;
+its recorded capacity therefore equals its logical byte or item length, including
+zero, and caller-controlled spare capacity is not retained.
 
 ### Identity
 

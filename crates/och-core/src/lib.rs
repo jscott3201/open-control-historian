@@ -7,6 +7,8 @@
 //! It deliberately contains no runtime, persistence, storage, query, wire-format,
 //! hashing, ID-generation, or adapter behavior.
 
+mod compact;
+
 pub mod bounded;
 pub mod collection;
 pub mod error;
