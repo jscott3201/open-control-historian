@@ -14,17 +14,21 @@ explicit `StoreId`. M02-PR01b0 likewise changes no core semantics: `och-store`
 encodes complete admissions into Journal V1 and decodes them only into
 non-authorizing inspection evidence. M02-PR01b1 changes no core semantics either:
 it makes that exact byte format the sole runtime active-journal path and adds
-mechanical durable cutoff evidence around it. All pre-existing exact value, time,
-quality, order, collection, gap/no-change, envelope, and retry semantics remain unchanged. The model is native
+mechanical durable cutoff evidence around it. M02-PR02a again leaves core
+unchanged while persisting the complete bounded `SeriesRegistry` snapshot and
+making one manifest the outer committed cutoff. All pre-existing exact value,
+time, quality, order, collection, gap/no-change, envelope, and retry semantics
+remain unchanged. The model is native
 Historian authority rather than a serialization of a Studio, Engine, transport,
 or persistence schema. Future adapters must preserve supported values exactly and
 reject or report unsupported unsigned, unavailable, or collection-mode extensions
 instead of truncating them.
 
-The model does not generate identities, normalize content, hash bytes, define a
-wire format, schedule work, retain retry state, persist registry state or data,
-answer queries, or integrate a platform. MIT OR Apache-2.0 remains the repository
-license.
+The core model does not generate identities, normalize content, hash bytes,
+define a wire format, schedule work, retain retry state, persist itself, answer
+queries, or integrate a platform. `och-store` persists a snapshot only by replay
+through these public core semantics and exact comparison. MIT OR Apache-2.0
+remains the repository license.
 
 ## Bounds and exact primitives
 
@@ -117,11 +121,13 @@ All registry refusal paths preserve equality with the pre-call state. Registry
 iteration and snapshots order series by nominal `SeriesId` and declarations by
 revision.
 
-`och-runtime` consumes only complete `CanonicalAdmission` values; it does not
-consume or mutate `SeriesRegistry` or accept `DeclaredCollectionEnvelope`
-directly. Its volatile `SeriesMetadata` equality check remains a read-optimization
-invariant only and gains no declaration, historical, or durable-admission
-authority.
+`och-runtime` admits only complete `CanonicalAdmission` values. Its sole blocking
+store writer owns one non-cloneable live `SeriesRegistry` and exposes bounded
+register, revise, retire, and current-active bind operations through the same
+ordering gate as append publication. Runtime code does not reinterpret lifecycle
+semantics or expose a mutable registry. Its volatile `SeriesMetadata` equality
+check remains a read-optimization invariant only and gains no declaration,
+historical, or durable-admission authority.
 
 ## Source/capture provenance and canonical admission
 
@@ -207,32 +213,37 @@ convert into `CanonicalAdmission`, bind new evidence, resolve missing declaratio
 history, mutate a registry, or be submitted to runtime.
 
 M02-PR01b1 places those frames in one fixed generation-one active journal paired
-with a two-slot mechanical checkpoint. The runtime computes the exact frame size
+with a two-slot mechanical checkpoint. M02-PR02a adds a stable store lock, a
+header-v2 compatibility fence in the unchanged 28-byte layout, two manifest
+slots, and three complete registry snapshot slots. Admission-frame bytes remain
+Journal V1. The runtime computes the exact frame size
 without allocating, reserves count and bytes atomically, then allocates and
 encodes under that retained reservation. The sole blocking writer assigns append
 sequence and validates frame and declaration StoreId against the journal header.
-Durable order is append, journal sync, alternate checkpoint write, checkpoint
-sync, then receipt and reservation release. The checkpoint retains only store and
-journal identity, slot generation, append sequence, end offset, and CRC. The
+Durable order is append, volatile publication, journal sync, alternate checkpoint
+write, checkpoint sync, manifest publication naming that exact cutoff and the
+current registry snapshot, then receipt and reservation release. The checkpoint
+retains only store and journal identity, slot generation, append sequence, end
+offset, and CRC. The
 public cutoff exposes slot generation separately from journal generation. Two
 valid consecutive slots must advance append sequence and end offset strictly; a
 recomputed checksum cannot legitimize a non-progressing cutoff. The checkpoint is
 neither registry nor retry authority.
 
-Open scans only configured active bytes and record counts. It refuses corruption
-inside the durable prefix, any ambiguous newer nonzero checkpoint slot, and any
-complete malformed suffix followed by later bytes. A proven terminal invalid
-unacknowledged suffix may be truncated and synchronized; a proven valid suffix
-may be synchronized and checkpointed before readiness. A missing checkpoint is
-created, or an existing zero-byte checkpoint initialized, only for an exact valid
-header-only journal under the retained lock; every nonzero wrong length refuses
-unchanged. An append I/O failure that may have changed bytes terminally faults
-that open journal handle, which cannot assign another sequence, append, or sync
-until validated reopen. Returned
+Manifest open bounds the exact non-recursive inventory, selects only strict
+manifest candidates, restores the referenced registry solely by public
+register/revise/retire replay, and requires exact snapshot equality. Every
+recovered declaration must resolve historically. A nonempty premanifest V1 or V2
+store requires an explicit matching snapshot; an exact header-only store may
+bootstrap empty. New binding uses the current active registry, while append
+requires exact equality with `resolve(series, revision)` and therefore preserves
+already-issued historical evidence after correction or retirement. Returned
 reopen records remain `DecodedAdmissionV1` inspection evidence, never seed a
-completed retry cache, and do not rebuild volatile latest. Journal persistence is
-therefore bounded to this active generation and cutoff; manifests, rotation,
-registry bootstrap, immutable history, and durable long-term retry remain absent.
+completed retry cache, and do not rebuild volatile latest. Persistence remains
+bounded to this active generation and manifest cutoff; rotation, immutable
+history, broad recovery, latest projection, and durable long-term retry remain
+absent. Exact bytes and publication law are specified in
+[Manifest V1](manifest-v1-format.md).
 
 ### Values and content
 

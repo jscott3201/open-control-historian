@@ -20,27 +20,36 @@ value/content, time, quality/status, producer ordering, declaration lifecycle,
 source/capture provenance, collection, gap/no-change, envelope, canonical
 admission, and retry-comparison semantics. M02-PR01a established the reviewed
 store-scoped runtime command boundary, and M02-PR01b0 established the reviewed
-Journal V1 semantic frame format. M02-PR01b1 is their active-journal durable
-successor: `och-runtime` depends inward on `och-store`, opens one explicitly
+Journal V1 semantic frame format. M02-PR01b1 established their active-journal
+durable successor, and M02-PR02a now makes a bounded manifest the committed
+description of its active range, mechanical cutoff, and complete canonical
+registry history. `och-runtime` depends inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05
 `CanonicalAdmission` evidence, reserves exact encoded bytes before allocation,
 and sends FIFO work to one dedicated blocking writer thread. Handled and durable
-receipt stages are distinct; the latter is released only after journal sync and
-the crash-safe mechanical checkpoint cover the append. A fixed reaper owns the
-eventual writer join after nonblocking Drop.
+receipt stages are distinct; the latter is released only after journal sync,
+checkpoint sync, and manifest publication cover the append. Public register,
+revise, retire, and active bind requests share the sole bounded writer ordering
+authority with append publication. A fixed reaper owns the eventual writer join
+after nonblocking Drop.
 
-`och-store` owns Journal V1 bytes plus fixed active-artifact create/open/lock,
-bounded scan, append, centralized synchronization, and the double-slot durable
-high-water checkpoint. Decoded reopen records remain non-authorizing inspection
-evidence. `och-runtime` retains the fixed 16-command count window, exact bounded
+`och-store` owns Journal V1 bytes, the header-v2 old-writer fence, stable
+never-renamed store lock, retained journal lock, fixed active-artifact
+create/open, bounded scan and append, double-slot mechanical checkpoint,
+two-slot manifest, three-slot complete registry snapshots, strict bootstrap, and
+publication. It restores snapshots only by public `SeriesRegistry` replay and
+requires every decoded journal declaration to match retained historical
+authority; decoded records never authorize registry state. `och-runtime` retains
+the fixed 16-command count window, exact bounded
 byte reservations through durability, outstanding-only retry coalescing, a
 separately fixed 16-series volatile latest registry, store-scoped immutable
 snapshots, group barriers, graceful drain/final barrier/seal/join, and
-nonblocking fail-stop Drop. It does not consume or mutate `SeriesRegistry`, seed
-a completed retry cache on reopen, or gain declaration/source interpretation
-authority. Latest state restarts empty. Manifest publication, successor rotation,
-registry bootstrap, long-term retry, query, adapters, and broad recovery remain
-absent. Published observations never imply current or held values.
+nonblocking fail-stop Drop. The blocking writer owns the one non-cloneable live
+`SeriesRegistry`; runtime code gains no declaration/source interpretation
+semantics and exposes no mutable registry handle. Latest state restarts empty and
+completed retries are not restored. Successor rotation, long-term retry, query,
+adapters, manifest-backed latest projection, and broad recovery remain absent.
+Published observations never imply current or held values.
 
 The ignored `_roadmap/` directory is local and unpublished.
 Do not commit or push the `_roadmap/` directory to github. Preserve unrelated

@@ -3,9 +3,9 @@ use crate::decoded::{
     all_evidence_ids,
 };
 use crate::{
-    JOURNAL_V1_FRAME_CRC_LEN, JOURNAL_V1_FRAME_MAGIC, JOURNAL_V1_FRAME_PREFIX_LEN,
-    JOURNAL_V1_HEADER_LEN, JOURNAL_V1_HEADER_MAGIC, JOURNAL_V1_VERSION, JournalV1Error,
-    MAX_ADMISSION_PAYLOAD_V1,
+    ACTIVE_JOURNAL_HEADER_V2_VERSION, JOURNAL_V1_FRAME_CRC_LEN, JOURNAL_V1_FRAME_MAGIC,
+    JOURNAL_V1_FRAME_PREFIX_LEN, JOURNAL_V1_HEADER_LEN, JOURNAL_V1_HEADER_MAGIC,
+    JOURNAL_V1_VERSION, JournalV1Error, MAX_ADMISSION_PAYLOAD_V1,
 };
 use och_core::{
     ArtifactId, ArtifactReference, CanonicalAdmission, CaptureLifecycle, CaptureRunEvidence,
@@ -130,12 +130,7 @@ impl JournalHeaderV1 {
     /// Encodes the exact fixed-length Journal V1 header.
     #[must_use]
     pub fn encode(self) -> [u8; JOURNAL_V1_HEADER_LEN] {
-        let mut bytes = [0_u8; JOURNAL_V1_HEADER_LEN];
-        bytes[..8].copy_from_slice(&JOURNAL_V1_HEADER_MAGIC);
-        bytes[8..10].copy_from_slice(&JOURNAL_V1_VERSION.to_be_bytes());
-        bytes[HEADER_LENGTH_OFFSET..12].copy_from_slice(&28_u16.to_be_bytes());
-        bytes[12..].copy_from_slice(self.store_id.as_bytes());
-        bytes
+        encode_header(self.store_id, JOURNAL_V1_VERSION)
     }
 
     /// Decodes exactly one fixed-length Journal V1 header.
@@ -145,29 +140,80 @@ impl JournalHeaderV1 {
     /// Rejects truncation, trailing bytes, unknown magic/version/length, or an
     /// invalid store identity.
     pub fn decode(bytes: &[u8]) -> Result<Self, JournalV1Error> {
-        if bytes.len() < JOURNAL_V1_HEADER_LEN {
-            return Err(JournalV1Error::Truncated);
-        }
-        if bytes.len() > JOURNAL_V1_HEADER_LEN {
-            return Err(JournalV1Error::TrailingBytes);
-        }
-        if bytes[..8] != JOURNAL_V1_HEADER_MAGIC {
-            return Err(JournalV1Error::InvalidHeaderMagic);
-        }
-        if u16::from_be_bytes([bytes[8], bytes[9]]) != JOURNAL_V1_VERSION {
-            return Err(JournalV1Error::UnsupportedHeaderVersion);
-        }
-        if u16::from_be_bytes([bytes[10], bytes[11]])
-            != u16::try_from(JOURNAL_V1_HEADER_LEN).unwrap_or_default()
-        {
-            return Err(JournalV1Error::InvalidHeaderLength);
-        }
-        let mut identity = [0_u8; 16];
-        identity.copy_from_slice(&bytes[12..28]);
-        let store_id =
-            StoreId::from_bytes(identity).map_err(|_| JournalV1Error::InvalidIdentity)?;
-        Ok(Self { store_id })
+        decode_header(bytes, JOURNAL_V1_VERSION).map(|store_id| Self { store_id })
     }
+}
+
+/// Fixed manifest-required active-journal header scoped to one exact store.
+///
+/// The layout remains exactly 28 bytes. Only the header version differs from
+/// [`JournalHeaderV1`]; all admission frames retain their Journal V1 bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalHeaderV2 {
+    store_id: StoreId,
+}
+
+impl JournalHeaderV2 {
+    /// Constructs the fixed manifest-owned header for `store_id`.
+    #[must_use]
+    pub const fn new(store_id: StoreId) -> Self {
+        Self { store_id }
+    }
+
+    /// Returns the exact store identity carried by the header.
+    #[must_use]
+    pub const fn store_id(self) -> StoreId {
+        self.store_id
+    }
+
+    /// Encodes the exact fixed-length manifest-required header.
+    #[must_use]
+    pub fn encode(self) -> [u8; JOURNAL_V1_HEADER_LEN] {
+        encode_header(self.store_id, ACTIVE_JOURNAL_HEADER_V2_VERSION)
+    }
+
+    /// Decodes exactly one manifest-required fixed-length header.
+    ///
+    /// # Errors
+    ///
+    /// Rejects truncation, trailing bytes, unknown magic/version/length, or an
+    /// invalid store identity. In particular, legacy header version one is not
+    /// accepted by this decoder.
+    pub fn decode(bytes: &[u8]) -> Result<Self, JournalV1Error> {
+        decode_header(bytes, ACTIVE_JOURNAL_HEADER_V2_VERSION).map(|store_id| Self { store_id })
+    }
+}
+
+fn encode_header(store_id: StoreId, version: u16) -> [u8; JOURNAL_V1_HEADER_LEN] {
+    let mut bytes = [0_u8; JOURNAL_V1_HEADER_LEN];
+    bytes[..8].copy_from_slice(&JOURNAL_V1_HEADER_MAGIC);
+    bytes[8..10].copy_from_slice(&version.to_be_bytes());
+    bytes[HEADER_LENGTH_OFFSET..12].copy_from_slice(&28_u16.to_be_bytes());
+    bytes[12..].copy_from_slice(store_id.as_bytes());
+    bytes
+}
+
+fn decode_header(bytes: &[u8], expected_version: u16) -> Result<StoreId, JournalV1Error> {
+    if bytes.len() < JOURNAL_V1_HEADER_LEN {
+        return Err(JournalV1Error::Truncated);
+    }
+    if bytes.len() > JOURNAL_V1_HEADER_LEN {
+        return Err(JournalV1Error::TrailingBytes);
+    }
+    if bytes[..8] != JOURNAL_V1_HEADER_MAGIC {
+        return Err(JournalV1Error::InvalidHeaderMagic);
+    }
+    if u16::from_be_bytes([bytes[8], bytes[9]]) != expected_version {
+        return Err(JournalV1Error::UnsupportedHeaderVersion);
+    }
+    if u16::from_be_bytes([bytes[10], bytes[11]])
+        != u16::try_from(JOURNAL_V1_HEADER_LEN).unwrap_or_default()
+    {
+        return Err(JournalV1Error::InvalidHeaderLength);
+    }
+    let mut identity = [0_u8; 16];
+    identity.copy_from_slice(&bytes[12..28]);
+    StoreId::from_bytes(identity).map_err(|_| JournalV1Error::InvalidIdentity)
 }
 
 /// Encodes one independent Journal V1 canonical-admission frame.
@@ -581,50 +627,50 @@ enum EncoderOutput {
     Count(usize),
 }
 
-struct Encoder {
+pub(crate) struct Encoder {
     output: EncoderOutput,
 }
 
 impl Encoder {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             output: EncoderOutput::Bytes(Vec::new()),
         }
     }
 
-    const fn counting() -> Self {
+    pub(crate) const fn counting() -> Self {
         Self {
             output: EncoderOutput::Count(0),
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match &self.output {
             EncoderOutput::Bytes(bytes) => bytes.len(),
             EncoderOutput::Count(length) => *length,
         }
     }
 
-    fn finish(self) -> Vec<u8> {
+    pub(crate) fn finish(self) -> Vec<u8> {
         match self.output {
             EncoderOutput::Bytes(bytes) => bytes,
             EncoderOutput::Count(_) => Vec::new(),
         }
     }
 
-    fn u8(&mut self, value: u8) {
+    pub(crate) fn u8(&mut self, value: u8) {
         self.bytes(&[value]);
     }
 
-    fn u32(&mut self, value: u32) {
+    pub(crate) fn u32(&mut self, value: u32) {
         self.bytes(&value.to_be_bytes());
     }
 
-    fn u64(&mut self, value: u64) {
+    pub(crate) fn u64(&mut self, value: u64) {
         self.bytes(&value.to_be_bytes());
     }
 
-    fn u128(&mut self, value: u128) {
+    pub(crate) fn u128(&mut self, value: u128) {
         self.bytes(&value.to_be_bytes());
     }
 
@@ -632,7 +678,7 @@ impl Encoder {
         self.bytes(&value.to_be_bytes());
     }
 
-    fn bytes(&mut self, bytes: &[u8]) {
+    pub(crate) fn bytes(&mut self, bytes: &[u8]) {
         match &mut self.output {
             EncoderOutput::Bytes(output) => output.extend_from_slice(bytes),
             EncoderOutput::Count(length) => *length = length.saturating_add(bytes.len()),
@@ -646,7 +692,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn count(&mut self, value: usize) -> Result<(), JournalV1Error> {
+    pub(crate) fn count(&mut self, value: usize) -> Result<(), JournalV1Error> {
         self.u32(u32::try_from(value).map_err(|_| JournalV1Error::InvalidCount)?);
         Ok(())
     }
@@ -706,7 +752,7 @@ fn encode_decoded_payload(
     Ok(())
 }
 
-fn encode_declaration(
+pub(crate) fn encode_declaration(
     encoder: &mut Encoder,
     declaration: &SeriesDeclaration,
 ) -> Result<(), JournalV1Error> {
@@ -773,7 +819,7 @@ fn encode_declaration_payload(
     encode_optional_declaration_reference(encoder, payload.application())
 }
 
-fn encode_declaration_evidence(
+pub(crate) fn encode_declaration_evidence(
     encoder: &mut Encoder,
     evidence: &DeclarationEvidence,
 ) -> Result<(), JournalV1Error> {
@@ -1215,17 +1261,17 @@ fn encode_evidence_id(encoder: &mut Encoder, id: EvidenceId) {
     encoder.bytes(id.as_bytes());
 }
 
-struct Cursor<'a> {
+pub(crate) struct Cursor<'a> {
     bytes: &'a [u8],
     offset: usize,
 }
 
 impl<'a> Cursor<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 
-    fn take(&mut self, length: usize) -> Result<&'a [u8], JournalV1Error> {
+    pub(crate) fn take(&mut self, length: usize) -> Result<&'a [u8], JournalV1Error> {
         let end = self
             .offset
             .checked_add(length)
@@ -1244,19 +1290,19 @@ impl<'a> Cursor<'a> {
             .map_err(|_| JournalV1Error::Truncated)
     }
 
-    fn u8(&mut self) -> Result<u8, JournalV1Error> {
+    pub(crate) fn u8(&mut self) -> Result<u8, JournalV1Error> {
         Ok(self.array::<1>()?[0])
     }
 
-    fn u32(&mut self) -> Result<u32, JournalV1Error> {
+    pub(crate) fn u32(&mut self) -> Result<u32, JournalV1Error> {
         Ok(u32::from_be_bytes(self.array()?))
     }
 
-    fn u64(&mut self) -> Result<u64, JournalV1Error> {
+    pub(crate) fn u64(&mut self) -> Result<u64, JournalV1Error> {
         Ok(u64::from_be_bytes(self.array()?))
     }
 
-    fn u128(&mut self) -> Result<u128, JournalV1Error> {
+    pub(crate) fn u128(&mut self) -> Result<u128, JournalV1Error> {
         Ok(u128::from_be_bytes(self.array()?))
     }
 
@@ -1290,7 +1336,7 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    fn finish(self) -> Result<(), JournalV1Error> {
+    pub(crate) fn finish(self) -> Result<(), JournalV1Error> {
         if self.offset == self.bytes.len() {
             Ok(())
         } else {
@@ -1340,7 +1386,9 @@ fn decode_payload(
     })
 }
 
-fn decode_declaration(cursor: &mut Cursor<'_>) -> Result<DecodedDeclarationV1, JournalV1Error> {
+pub(crate) fn decode_declaration(
+    cursor: &mut Cursor<'_>,
+) -> Result<DecodedDeclarationV1, JournalV1Error> {
     let store_id = decode_store_id(cursor)?;
     let series_id = decode_series_id(cursor)?;
     let revision = DeclarationRevision::new(cursor.u128()?).map_err(invalid_model)?;
@@ -1398,7 +1446,7 @@ fn decode_declaration_payload(
     ))
 }
 
-fn decode_declaration_evidence(
+pub(crate) fn decode_declaration_evidence(
     cursor: &mut Cursor<'_>,
 ) -> Result<DeclarationEvidence, JournalV1Error> {
     let effective_at = decode_timestamp(cursor)?;

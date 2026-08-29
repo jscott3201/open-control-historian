@@ -2,10 +2,15 @@ use crate::ingress::{
     AdmissionPriority, AppendIdentity, BarrierDemand, ByteReservationLimits, IngressShared,
     MAX_OUTSTANDING_COMMANDS,
 };
-use och_core::{CanonicalAdmission, StoreId};
+use och_core::{
+    CanonicalAdmission, CollectionEnvelope, DeclarationEvidence, DeclarationRevision,
+    DeclaredCollectionEnvelope, SeriesBinding, SeriesDeclaration, SeriesDeclarationPayload,
+    SeriesId, SeriesRetirement, StoreId,
+};
 use och_store::{
-    ActiveJournal, ActiveJournalConfig, ActiveJournalError, ActiveJournalInspection,
-    ActiveJournalLimits, ActiveJournalOpenMode, PreparedAdmissionV1, RecoveredAdmissionV1,
+    ActiveJournalError, ActiveJournalInspection, ActiveJournalLimits, ActiveJournalOpenMode,
+    ManifestCommit, ManifestStore, ManifestStoreConfig, ManifestStoreError,
+    ManifestStoreInspection, PreparedAdmissionV1, RecoveredAdmissionV1, RegistryPersistenceOptions,
 };
 use std::fmt;
 use std::path::PathBuf;
@@ -85,6 +90,7 @@ pub struct StoreOptions {
     journal_limits: ActiveJournalLimits,
     byte_limits: ByteReservationLimits,
     group_commit: GroupCommitPolicy,
+    registry: RegistryPersistenceOptions,
     #[cfg(test)]
     cleanup_on_reap: bool,
 }
@@ -102,15 +108,20 @@ impl StoreOptions {
         journal_limits: ActiveJournalLimits,
         byte_limits: ByteReservationLimits,
         group_commit: GroupCommitPolicy,
+        registry: RegistryPersistenceOptions,
     ) -> Result<Self, StoreOptionsError> {
         let directory_length = directory.as_os_str().as_encoded_bytes().len();
         if directory_length == 0 || directory_length > och_store::MAX_STORE_DIRECTORY_BYTES {
-            return Err(StoreOptionsError::Journal(
-                ActiveJournalError::InvalidOptions,
-            ));
+            return Err(StoreOptionsError::Store(ManifestStoreError::InvalidOptions));
         }
-        ActiveJournalConfig::new(directory.clone(), store_id, mode, journal_limits)
-            .map_err(StoreOptionsError::Journal)?;
+        ManifestStoreConfig::new(
+            directory.clone(),
+            store_id,
+            mode,
+            journal_limits,
+            registry.clone(),
+        )
+        .map_err(StoreOptionsError::Store)?;
         if group_commit.max_bytes > byte_limits.max_outstanding_bytes() {
             return Err(StoreOptionsError::InvalidRelationships);
         }
@@ -121,6 +132,7 @@ impl StoreOptions {
             journal_limits,
             byte_limits,
             group_commit,
+            registry,
             #[cfg(test)]
             cleanup_on_reap: false,
         })
@@ -156,12 +168,19 @@ impl StoreOptions {
         self.group_commit
     }
 
-    pub(crate) fn active_config(&self) -> Result<ActiveJournalConfig, ActiveJournalError> {
-        ActiveJournalConfig::new(
+    /// Returns bounded canonical registry persistence options.
+    #[must_use]
+    pub const fn registry(&self) -> &RegistryPersistenceOptions {
+        &self.registry
+    }
+
+    pub(crate) fn manifest_config(&self) -> Result<ManifestStoreConfig, ManifestStoreError> {
+        ManifestStoreConfig::new(
             self.directory.clone(),
             self.store_id,
             self.mode,
             self.journal_limits,
+            self.registry.clone(),
         )
     }
 
@@ -181,6 +200,7 @@ impl fmt::Debug for StoreOptions {
             .field("journal_limits", &self.journal_limits)
             .field("byte_limits", &self.byte_limits)
             .field("group_commit", &self.group_commit)
+            .field("registry", &self.registry)
             .finish_non_exhaustive()
     }
 }
@@ -188,8 +208,8 @@ impl fmt::Debug for StoreOptions {
 /// Sanitized invalid runtime options.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreOptionsError {
-    /// Active-journal options were invalid.
-    Journal(ActiveJournalError),
+    /// Manifest-rooted store options were invalid.
+    Store(ManifestStoreError),
     /// Cross-option bounds were invalid.
     InvalidRelationships,
 }
@@ -201,6 +221,92 @@ impl fmt::Display for StoreOptionsError {
 }
 
 impl std::error::Error for StoreOptionsError {}
+
+/// One canonical registry lifecycle operation serialized by the sole store writer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegistryOperation {
+    /// Register initial declaration revision one.
+    Register {
+        /// Stable new series identity.
+        series_id: SeriesId,
+        /// Immutable logical-point binding.
+        binding: SeriesBinding,
+        /// Initial revisionable interpretation payload.
+        payload: SeriesDeclarationPayload,
+        /// Initial declaration evidence.
+        evidence: DeclarationEvidence,
+    },
+    /// Append one metadata correction revision.
+    Revise {
+        /// Existing series identity.
+        series_id: SeriesId,
+        /// Exact currently expected revision.
+        expected_revision: DeclarationRevision,
+        /// Corrected revisionable payload.
+        payload: SeriesDeclarationPayload,
+        /// Correction evidence.
+        evidence: DeclarationEvidence,
+    },
+    /// Terminally retire one series.
+    Retire {
+        /// Existing series identity.
+        series_id: SeriesId,
+        /// Exact final active revision.
+        expected_revision: DeclarationRevision,
+        /// Retirement evidence.
+        evidence: DeclarationEvidence,
+    },
+}
+
+/// Canonical result of one committed registry lifecycle operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegistryOutcome {
+    /// Initial or revised immutable declaration.
+    Declaration(Box<SeriesDeclaration>),
+    /// Terminal immutable retirement tombstone.
+    Retirement(SeriesRetirement),
+}
+
+/// Manifest-backed registry lifecycle success.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryCommit {
+    outcome: RegistryOutcome,
+    committed: ManifestCommit,
+}
+
+impl RegistryCommit {
+    /// Returns the exact core lifecycle outcome.
+    #[must_use]
+    pub const fn outcome(&self) -> &RegistryOutcome {
+        &self.outcome
+    }
+
+    /// Returns the manifest state committed before this result was reported.
+    #[must_use]
+    pub const fn manifest_commit(&self) -> ManifestCommit {
+        self.committed
+    }
+}
+
+/// Typed registry-control refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegistryError {
+    /// The runtime or its sole writer is closed.
+    Closed,
+    /// Canonical or durable store authority refused the operation.
+    Store(ManifestStoreError),
+}
+
+impl fmt::Display for RegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Closed => "historian registry control is closed",
+            Self::Store(_) => "historian registry operation refused",
+        })
+    }
+}
+
+impl std::error::Error for RegistryError {}
 
 /// Coarse sanitized runtime health.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -219,6 +325,7 @@ pub enum RuntimeHealth {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeInspection {
     store: ActiveJournalInspection,
+    committed: ManifestCommit,
     pending_count: usize,
     pending_bytes: usize,
     health: RuntimeHealth,
@@ -229,6 +336,12 @@ impl RuntimeInspection {
     #[must_use]
     pub const fn store(self) -> ActiveJournalInspection {
         self.store
+    }
+
+    /// Returns the current manifest-backed committed state.
+    #[must_use]
+    pub const fn committed(self) -> ManifestCommit {
+        self.committed
     }
 
     /// Returns commands retaining an outstanding slot.
@@ -256,7 +369,7 @@ pub(crate) struct InspectionShared {
 }
 
 struct InspectionState {
-    store: Option<ActiveJournalInspection>,
+    store: Option<ManifestStoreInspection>,
     health: RuntimeHealth,
 }
 
@@ -270,7 +383,7 @@ impl InspectionShared {
         }
     }
 
-    fn update(&self, store: ActiveJournalInspection, health: RuntimeHealth) {
+    fn update(&self, store: ManifestStoreInspection, health: RuntimeHealth) {
         let mut state = self
             .state
             .lock()
@@ -279,7 +392,7 @@ impl InspectionShared {
         state.health = health;
     }
 
-    fn update_store(&self, store: ActiveJournalInspection) {
+    fn update_store(&self, store: ManifestStoreInspection) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -306,7 +419,7 @@ impl InspectionShared {
     pub(crate) fn snapshot(
         &self,
         ingress: &IngressShared,
-        fallback: ActiveJournalInspection,
+        fallback: ManifestStoreInspection,
     ) -> RuntimeInspection {
         let state = self
             .state
@@ -317,7 +430,8 @@ impl InspectionShared {
         drop(state);
         let (pending_count, pending_bytes) = ingress.pending_counts();
         RuntimeInspection {
-            store,
+            store: store.active(),
+            committed: store.committed(),
             pending_count,
             pending_bytes,
             health,
@@ -326,7 +440,7 @@ impl InspectionShared {
 }
 
 pub(crate) struct WorkerReady {
-    pub(crate) inspection: ActiveJournalInspection,
+    pub(crate) inspection: ManifestStoreInspection,
     pub(crate) recovered: Vec<RecoveredAdmissionV1>,
 }
 
@@ -339,7 +453,7 @@ pub(crate) enum WorkerMessage {
     Append {
         slot: usize,
         prepared: Box<PreparedAdmissionV1>,
-        response: oneshot::Sender<Result<AppendResult, ActiveJournalError>>,
+        response: oneshot::Sender<Result<AppendResult, ManifestStoreError>>,
     },
     Published {
         slot: usize,
@@ -348,10 +462,18 @@ pub(crate) enum WorkerMessage {
         frame_bytes: usize,
     },
     Barrier {
-        response: oneshot::Sender<Result<(), ActiveJournalError>>,
+        response: oneshot::Sender<Result<(), ManifestStoreError>>,
+    },
+    Registry {
+        operation: Box<RegistryOperation>,
+        response: oneshot::Sender<Result<RegistryCommit, ManifestStoreError>>,
+    },
+    Bind {
+        envelope: CollectionEnvelope,
+        response: oneshot::Sender<Result<DeclaredCollectionEnvelope, ManifestStoreError>>,
     },
     Shutdown {
-        response: oneshot::Sender<Result<(), ActiveJournalError>>,
+        response: oneshot::Sender<Result<(), ManifestStoreError>>,
     },
     Abort,
 }
@@ -365,12 +487,12 @@ struct PendingDurable {
 pub(crate) fn run_store_worker(
     options: StoreOptions,
     receiver: Receiver<WorkerMessage>,
-    readiness: oneshot::Sender<Result<WorkerReady, ActiveJournalError>>,
+    readiness: oneshot::Sender<Result<WorkerReady, ManifestStoreError>>,
     ingress: Arc<IngressShared>,
     inspection: InspectionShared,
     stop: Arc<AtomicBool>,
 ) {
-    let config = match options.active_config() {
+    let config = match options.manifest_config() {
         Ok(config) => config,
         Err(error) => {
             let _ = readiness.send(Err(error));
@@ -378,8 +500,8 @@ pub(crate) fn run_store_worker(
             return;
         }
     };
-    let mut journal = match ActiveJournal::open(config) {
-        Ok(journal) => journal,
+    let mut store = match ManifestStore::open(config) {
+        Ok(store) => store,
         Err(error) => {
             let _ = readiness.send(Err(error));
             ingress.stop();
@@ -387,16 +509,16 @@ pub(crate) fn run_store_worker(
         }
     };
     let opened_at = Instant::now();
-    let initial_health = if rotation_required(&journal, &options, opened_at) {
+    let initial_health = if rotation_required(&store, &options, opened_at) {
         RuntimeHealth::RotationRequired
     } else {
         RuntimeHealth::Healthy
     };
-    inspection.update(journal.inspection(), initial_health);
+    inspection.update(store.inspection(), initial_health);
     if readiness
         .send(Ok(WorkerReady {
-            inspection: journal.inspection(),
-            recovered: journal.recovered_records().to_vec(),
+            inspection: store.inspection(),
+            recovered: store.recovered_records().to_vec(),
         }))
         .is_err()
     {
@@ -433,19 +555,23 @@ pub(crate) fn run_store_worker(
                 response,
             }) => {
                 if unpublished.is_some() {
-                    let _ = response.send(Err(ActiveJournalError::InvalidLayout));
+                    let _ = response.send(Err(ManifestStoreError::Active(
+                        ActiveJournalError::InvalidLayout,
+                    )));
                     fail_worker(&ingress, &inspection);
                     return;
                 }
                 if opened_at.elapsed() >= options.group_commit.rotation_age {
                     let admission = prepared.into_admission();
                     drop(admission);
-                    let _ = response.send(Err(ActiveJournalError::RotationRequired));
+                    let _ = response.send(Err(ManifestStoreError::Active(
+                        ActiveJournalError::RotationRequired,
+                    )));
                     inspection.set_health(RuntimeHealth::RotationRequired);
                     ingress.stop();
                     return;
                 }
-                let sequence = match journal.next_append_sequence() {
+                let sequence = match store.next_append_sequence() {
                     Ok(sequence) => sequence,
                     Err(error) => {
                         let _ = response.send(Err(error));
@@ -457,16 +583,23 @@ pub(crate) fn run_store_worker(
                 let frame = match (*prepared).into_frame(sequence) {
                     Ok(frame) => frame,
                     Err(error) => {
-                        let _ = response.send(Err(ActiveJournalError::Journal(error.error())));
+                        let _ = response.send(Err(ManifestStoreError::Active(
+                            ActiveJournalError::Journal(error.error()),
+                        )));
                         fail_worker(&ingress, &inspection);
                         return;
                     }
                 };
-                let end_offset = match journal.append(&frame) {
+                let end_offset = match store.append(&frame) {
                     Ok(end_offset) => end_offset,
                     Err(error) => {
+                        // Registry history is reachable only on this writer. A
+                        // mismatch after synchronous resource admission cannot
+                        // be downgraded to handled evidence, so the existing
+                        // fail-stop receipt contract closes the authority.
                         let _ = response.send(Err(error));
-                        if error == ActiveJournalError::RotationRequired {
+                        if error == ManifestStoreError::Active(ActiveJournalError::RotationRequired)
+                        {
                             inspection.set_health(RuntimeHealth::RotationRequired);
                         } else {
                             fail_worker(&ingress, &inspection);
@@ -474,10 +607,13 @@ pub(crate) fn run_store_worker(
                         return;
                     }
                 };
-                let append =
-                    AppendIdentity::new(journal.inspection().journal(), sequence.get(), end_offset);
-                inspection.update_store(journal.inspection());
-                if rotation_required(&journal, &options, opened_at) {
+                let append = AppendIdentity::new(
+                    store.inspection().active().journal(),
+                    sequence.get(),
+                    end_offset,
+                );
+                inspection.update_store(store.inspection());
+                if rotation_required(&store, &options, opened_at) {
                     inspection.set_health(RuntimeHealth::RotationRequired);
                 }
                 let admission = frame.into_admission();
@@ -512,8 +648,7 @@ pub(crate) fn run_store_worker(
                     || barrier == BarrierDemand::Immediate
                     || pending.len() >= options.group_commit.max_records
                     || pending_bytes >= options.group_commit.max_bytes;
-                if forced
-                    && flush_pending(&mut journal, &mut pending, &ingress, &inspection).is_err()
+                if forced && flush_pending(&mut store, &mut pending, &ingress, &inspection).is_err()
                 {
                     return;
                 }
@@ -523,29 +658,108 @@ pub(crate) fn run_store_worker(
             }
             Ok(WorkerMessage::Barrier { response }) => {
                 if unpublished.is_some() {
-                    let result = Err(ActiveJournalError::InvalidLayout);
+                    let result = Err(ManifestStoreError::Active(
+                        ActiveJournalError::InvalidLayout,
+                    ));
                     let _ = response.send(result);
                     fail_worker(&ingress, &inspection);
                     return;
                 }
-                let result = flush_pending(&mut journal, &mut pending, &ingress, &inspection);
+                let result = flush_pending(&mut store, &mut pending, &ingress, &inspection);
                 pending_since = None;
                 let _ = response.send(result);
                 if result.is_err() {
                     return;
                 }
             }
+            Ok(WorkerMessage::Registry {
+                operation,
+                response,
+            }) => {
+                if unpublished.is_some() {
+                    let _ = response.send(Err(ManifestStoreError::Active(
+                        ActiveJournalError::InvalidLayout,
+                    )));
+                    fail_worker(&ingress, &inspection);
+                    return;
+                }
+                let result = match *operation {
+                    RegistryOperation::Register {
+                        series_id,
+                        binding,
+                        payload,
+                        evidence,
+                    } => store.register(series_id, binding, payload, evidence).map(
+                        |(declaration, committed)| RegistryCommit {
+                            outcome: RegistryOutcome::Declaration(Box::new(declaration)),
+                            committed,
+                        },
+                    ),
+                    RegistryOperation::Revise {
+                        series_id,
+                        expected_revision,
+                        payload,
+                        evidence,
+                    } => store
+                        .revise(series_id, expected_revision, payload, evidence)
+                        .map(|(declaration, committed)| RegistryCommit {
+                            outcome: RegistryOutcome::Declaration(Box::new(declaration)),
+                            committed,
+                        }),
+                    RegistryOperation::Retire {
+                        series_id,
+                        expected_revision,
+                        evidence,
+                    } => store.retire(series_id, expected_revision, evidence).map(
+                        |(retirement, committed)| RegistryCommit {
+                            outcome: RegistryOutcome::Retirement(retirement),
+                            committed,
+                        },
+                    ),
+                };
+                let terminal = result
+                    .as_ref()
+                    .is_err_and(|error| !matches!(error, ManifestStoreError::Model(_)));
+                if result.as_ref().is_ok() {
+                    inspection.update_store(store.inspection());
+                }
+                let _ = response.send(result);
+                if terminal {
+                    fail_worker(&ingress, &inspection);
+                    return;
+                }
+            }
+            Ok(WorkerMessage::Bind { envelope, response }) => {
+                if unpublished.is_some() {
+                    let _ = response.send(Err(ManifestStoreError::Active(
+                        ActiveJournalError::InvalidLayout,
+                    )));
+                    fail_worker(&ingress, &inspection);
+                    return;
+                }
+                let result = store.bind(envelope);
+                let terminal = result
+                    .as_ref()
+                    .is_err_and(|error| !matches!(error, ManifestStoreError::Model(_)));
+                let _ = response.send(result);
+                if terminal {
+                    fail_worker(&ingress, &inspection);
+                    return;
+                }
+            }
             Ok(WorkerMessage::Shutdown { response }) => {
                 if unpublished.is_some() {
-                    let result = Err(ActiveJournalError::InvalidLayout);
+                    let result = Err(ManifestStoreError::Active(
+                        ActiveJournalError::InvalidLayout,
+                    ));
                     let _ = response.send(result);
                     fail_worker(&ingress, &inspection);
                     return;
                 }
-                let result = flush_pending(&mut journal, &mut pending, &ingress, &inspection);
+                let result = flush_pending(&mut store, &mut pending, &ingress, &inspection);
                 let _ = response.send(result);
                 if result.is_ok() {
-                    inspection.update(journal.inspection(), RuntimeHealth::Stopped);
+                    inspection.update(store.inspection(), RuntimeHealth::Stopped);
                 }
                 return;
             }
@@ -555,7 +769,7 @@ pub(crate) fn run_store_worker(
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !pending.is_empty()
-                    && flush_pending(&mut journal, &mut pending, &ingress, &inspection).is_err()
+                    && flush_pending(&mut store, &mut pending, &ingress, &inspection).is_err()
                 {
                     return;
                 }
@@ -566,35 +780,39 @@ pub(crate) fn run_store_worker(
 }
 
 fn flush_pending(
-    journal: &mut ActiveJournal,
+    store: &mut ManifestStore,
     pending: &mut Vec<PendingDurable>,
     ingress: &IngressShared,
     inspection: &InspectionShared,
-) -> Result<(), ActiveJournalError> {
+) -> Result<(), ManifestStoreError> {
     if pending.is_empty() {
         return Ok(());
     }
-    let cutoff = match journal.sync_pending() {
-        Ok(cutoff) => cutoff,
+    let committed = match store.sync_pending() {
+        Ok(committed) => committed,
         Err(error) => {
             fail_worker(ingress, inspection);
             return Err(error);
         }
     };
+    // Inspection must name the committed manifest before any covered receipt
+    // can wake and observe runtime state.
+    inspection.update_store(store.inspection());
     for entry in pending.drain(..) {
-        if !ingress.complete_durable(entry.slot, cutoff) {
+        if !ingress.complete_durable(entry.slot, committed) {
             fail_worker(ingress, inspection);
-            return Err(ActiveJournalError::InvalidLayout);
+            return Err(ManifestStoreError::Active(
+                ActiveJournalError::InvalidLayout,
+            ));
         }
     }
-    inspection.update_store(journal.inspection());
     Ok(())
 }
 
-fn rotation_required(journal: &ActiveJournal, options: &StoreOptions, opened_at: Instant) -> bool {
-    let store = journal.inspection();
-    store.active_bytes() >= options.journal_limits.max_active_bytes()
-        || store.active_records() >= options.journal_limits.max_active_records()
+fn rotation_required(store: &ManifestStore, options: &StoreOptions, opened_at: Instant) -> bool {
+    let active = store.inspection().active();
+    active.active_bytes() >= options.journal_limits.max_active_bytes()
+        || active.active_records() >= options.journal_limits.max_active_records()
         || opened_at.elapsed() >= options.group_commit.rotation_age
 }
 
@@ -606,7 +824,7 @@ fn fail_worker(ingress: &IngressShared, inspection: &InspectionShared) {
 pub(crate) fn spawn_worker_and_reaper(
     options: StoreOptions,
     receiver: Receiver<WorkerMessage>,
-    readiness: oneshot::Sender<Result<WorkerReady, ActiveJournalError>>,
+    readiness: oneshot::Sender<Result<WorkerReady, ManifestStoreError>>,
     ingress: Arc<IngressShared>,
     inspection: InspectionShared,
     stop: Arc<AtomicBool>,

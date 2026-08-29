@@ -4,14 +4,16 @@
 //!
 //! The crate encodes already-authorized [`och_core::CanonicalAdmission`] values
 //! and decodes hostile bytes into non-authorizing inspection records. Its
-//! [`ActiveJournal`] is the sole synchronous owner of the fixed pre-manifest
-//! active artifacts and their mechanical durable high-water. The crate owns no
-//! runtime, registry, manifest, rotation, or query behavior.
+//! [`ActiveJournal`] is the sole synchronous owner of the fixed mechanical
+//! active artifacts. [`ManifestStore`] composes that journal with stable
+//! locking, bounded canonical-registry snapshots, and a manifest-backed durable
+//! cutoff. The crate owns no runtime scheduling, rotation, or query behavior.
 
 mod active;
 mod codec;
 mod decoded;
 mod error;
+mod manifest;
 
 #[cfg(test)]
 #[path = "../tests/support/mod.rs"]
@@ -26,15 +28,25 @@ pub use active::{
 };
 
 pub use codec::{
-    AppendSequenceV1, DecodeLimitsV1, JournalHeaderV1, PrepareAdmissionError, PreparedAdmissionV1,
-    PreparedFrameV1, admission_frame_len_v1, decode_admission_frame_v1, encode_admission_frame_v1,
-    encode_decoded_admission_frame_v1,
+    AppendSequenceV1, DecodeLimitsV1, JournalHeaderV1, JournalHeaderV2, PrepareAdmissionError,
+    PreparedAdmissionV1, PreparedFrameV1, admission_frame_len_v1, decode_admission_frame_v1,
+    encode_admission_frame_v1, encode_decoded_admission_frame_v1,
 };
 pub use decoded::{DecodedAdmissionV1, DecodedDeclarationV1, DecodedObservationLineageV1};
 pub use error::JournalV1Error;
+pub use manifest::{
+    MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME, MANIFEST_STAGING_FILE_NAME,
+    MAX_PERSISTED_REGISTRY_REVISIONS, MAX_PERSISTED_REGISTRY_SERIES, MAX_REGISTRY_SNAPSHOT_BYTES,
+    ManifestCommit, ManifestIoEvidence, ManifestIoOperation, ManifestStore, ManifestStoreConfig,
+    ManifestStoreError, ManifestStoreInspection, REGISTRY_SLOT_0_FILE_NAME,
+    REGISTRY_SLOT_1_FILE_NAME, REGISTRY_SLOT_2_FILE_NAME, REGISTRY_STAGING_FILE_NAME,
+    RegistryPersistenceOptions, STORE_LOCK_FILE_NAME,
+};
 
-/// Journal V1 format version written in headers and admission frames.
+/// Journal V1 format version written in premanifest headers and every admission frame.
 pub const JOURNAL_V1_VERSION: u16 = 1;
+/// Manifest-required active-header version; Journal V1 frame bytes remain version one.
+pub const ACTIVE_JOURNAL_HEADER_V2_VERSION: u16 = 2;
 /// Fixed Journal V1 file-header length in bytes.
 pub const JOURNAL_V1_HEADER_LEN: usize = 28;
 /// Fixed admission-frame prefix length before its variable payload.

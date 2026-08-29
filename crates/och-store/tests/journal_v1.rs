@@ -9,8 +9,9 @@ use och_core::{
 };
 use och_store::{
     AppendSequenceV1, DecodeLimitsV1, JOURNAL_V1_FRAME_CRC_LEN, JOURNAL_V1_FRAME_PREFIX_LEN,
-    JOURNAL_V1_HEADER_LEN, JournalHeaderV1, JournalV1Error, MAX_ADMISSION_PAYLOAD_V1,
-    decode_admission_frame_v1, encode_admission_frame_v1, encode_decoded_admission_frame_v1,
+    JOURNAL_V1_HEADER_LEN, JournalHeaderV1, JournalHeaderV2, JournalV1Error,
+    MAX_ADMISSION_PAYLOAD_V1, decode_admission_frame_v1, encode_admission_frame_v1,
+    encode_decoded_admission_frame_v1,
 };
 
 fn crc32c(bytes: &[u8]) -> u32 {
@@ -83,6 +84,26 @@ fn header_has_exact_fixed_bytes_and_rejects_hostile_layouts() {
         hostile[offset] ^= 0xff;
         assert_eq!(JournalHeaderV1::decode(&hostile), Err(expected_error));
     }
+}
+
+#[test]
+fn manifest_header_v2_changes_only_the_version_and_old_decode_fails_closed() {
+    let v1 = JournalHeaderV1::new(support::store_id(1)).encode();
+    let v2_header = JournalHeaderV2::new(support::store_id(1));
+    let v2 = v2_header.encode();
+    assert_eq!(v2.len(), JOURNAL_V1_HEADER_LEN);
+    assert_eq!(&v2[..9], &v1[..9]);
+    assert_eq!(v2[9], 2);
+    assert_eq!(&v2[10..], &v1[10..]);
+    assert_eq!(JournalHeaderV2::decode(&v2), Ok(v2_header));
+    assert_eq!(
+        JournalHeaderV1::decode(&v2),
+        Err(JournalV1Error::UnsupportedHeaderVersion)
+    );
+    assert_eq!(
+        JournalHeaderV2::decode(&v1),
+        Err(JournalV1Error::UnsupportedHeaderVersion)
+    );
 }
 
 #[test]

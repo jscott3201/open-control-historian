@@ -21,12 +21,13 @@ pub use latest::{
     LatestReadError, LatestReadHandle, LatestSnapshot, MAX_PUBLISHED_SERIES, PublishedObservation,
 };
 pub use store_worker::{
-    GroupCommitPolicy, RuntimeHealth, RuntimeInspection, StoreOptions, StoreOptionsError,
+    GroupCommitPolicy, RegistryCommit, RegistryError, RegistryOperation, RegistryOutcome,
+    RuntimeHealth, RuntimeInspection, StoreOptions, StoreOptionsError,
 };
 
 use ingress::{CompletionFaultInjection, IngressShared, NextWork};
 use och_core::StoreId;
-use och_store::{ActiveJournalError, RecoveredAdmissionV1};
+use och_store::{ManifestStoreError, RecoveredAdmissionV1};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -36,7 +37,7 @@ use store_worker::{
     AppendResult, InspectionShared, WorkerMessage, spawn_worker_and_reaper, try_send,
 };
 use tokio::runtime::Handle;
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 
 /// One open filesystem-backed Historian runtime.
@@ -51,8 +52,9 @@ pub struct HistorianRuntime {
     stop: Arc<AtomicBool>,
     reaped: Option<oneshot::Receiver<()>>,
     inspection: InspectionShared,
-    initial_inspection: och_store::ActiveJournalInspection,
+    initial_inspection: och_store::ManifestStoreInspection,
     recovered: Arc<[RecoveredAdmissionV1]>,
+    control_gate: Arc<AsyncMutex<()>>,
     shutdown_complete: bool,
 }
 
@@ -90,6 +92,7 @@ impl HistorianRuntime {
         let (store_sender, store_receiver) = sync_channel(MAX_OUTSTANDING_COMMANDS);
         let (store_ready_tx, store_ready_rx) = oneshot::channel();
         let (reaped_tx, reaped_rx) = oneshot::channel();
+        let control_gate = Arc::new(AsyncMutex::new(()));
         spawn_worker_and_reaper(
             store_options,
             store_receiver,
@@ -112,6 +115,7 @@ impl HistorianRuntime {
             store_sender.clone(),
             inspection.clone(),
             Arc::clone(&stop),
+            Arc::clone(&control_gate),
         ));
         let mut startup = StartupGuard::new(writer);
 
@@ -132,6 +136,7 @@ impl HistorianRuntime {
                     inspection,
                     initial_inspection: ready.inspection,
                     recovered: ready.recovered.into(),
+                    control_gate,
                     shutdown_complete: false,
                 })
             }
@@ -185,6 +190,70 @@ impl HistorianRuntime {
         &self.recovered
     }
 
+    /// Applies one bounded canonical registry lifecycle operation through the
+    /// sole durable writer and returns only after manifest commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Closed`] after writer closure, or the exact
+    /// canonical/persistence refusal from the store authority.
+    pub async fn apply_registry(
+        &self,
+        operation: RegistryOperation,
+    ) -> Result<RegistryCommit, RegistryError> {
+        let _control = self.control_gate.lock().await;
+        let sender = self.store_sender.as_ref().ok_or(RegistryError::Closed)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        if try_send(
+            sender,
+            WorkerMessage::Registry {
+                operation: Box::new(operation),
+                response: response_tx,
+            },
+        )
+        .is_err()
+        {
+            return Err(RegistryError::Closed);
+        }
+        response_rx
+            .await
+            .map_err(|_| RegistryError::Closed)?
+            .map_err(RegistryError::Store)
+    }
+
+    /// Binds one envelope through the current active canonical registry.
+    ///
+    /// This operation is serialized with append publication and lifecycle
+    /// commits, but performs no durable mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Closed`] after writer closure, or the exact
+    /// current-active core binding refusal.
+    pub async fn bind_envelope(
+        &self,
+        envelope: och_core::CollectionEnvelope,
+    ) -> Result<och_core::DeclaredCollectionEnvelope, RegistryError> {
+        let _control = self.control_gate.lock().await;
+        let sender = self.store_sender.as_ref().ok_or(RegistryError::Closed)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        if try_send(
+            sender,
+            WorkerMessage::Bind {
+                envelope,
+                response: response_tx,
+            },
+        )
+        .is_err()
+        {
+            return Err(RegistryError::Closed);
+        }
+        response_rx
+            .await
+            .map_err(|_| RegistryError::Closed)?
+            .map_err(RegistryError::Store)
+    }
+
     /// Gracefully stops and joins this instance's private writer task.
     ///
     /// Admission closes synchronously when this future is first polled. Commands
@@ -233,6 +302,12 @@ impl HistorianRuntime {
         store_id: StoreId,
         options: WriterOptions,
     ) -> Result<Self, StartError> {
+        let seed_default_registry = matches!(
+            options.behavior,
+            TestBehavior::Normal
+                | TestBehavior::FaultBeforePublicationSwap
+                | TestBehavior::FaultAfterPublicationSwap
+        );
         let directory = test_directory();
         let journal_limits = och_store::ActiveJournalLimits::new(
             och_store::MAX_ADMISSION_PAYLOAD_V1,
@@ -256,10 +331,58 @@ impl HistorianRuntime {
             journal_limits,
             byte_limits,
             group,
+            och_store::RegistryPersistenceOptions::new(och_core::SeriesRegistryLimits::new(
+                256, 512,
+            ))
+            .expect("test registry persistence options"),
         )
         .expect("test store options")
         .with_test_cleanup();
-        Self::open_inner(store, options).await
+        let runtime = Self::open_inner(store, options).await?;
+        if seed_default_registry {
+            runtime
+                .apply_registry(default_test_registry_operation(store_id))
+                .await
+                .expect("default test registry declaration should commit");
+        }
+        Ok(runtime)
+    }
+}
+
+#[cfg(test)]
+fn default_test_registry_operation(_store_id: StoreId) -> RegistryOperation {
+    let mut series_bytes = [0_u8; 16];
+    series_bytes[6] = 0x70;
+    series_bytes[8] = 0x80;
+    series_bytes[15] = 1;
+    let mut producer_bytes = series_bytes;
+    producer_bytes[15] = 2;
+    let reference = |value: &str| {
+        och_core::DeclarationReference::new(value.to_owned())
+            .expect("default test declaration reference")
+    };
+    RegistryOperation::Register {
+        series_id: och_core::SeriesId::from_bytes(series_bytes)
+            .expect("default test series identity"),
+        binding: och_core::SeriesBinding::new(och_core::SourceReference::with_projection(
+            reference("provider:test"),
+            och_core::SourceProjection::new("projection:test".to_owned())
+                .expect("default test projection"),
+            reference("locator:test"),
+        )),
+        payload: och_core::SeriesDeclarationPayload::new(
+            och_core::ProducerId::from_bytes(producer_bytes)
+                .expect("default test producer identity"),
+            och_core::CollectionMode::Sampled,
+            och_core::ValueFamily::Unsigned,
+            och_core::QuantityEvidence::Absent,
+            och_core::UnitEvidence::Absent,
+            None,
+        ),
+        evidence: och_core::DeclarationEvidence::new(
+            och_core::Timestamp::new(0, 0).expect("default test timestamp"),
+            None,
+        ),
     }
 }
 
@@ -303,7 +426,7 @@ pub enum StartError {
     /// The blocking worker exited before store readiness.
     WorkerExitedBeforeReadiness,
     /// Active-journal create/open/scan/lock refused.
-    Store(ActiveJournalError),
+    Store(ManifestStoreError),
 }
 
 impl fmt::Display for StartError {
@@ -510,14 +633,16 @@ fn test_directory() -> std::path::PathBuf {
     directory
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_writer(
     options: WriterOptions,
     readiness: oneshot::Sender<Result<store_worker::WorkerReady, StartError>>,
-    store_readiness: oneshot::Receiver<Result<store_worker::WorkerReady, ActiveJournalError>>,
+    store_readiness: oneshot::Receiver<Result<store_worker::WorkerReady, ManifestStoreError>>,
     ingress: Arc<IngressShared>,
     store_sender: SyncSender<WorkerMessage>,
     inspection: InspectionShared,
     stop: Arc<AtomicBool>,
+    control_gate: Arc<AsyncMutex<()>>,
 ) -> WriterExit {
     #[cfg(test)]
     let mut options = options;
@@ -580,7 +705,14 @@ async fn run_writer(
         | TestBehavior::FaultAfterPublicationSwap => {}
     }
 
-    writer_loop(options, ingress, store_sender, &mut failure_guard).await
+    writer_loop(
+        options,
+        ingress,
+        store_sender,
+        control_gate,
+        &mut failure_guard,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -588,6 +720,7 @@ async fn writer_loop(
     options: WriterOptions,
     ingress: Arc<IngressShared>,
     store_sender: SyncSender<WorkerMessage>,
+    control_gate: Arc<AsyncMutex<()>>,
     failure_guard: &mut WriterFailureGuard,
 ) -> WriterExit {
     #[cfg(test)]
@@ -603,6 +736,7 @@ async fn writer_loop(
         let notified = ingress.notified();
         match ingress.take_next() {
             NextWork::Work(mut work) => {
+                let _control = control_gate.lock().await;
                 #[cfg(test)]
                 if let Some(probe) = &options.probe {
                     probe.commands_started.fetch_add(1, Ordering::SeqCst);
@@ -699,6 +833,7 @@ async fn writer_loop(
                 }
             }
             NextWork::BarrierRequired => {
+                let _control = control_gate.lock().await;
                 let (barrier_tx, barrier_rx) = oneshot::channel();
                 if try_send(
                     &store_sender,
@@ -714,6 +849,7 @@ async fn writer_loop(
             }
             NextWork::Empty => notified.await,
             NextWork::Drained => {
+                let _control = control_gate.lock().await;
                 #[cfg(test)]
                 if let Some(probe) = &options.probe {
                     probe.shutdown_received.fetch_add(1, Ordering::SeqCst);
@@ -870,8 +1006,9 @@ mod tests {
         AdmissionPriority, BarrierDemand, ByteReservationLimits, DurableOutcome, GroupCommitPolicy,
         HandledOutcome, HistorianIngress, HistorianRuntime, IngressCommand, LatestReadError,
         LatestReadHandle, LifecycleProbe, MAX_OUTSTANDING_COMMANDS, MAX_PUBLISHED_SERIES,
-        ReceiptOutcome, RuntimeHealth, ShutdownError, StartError, StoreOptions, StoreOptionsError,
-        SubmissionDisposition, TestBehavior, TrySubmitErrorKind, WriterOptions, test_directory,
+        ReceiptOutcome, RegistryOperation, RegistryOutcome, RuntimeHealth, ShutdownError,
+        StartError, StoreOptions, StoreOptionsError, SubmissionDisposition, TestBehavior,
+        TrySubmitErrorKind, WriterOptions, default_test_registry_operation, test_directory,
     };
     use och_core::{
         ArtifactId, ArtifactReference, CanonicalAdmission, CaptureLifecycle, CaptureRunEvidence,
@@ -926,8 +1063,38 @@ mod tests {
             .expect("test journal limits"),
             byte_limits,
             group,
+            och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(16, 64))
+                .expect("test registry persistence options"),
         )
         .expect("test durable options")
+    }
+
+    async fn open_durable_test(options: StoreOptions) -> Result<HistorianRuntime, StartError> {
+        let runtime = HistorianRuntime::open(options).await?;
+        runtime
+            .apply_registry(default_test_registry_operation(runtime.store_id()))
+            .await
+            .expect("default durable-test registry declaration should commit");
+        Ok(runtime)
+    }
+
+    async fn register_metadata(runtime: &HistorianRuntime, metadata: &SeriesMetadata) {
+        runtime
+            .apply_registry(RegistryOperation::Register {
+                series_id: metadata.series_id(),
+                binding: SeriesBinding::new(source_reference()),
+                payload: SeriesDeclarationPayload::new(
+                    metadata.producer_id(),
+                    metadata.collection_mode(),
+                    ValueFamily::Unsigned,
+                    QuantityEvidence::Absent,
+                    UnitEvidence::Absent,
+                    None,
+                ),
+                evidence: DeclarationEvidence::new(timestamp(0), None),
+            })
+            .await
+            .expect("test registry declaration should commit");
     }
 
     fn group_policy(delay: std::time::Duration, records: usize, bytes: usize) -> GroupCommitPolicy {
@@ -1323,7 +1490,7 @@ mod tests {
             runtime.read_handle().snapshot(),
             Err(LatestReadError::unavailable())
         );
-        let config = och_store::ActiveJournalConfig::new(
+        let config = och_store::ManifestStoreConfig::new(
             directory.to_path_buf(),
             runtime.store_id(),
             och_store::ActiveJournalOpenMode::OpenExisting,
@@ -1333,9 +1500,11 @@ mod tests {
                 4_096,
             )
             .expect("reopen journal limits"),
+            och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(256, 512))
+                .expect("reopen registry options"),
         )
         .expect("reopen configuration");
-        let reopened = och_store::ActiveJournal::open(config)
+        let reopened = och_store::ManifestStore::open(config)
             .expect("reaped coordinator failure must release the store lock");
         drop(reopened);
     }
@@ -2599,6 +2768,12 @@ mod tests {
             assert!(second_empty.is_empty());
             assert_eq!(format!("{first_read:?}"), "LatestReadHandle { .. }");
 
+            register_metadata(
+                &first,
+                &SeriesMetadata::new(series_id(30), producer_id(31), CollectionMode::Sampled),
+            )
+            .await;
+
             let receipt = first
                 .ingress()
                 .try_submit(positioned_command(
@@ -2661,6 +2836,7 @@ mod tests {
             let read = runtime.read_handle();
             let metadata =
                 SeriesMetadata::new(series_id(40), producer_id(41), CollectionMode::Sampled);
+            register_metadata(&runtime, &metadata).await;
             let timestamp_and_id_later = observation(
                 CollectionMode::Sampled,
                 250,
@@ -2790,6 +2966,11 @@ mod tests {
             ];
             for (index, mode) in modes.into_iter().enumerate() {
                 let tag = u8::try_from(50 + index).expect("mode tag should fit");
+                register_metadata(
+                    &runtime,
+                    &SeriesMetadata::new(series_id(tag), producer_id(tag + 10), mode),
+                )
+                .await;
                 let receipt = ingress
                     .try_submit(positioned_command(
                         tag,
@@ -2836,10 +3017,8 @@ mod tests {
             .expect("writer should start");
             let ingress = runtime.ingress();
             let read = runtime.read_handle();
-            let nominal = series_id(70);
-
             let gap_metadata =
-                SeriesMetadata::new(nominal, producer_id(71), CollectionMode::Sampled);
+                SeriesMetadata::new(series_id(70), producer_id(71), CollectionMode::Sampled);
             let gap = Gap::new(
                 ProducerEpoch::new(0),
                 ProducerSequence::new(1),
@@ -2850,7 +3029,7 @@ mod tests {
             let gap_only = CollectionEnvelope::observed(gap_metadata, Vec::new(), vec![gap])
                 .expect("gap-only envelope should be valid");
             let unpositioned_metadata =
-                SeriesMetadata::new(nominal, producer_id(72), CollectionMode::Event);
+                SeriesMetadata::new(series_id(71), producer_id(72), CollectionMode::Event);
             let unpositioned = CollectionEnvelope::observed(
                 unpositioned_metadata,
                 vec![observation(CollectionMode::Event, 73, 1, None, 1, 1)],
@@ -2858,7 +3037,7 @@ mod tests {
             )
             .expect("unpositioned envelope should be valid");
             let no_change_metadata =
-                SeriesMetadata::new(nominal, producer_id(74), CollectionMode::ChangeOnly);
+                SeriesMetadata::new(series_id(72), producer_id(74), CollectionMode::ChangeOnly);
             let no_change = CollectionEnvelope::no_change(
                 no_change_metadata,
                 NoChange::new(
@@ -2868,6 +3047,13 @@ mod tests {
             )
             .expect("no-change envelope should be valid");
 
+            for metadata in [
+                SeriesMetadata::new(series_id(70), producer_id(71), CollectionMode::Sampled),
+                SeriesMetadata::new(series_id(71), producer_id(72), CollectionMode::Event),
+                SeriesMetadata::new(series_id(72), producer_id(74), CollectionMode::ChangeOnly),
+            ] {
+                register_metadata(&runtime, &metadata).await;
+            }
             for (index, envelope) in [gap_only, unpositioned, no_change].into_iter().enumerate() {
                 let receipt = ingress
                     .try_submit(envelope_command(
@@ -2889,7 +3075,8 @@ mod tests {
             }
 
             let bound_metadata =
-                SeriesMetadata::new(nominal, producer_id(75), CollectionMode::Cumulative);
+                SeriesMetadata::new(series_id(73), producer_id(75), CollectionMode::Cumulative);
+            register_metadata(&runtime, &bound_metadata).await;
             let bound_observation = observation(
                 CollectionMode::Cumulative,
                 76,
@@ -2913,7 +3100,8 @@ mod tests {
             );
 
             let later_mismatch =
-                SeriesMetadata::new(nominal, producer_id(77), CollectionMode::Event);
+                SeriesMetadata::new(series_id(74), producer_id(77), CollectionMode::Event);
+            register_metadata(&runtime, &later_mismatch).await;
             let later_gap = Gap::new(
                 ProducerEpoch::new(0),
                 ProducerSequence::new(5),
@@ -2937,7 +3125,7 @@ mod tests {
                 .expect("bound snapshot should remain available");
             assert_eq!(snapshot.len(), 1);
             let entry = snapshot
-                .get(&nominal)
+                .get(&bound_metadata.series_id())
                 .expect("eligible metadata should bind");
             assert_eq!(entry.series_metadata(), &bound_metadata);
             assert_eq!(entry.observation(), &bound_observation);
@@ -2963,6 +3151,7 @@ mod tests {
             let equal_read = equal_runtime.read_handle();
             let metadata =
                 SeriesMetadata::new(series_id(80), producer_id(81), CollectionMode::Sampled);
+            register_metadata(&equal_runtime, &metadata).await;
             let original = observation(CollectionMode::Sampled, 82, 1, Some(position(1, 9)), 1, 1);
             let seed = equal_ingress
                 .try_submit(observed_command(
@@ -3040,6 +3229,7 @@ mod tests {
                 let read = runtime.read_handle();
                 let bound =
                     SeriesMetadata::new(series_id(90), producer_id(91), CollectionMode::Sampled);
+                register_metadata(&runtime, &bound).await;
                 let seed = ingress
                     .try_submit(observed_command(
                         bound,
@@ -3100,7 +3290,13 @@ mod tests {
             assert_eq!(MAX_OUTSTANDING_COMMANDS, 16);
 
             for index in 0..MAX_PUBLISHED_SERIES {
-                let tag = u8::try_from(index + 1).expect("series index should fit");
+                let tag = u8::try_from(index + 2).expect("series index should fit");
+                let metadata = SeriesMetadata::new(
+                    series_id(tag),
+                    producer_id(tag + 32),
+                    CollectionMode::Sampled,
+                );
+                register_metadata(&runtime, &metadata).await;
                 let receipt = ingress
                     .try_submit(positioned_command(
                         tag,
@@ -3122,8 +3318,8 @@ mod tests {
 
             let update = ingress
                 .try_submit(positioned_command(
-                    1,
-                    33,
+                    2,
+                    34,
                     CollectionMode::Sampled,
                     100,
                     2,
@@ -3134,8 +3330,8 @@ mod tests {
                 .into_receipt();
             let stale = ingress
                 .try_submit(positioned_command(
-                    2,
-                    34,
+                    3,
+                    35,
                     CollectionMode::Sampled,
                     101,
                     0,
@@ -3145,7 +3341,8 @@ mod tests {
                 .expect("existing stale series may no-op at capacity")
                 .into_receipt();
             let new_metadata =
-                SeriesMetadata::new(series_id(17), producer_id(49), CollectionMode::Sampled);
+                SeriesMetadata::new(series_id(18), producer_id(50), CollectionMode::Sampled);
+            register_metadata(&runtime, &new_metadata).await;
             let ineligible_gap = Gap::new(
                 ProducerEpoch::new(0),
                 ProducerSequence::new(5),
@@ -3172,17 +3369,17 @@ mod tests {
             assert_eq!(before_fault.len(), 16);
             assert_eq!(
                 before_fault
-                    .get(&series_id(1))
+                    .get(&series_id(2))
                     .expect("updated series remains")
                     .producer_position(),
                 position(1, 2)
             );
-            assert!(before_fault.get(&series_id(17)).is_none());
+            assert!(before_fault.get(&series_id(18)).is_none());
 
             let overflow = ingress
                 .try_submit(positioned_command(
-                    17,
-                    49,
+                    18,
+                    50,
                     CollectionMode::Sampled,
                     102,
                     1,
@@ -3197,7 +3394,7 @@ mod tests {
             );
             assert_eq!(read.snapshot(), Err(LatestReadError::unavailable()));
             assert_eq!(before_fault.len(), 16);
-            assert!(before_fault.get(&series_id(17)).is_none());
+            assert!(before_fault.get(&series_id(18)).is_none());
             assert_eq!(
                 ingress
                     .try_submit(command("closed-after-capacity", 9, 0))
@@ -3230,6 +3427,7 @@ mod tests {
             let dropped_read_clone = read.clone();
             let metadata =
                 SeriesMetadata::new(series_id(110), producer_id(111), CollectionMode::Event);
+            register_metadata(&runtime, &metadata).await;
             let admitted = observation(CollectionMode::Event, 112, 1, Some(position(2, 1)), 1, 1);
             let first = ingress
                 .try_submit(observed_command(
@@ -3319,6 +3517,15 @@ mod tests {
                 let old = read
                     .snapshot()
                     .expect("pre-fault snapshot should be available");
+                register_metadata(
+                    &runtime,
+                    &SeriesMetadata::new(
+                        series_id(200),
+                        producer_id(201),
+                        CollectionMode::Cumulative,
+                    ),
+                )
+                .await;
                 let receipt = runtime
                     .ingress()
                     .try_submit(positioned_command(
@@ -3361,7 +3568,7 @@ mod tests {
         harness().block_on(async {
             let directory = test_directory();
             let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("byte limits");
-            let runtime = complete_bounded(HistorianRuntime::open(durable_options(
+            let runtime = complete_bounded(open_durable_test(durable_options(
                 directory.clone(),
                 store_id(1),
                 och_store::ActiveJournalOpenMode::CreateNew,
@@ -3404,7 +3611,7 @@ mod tests {
                 .snapshot()
                 .expect("sealed snapshot remains readable after shutdown");
 
-            let reopened = complete_bounded(HistorianRuntime::open(durable_options(
+            let reopened = complete_bounded(open_durable_test(durable_options(
                 directory.clone(),
                 store_id(1),
                 och_store::ActiveJournalOpenMode::OpenExisting,
@@ -3536,7 +3743,7 @@ mod tests {
             let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("byte limits");
 
             let records_directory = test_directory();
-            let records_runtime = complete_bounded(HistorianRuntime::open(durable_options(
+            let records_runtime = complete_bounded(open_durable_test(durable_options(
                 records_directory.clone(),
                 store_id(1),
                 och_store::ActiveJournalOpenMode::CreateNew,
@@ -3582,7 +3789,7 @@ mod tests {
                 och_store::admission_frame_len_v1(second_bytes.admission()),
                 Ok(frame_bytes)
             );
-            let bytes_runtime = complete_bounded(HistorianRuntime::open(durable_options(
+            let bytes_runtime = complete_bounded(open_durable_test(durable_options(
                 bytes_directory.clone(),
                 store_id(1),
                 och_store::ActiveJournalOpenMode::CreateNew,
@@ -3620,7 +3827,7 @@ mod tests {
             fs::remove_dir_all(bytes_directory).expect("remove byte directory");
 
             let time_directory = test_directory();
-            let time_runtime = complete_bounded(HistorianRuntime::open(durable_options(
+            let time_runtime = complete_bounded(open_durable_test(durable_options(
                 time_directory.clone(),
                 store_id(1),
                 och_store::ActiveJournalOpenMode::CreateNew,
@@ -3702,6 +3909,10 @@ mod tests {
             ))
             .await
             .expect("unpublished-cutoff runtime");
+            runtime
+                .apply_registry(default_test_registry_operation(runtime.store_id()))
+                .await
+                .expect("unpublished-cutoff registry seed");
             let ingress = runtime.ingress();
             let first = ingress
                 .try_submit(command("published-first", 90, 90))
@@ -3761,6 +3972,186 @@ mod tests {
                 .await
                 .expect("unpublished-cutoff shutdown");
             fs::remove_dir_all(directory).expect("remove unpublished-cutoff directory");
+        });
+    }
+
+    #[test]
+    fn concurrent_retirement_and_append_share_one_order_and_preserve_historical_authority() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                .expect("concurrency byte limits");
+            let runtime = complete_bounded(open_durable_test(durable_options(
+                directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                bytes,
+                group_policy(
+                    std::time::Duration::from_secs(60),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                ),
+            )))
+            .await
+            .expect("concurrency runtime");
+            let receipt = runtime
+                .ingress()
+                .try_submit(IngressCommand::with_policy(
+                    command("historic-concurrency", 230, 230).into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Immediate,
+                ))
+                .expect("queue revision-one admission")
+                .into_receipt();
+            let retirement = RegistryOperation::Retire {
+                series_id: series_id(1),
+                expected_revision: och_core::DeclarationRevision::FIRST,
+                evidence: DeclarationEvidence::new(timestamp(5), None),
+            };
+            let mut registry_future = Box::pin(runtime.apply_registry(retirement));
+            let mut durable_future = Box::pin(receipt.wait_durable());
+            let mut registry_result = None;
+            let mut durable_result = None;
+            poll_fn(|context| {
+                if registry_result.is_none()
+                    && let Poll::Ready(result) = registry_future.as_mut().poll(context)
+                {
+                    registry_result = Some(result);
+                }
+                if durable_result.is_none()
+                    && let Poll::Ready(result) = durable_future.as_mut().poll(context)
+                {
+                    durable_result = Some(result);
+                }
+                if registry_result.is_some() && durable_result.is_some() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            drop(registry_future);
+            drop(durable_future);
+            let registry_commit = registry_result
+                .expect("registry result")
+                .expect("retirement commits");
+            assert!(matches!(
+                registry_commit.outcome(),
+                RegistryOutcome::Retirement(_)
+            ));
+            let durable = match durable_result.expect("durable result") {
+                DurableOutcome::Durable(commit) => commit,
+                DurableOutcome::WriterStopped => panic!("writer must retain historical authority"),
+            };
+            assert_eq!(durable.append().append_sequence(), 1);
+            assert_eq!(durable.durable_cutoff().append_sequence(), 1);
+            assert!(
+                runtime.inspection().committed().manifest_generation()
+                    >= registry_commit.manifest_commit().manifest_generation()
+            );
+            assert!(
+                runtime.inspection().committed().manifest_generation()
+                    >= durable.manifest_commit().manifest_generation()
+            );
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("shutdown concurrent runtime");
+
+            let reopened = complete_bounded(HistorianRuntime::open(durable_options(
+                directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::OpenExisting,
+                bytes,
+                group_policy(
+                    std::time::Duration::from_millis(2),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                ),
+            )))
+            .await
+            .expect("reopen concurrent store");
+            assert_eq!(reopened.recovered_records().len(), 1);
+            complete_bounded(reopened.shutdown())
+                .await
+                .expect("shutdown reopened runtime");
+            fs::remove_dir_all(directory).expect("remove concurrency directory");
+        });
+    }
+
+    #[test]
+    fn unknown_historical_declaration_is_an_intentional_terminal_authority_refusal() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                .expect("historical-refusal byte limits");
+            let runtime = complete_bounded(open_durable_test(durable_options(
+                directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                bytes,
+                group_policy(
+                    std::time::Duration::from_secs(60),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                ),
+            )))
+            .await
+            .expect("historical-refusal runtime");
+            let before = runtime.inspection();
+            let (envelope, retry) = model_parts(
+                series_id(240),
+                producer_id(241),
+                "unknown-history",
+                240,
+                240,
+            );
+            let receipt = runtime
+                .ingress()
+                .try_submit(IngressCommand::new(canonical_admission(
+                    store_id(1),
+                    envelope,
+                    retry,
+                )))
+                .expect("bounded admission reaches sole registry authority")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(receipt.clone().wait_handled()).await,
+                HandledOutcome::WriterStopped
+            );
+            assert_eq!(
+                complete_bounded(receipt.wait_durable()).await,
+                DurableOutcome::WriterStopped
+            );
+            let after = runtime.inspection();
+            assert_eq!(after.store(), before.store());
+            assert_eq!(after.committed(), before.committed());
+            assert_eq!(after.health(), RuntimeHealth::Faulted);
+            assert_eq!(after.pending_count(), 0);
+            assert_eq!(after.pending_bytes(), 0);
+            assert_eq!(
+                complete_bounded(runtime.shutdown()).await,
+                Err(ShutdownError::WriterExitedBeforeShutdown)
+            );
+
+            let reopened = complete_bounded(open_durable_test(durable_options(
+                directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::OpenExisting,
+                bytes,
+                group_policy(
+                    std::time::Duration::from_millis(2),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                ),
+            )))
+            .await
+            .expect("terminal refusal leaves committed store reopenable");
+            assert!(reopened.recovered_records().is_empty());
+            assert_eq!(reopened.inspection().committed(), before.committed());
+            complete_bounded(reopened.shutdown())
+                .await
+                .expect("shutdown reopened store");
+            fs::remove_dir_all(directory).expect("remove historical-refusal directory");
         });
     }
 
@@ -3860,6 +4251,8 @@ mod tests {
                 journal_limits,
                 byte_limits,
                 group,
+                och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(16, 64))
+                    .expect("path-bound registry options"),
             )
             .is_ok(),
             "exact path bound is retained"
@@ -3872,9 +4265,11 @@ mod tests {
                 journal_limits,
                 byte_limits,
                 group,
+                och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(16, 64))
+                    .expect("path-bound registry options"),
             ),
-            Err(StoreOptionsError::Journal(
-                och_store::ActiveJournalError::InvalidOptions
+            Err(StoreOptionsError::Store(
+                och_store::ManifestStoreError::InvalidOptions
             ))
         ));
     }
@@ -3892,7 +4287,7 @@ mod tests {
                 .expect("journal limits");
                 let bytes =
                     ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("byte limits");
-                let runtime = complete_bounded(HistorianRuntime::open(durable_options(
+                let runtime = complete_bounded(open_durable_test(durable_options(
                     directory.clone(),
                     store_id(1),
                     och_store::ActiveJournalOpenMode::CreateNew,
@@ -3910,19 +4305,23 @@ mod tests {
                 let mut reopened = None;
                 let started = std::time::Instant::now();
                 while started.elapsed() < TEST_WAIT_TIMEOUT {
-                    let config = och_store::ActiveJournalConfig::new(
+                    let config = och_store::ManifestStoreConfig::new(
                         directory.clone(),
                         store_id(1),
                         och_store::ActiveJournalOpenMode::OpenExisting,
                         journal_limits,
+                        och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(
+                            256, 512,
+                        ))
+                        .expect("reopen registry options"),
                     )
                     .expect("reopen config");
-                    match och_store::ActiveJournal::open(config) {
-                        Ok(journal) => {
-                            reopened = Some(journal);
+                    match och_store::ManifestStore::open(config) {
+                        Ok(store) => {
+                            reopened = Some(store);
                             break;
                         }
-                        Err(och_store::ActiveJournalError::AlreadyOpen) => {
+                        Err(och_store::ManifestStoreError::AlreadyOpen) => {
                             std::thread::sleep(std::time::Duration::from_micros(50));
                         }
                         Err(error) => panic!("unexpected reopen error: {error:?}"),
@@ -3940,7 +4339,7 @@ mod tests {
         harness().block_on(async {
             let directory = test_directory();
             let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("byte limits");
-            let runtime = complete_bounded(HistorianRuntime::open(durable_options(
+            let runtime = complete_bounded(open_durable_test(durable_options(
                 directory.clone(),
                 store_id(1),
                 och_store::ActiveJournalOpenMode::CreateNew,
@@ -3973,7 +4372,7 @@ mod tests {
         harness().block_on(async {
             let bytes =
                 ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("child byte limits");
-            let runtime = complete_bounded(HistorianRuntime::open(durable_options(
+            let runtime = complete_bounded(open_durable_test(durable_options(
                 PathBuf::from(&directory),
                 store_id(1),
                 och_store::ActiveJournalOpenMode::CreateNew,
@@ -4012,10 +4411,10 @@ mod tests {
                 ));
             }
             fs::write(
-                PathBuf::from(directory).join("child-ready"),
+                PathBuf::from(directory).with_extension("child-ready"),
                 stage.as_bytes(),
             )
-            .expect("publish child readiness marker");
+            .expect("publish child readiness marker outside the bounded store inventory");
             loop {
                 std::thread::park();
             }
@@ -4026,7 +4425,7 @@ mod tests {
     fn real_process_kill_reopens_durable_and_handled_suffixes_truthfully() {
         for stage in ["durable", "handled"] {
             let directory = test_directory();
-            let marker = directory.join("child-ready");
+            let marker = directory.with_extension("child-ready");
             let mut child = Command::new(std::env::current_exe().expect("runtime test executable"))
                 .args(["--exact", "tests::child_process_kill_helper", "--nocapture"])
                 .env("OCH_RUNTIME_KILL_DIRECTORY", &directory)
@@ -4055,7 +4454,7 @@ mod tests {
             harness().block_on(async {
                 let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
                     .expect("reopen byte limits");
-                let reopened = complete_bounded(HistorianRuntime::open(durable_options(
+                let reopened = complete_bounded(open_durable_test(durable_options(
                     directory.clone(),
                     store_id(1),
                     och_store::ActiveJournalOpenMode::OpenExisting,
@@ -4066,8 +4465,17 @@ mod tests {
                         64 * 1_024 * 1_024,
                     ),
                 )))
-                .await
-                .expect("bounded reopen after process kill");
+                .await;
+                if stage == "handled" {
+                    assert!(matches!(
+                        reopened,
+                        Err(StartError::Store(och_store::ManifestStoreError::Active(
+                            och_store::ActiveJournalError::InvalidLayout
+                        )))
+                    ));
+                    return;
+                }
+                let reopened = reopened.expect("durable manifest cutoff must reopen");
                 assert_eq!(reopened.recovered_records().len(), 1);
                 assert_eq!(
                     reopened
@@ -4088,6 +4496,7 @@ mod tests {
                     .await
                     .expect("shutdown reopened child journal");
             });
+            fs::remove_file(marker).expect("remove child readiness marker");
             fs::remove_dir_all(directory).expect("remove child-kill directory");
         }
     }

@@ -8,8 +8,9 @@ volatile ingress, and M01-PR03 added bounded runtime-local latest publication.
 M00-PR04 added bounded canonical series declaration authority, M00-PR05 added
 bounded source/capture provenance and canonical admission, M02-PR01a established
 the store-scoped runtime input, M02-PR01b0 froze Journal V1 semantic framing, and
-M02-PR01b1 connects that single path to one bounded active-journal durable
-vertical:
+M02-PR01b1 connected that single path to one bounded active-journal durable
+vertical, and M02-PR02a roots its range, mechanical cutoff, and complete
+canonical registry history in one bounded manifest:
 
 ```text
 default workspace selection
@@ -18,6 +19,7 @@ default workspace selection
   och-runtime (native) ----> och-store (native) ----> och-core (native)
   Tokio coordinator            active journal              ^
   16 slots + byte bounds       Journal V1 + checkpoint      |
+  one control gate             manifest + registry slots    |
        |                                                    |
        v                                      future adapters (not created yet)
   tokio rt + sync only
@@ -56,15 +58,26 @@ series. Multiple runtimes are independent; the retained file lock excludes a
 second active writer for the same artifacts. Tokio remains admitted only on the
 direct runtime edge with default features disabled and `rt` plus `sync` enabled.
 
-The runtime neither consumes nor mutates `SeriesRegistry`; core remains the sole
-declaration and source-admission authority. Retry classification reads the
-admission's exact `RetryQualification`, while volatile publication reads only its
-validated envelope. The exact `SeriesMetadata` bind remains a runtime-local read
-optimization invariant and cannot authorize a declaration or reinterpret an old
-revision. Source/declaration evidence stays owned by the command until
-append/publication returns it to the bounded slot, and the slot and exact byte
-reservation remain retained until durability or terminal stop. Reopen evidence
-is decoded and bounded but cannot authorize submission, registry, or latest state.
+Core remains the sole declaration and source-admission semantic authority. The
+blocking store writer now owns the one non-cloneable live `SeriesRegistry`, and
+the runtime exposes only bounded register/revise/retire operations plus
+registry-issued current-active envelope binding. Those operations and the
+append-to-publication handshake share one async control gate and the existing
+bounded writer channel, so no second ordering authority exists. Retry
+classification reads the admission's exact `RetryQualification`, while volatile
+publication reads only its validated envelope. The exact `SeriesMetadata` bind
+remains a runtime-local read optimization invariant and cannot authorize a
+declaration or reinterpret an old revision. Source/declaration evidence stays
+owned by the command until append/publication returns it to the bounded slot,
+and the slot and exact byte reservation remain retained until durability or
+terminal stop. Reopen evidence is decoded and bounded but cannot authorize
+submission, registry, or latest state.
+
+Because the registry is reachable only on the blocking writer, synchronous
+ingress performs resource/framing admission rather than historical lookup. An
+unknown or altered historical declaration is a terminal authority mismatch: no
+handled/durable success is emitted, both receipt stages resolve `WriterStopped`,
+and the runtime fail-stops without journal or latest mutation.
 
 [`och-store`](../crates/och-store/) owns version-one semantic bytes for complete
 already-authorized admissions. A fixed 28-byte header scopes a journal to one
@@ -76,28 +89,33 @@ payload against both the fixed 8 MiB maximum and a caller-selected lower limit
 before any field allocation. It produces only store-owned non-authorizing
 inspection evidence, never a registry-issued declaration or `CanonicalAdmission`.
 
-The store also owns two exact generation-one active artifacts in one existing
-directory: the locked read/write journal and a fixed two-slot durable-high-water
-checkpoint. Create-new synchronizes the header, initial checkpoint state, and
-directory entries before readiness. The sole blocking writer assigns strict
+The store also owns one bounded fixed inventory in an existing directory: a
+never-renamed stable store lock, the retained read/write journal lock, the
+generation-one active journal, a fixed two-slot mechanical checkpoint, two
+reusable manifest slots, and three reusable complete registry slots. Manifest
+stores use active-header version 2 in the unchanged 28-byte layout; every
+admission frame remains Journal V1. An old header-v1 decoder rejects the fence.
+Create-new synchronizes active genesis, an empty registry snapshot, and manifest
+generation one before readiness. The sole blocking writer assigns strict
 append sequences, explicitly seeks to journal end, and validates both frame and
 declaration StoreId against the header. A barrier performs journal sync, writes
 the alternate CRC-protected checkpoint slot, then synchronizes that checkpoint
-before publishing the new cutoff. The checkpoint contains only store/journal
-identity, slot generation, append sequence, end offset, and checksum; it is not
-registry or retry authority.
+and publishes a manifest naming the exact cutoff before exposing durability. The
+checkpoint contains only store/journal identity, slot generation, append
+sequence, end offset, and checksum; it is not registry or retry authority.
 
-Open-existing retains the writer lock, bounds journal bytes/records/payload before
-allocation, scans the checkpoint prefix exactly, and refuses interior corruption
-or ambiguous/non-progressing checkpoint fallback. A missing or zero-byte
-checkpoint is initialized only for an exact valid header-only journal under that
-lock; every nonzero wrong checkpoint length refuses unchanged. A proven
-terminal invalid unacknowledged suffix is truncated and synchronized; a complete
-malformed frame with later bytes refuses unchanged, while a proven valid suffix
-may be synchronized and adopted before readiness. The active scan exposes bounded
-decoded evidence only and latest restarts empty. `och-store` still owns no runtime
-scheduling, receipt, registry mutation, manifest, successor rotation, immutable
-segment, or query behavior.
+Open-existing acquires the stable lock before selection or mutation, validates a
+bounded non-recursive inventory, selects only strict consecutive manifest
+candidates, restores the referenced registry solely through public core
+lifecycle replay, and requires exact snapshot re-encoding. The selected manifest
+cutoff must equal the mechanical checkpoint, and every recovered declaration
+must resolve exactly from retained history. A nonempty premanifest store requires
+an explicit matching snapshot; exact header-only V1/V2 stores may bootstrap
+empty. Decoded evidence never authorizes registry state, and latest restarts
+empty. `och-store` still owns no runtime scheduling, successor rotation,
+immutable segment, durable retry, broad recovery, latest projection, or query
+behavior. The exact format and strict publication contract are in
+[Manifest V1](manifest-v1-format.md).
 
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`
@@ -192,10 +210,14 @@ caller-owned volatile memory, not runtime history.
 
 The blocking worker preserves FIFO and groups handled appends until the first of
 configured time, record, or byte bounds, explicit/immediate demand, protected
-demand, or shutdown. Durable order is append, journal sync, alternate checkpoint
-slot write, checkpoint sync, then `Durable` receipt assignment and reservation
-release. A durable receipt names store, fixed journal generation, append sequence,
-frame end, mechanical checkpoint generation, and covering cutoff. A timeout never
+demand, or shutdown. Durable order is append, volatile publication, journal
+sync, alternate checkpoint slot write, checkpoint sync, manifest publication
+naming the exact cutoff and current registry slot, then `Durable` receipt
+assignment and reservation release.
+
+A durable receipt names store, fixed journal generation, append sequence, frame
+end, mechanical checkpoint generation, manifest generation, and registry
+generation/slot. A timeout never
 synchronizes while the newest append still awaits the coordinator's publication
 acknowledgement; after acknowledgement an elapsed deadline may flush immediately.
 The receipt claims only the active artifacts under the documented platform
@@ -220,9 +242,9 @@ and is never recomputed from admission or envelope content.
 ## Intentionally absent
 
 There is currently no async/blocking admission wait, eviction, subscription/wait
-API, mutable read guard, manifest, active-generation successor publication,
-rotation handoff, immutable segment, registry persistence/bootstrap, durable
-long-term retry cache, latest reconstruction, broad recovery event model, query
+API, mutable read guard, active-generation successor publication, rotation
+handoff, immutable segment, durable long-term retry cache, manifest-backed latest
+reconstruction, broad recovery event model, query
 engine, network service, SQL layer, cloud/object provider, embedded database,
 memory mapping, Studio/Engine link, adapter, or donor-code compatibility layer.
 
@@ -241,3 +263,5 @@ transition and accepted split before journal bytes are recorded by
 durable hard stop are recorded by [M02-PR01b0](continuation-m02-pr01b0.md).
 The complete generation-one active-journal durable vertical and its PR02 handoff
 are recorded by [M02-PR01b1](continuation-m02-pr01b1.md).
+The manifest-rooted canonical registry transition and its exact successor ledger
+are recorded by [M02-PR02a](continuation-m02-pr02a.md).
