@@ -4,8 +4,8 @@ use och_core::{
     ArtifactId, ArtifactReference, ContentFormat, ContentIdentity, ContentVersion, ExactText,
     ExactValue, ModelError, NativeStatus, NativeStatusToken, ObservationId, ObservationTimes,
     ProducerEpoch, ProducerId, ProducerPosition, ProducerSequence, Quality, QualityFlags,
-    QualityLevel, RealBits, RetryKey, SeriesId, StateClass, StateMember, StateValue, Timestamp,
-    Unavailable, UnavailableReason,
+    QualityLevel, RealBits, RetryKey, SeriesId, StateClass, StateMember, StateValue, StoreId,
+    Timestamp, Unavailable, UnavailableReason,
 };
 
 const SERIES_TEXT: &str = "01941f29-7c00-7000-8000-000000000001";
@@ -31,11 +31,13 @@ fn identity_requires_canonical_uuid_v7_text_and_round_trips_bytes() {
 
 #[test]
 fn all_nominal_identity_families_parse_the_same_validated_shape() {
+    let store = StoreId::parse(SERIES_TEXT).expect("store");
     let series = SeriesId::parse(SERIES_TEXT).expect("series");
     let producer = ProducerId::parse(SERIES_TEXT).expect("producer");
     let observation = ObservationId::parse(SERIES_TEXT).expect("observation");
     let artifact = ArtifactId::parse(SERIES_TEXT).expect("artifact");
 
+    assert_eq!(store.to_string(), series.to_string());
     assert_eq!(series.to_string(), producer.to_string());
     assert_eq!(producer.to_string(), observation.to_string());
     assert_eq!(observation.to_string(), artifact.to_string());

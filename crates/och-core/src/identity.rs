@@ -132,6 +132,10 @@ macro_rules! identity_type {
 }
 
 identity_type!(
+    StoreId,
+    "The nominal identity of one Historian store authority."
+);
+identity_type!(
     SeriesId,
     "The nominal identity of one immutable collection-mode series."
 );

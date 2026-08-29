@@ -56,6 +56,28 @@ pub enum ModelError {
     UnexpectedObservationInterval,
     /// No-change evidence was supplied for a mode other than change-only.
     InvalidNoChangeMode,
+    /// A declaration reference is empty, contains a control, or exceeds its bound.
+    InvalidDeclarationReference,
+    /// Declaration revision zero is reserved and therefore invalid.
+    InvalidDeclarationRevision,
+    /// A new series would exceed the registry's total-series bound.
+    RegistrySeriesCapacityExceeded,
+    /// A new declaration would exceed the registry's retained-revision bound.
+    RegistryRevisionCapacityExceeded,
+    /// The series identity is already registered with different declaration input.
+    SeriesAlreadyRegistered,
+    /// The requested series identity is not registered.
+    SeriesNotFound,
+    /// The requested series is terminally retired.
+    SeriesRetired,
+    /// The expected declaration revision is not the active revision.
+    StaleDeclarationRevision,
+    /// A requested revision does not change the declaration payload.
+    DeclarationUnchanged,
+    /// Envelope series metadata differs from the active declaration.
+    SeriesMetadataMismatch,
+    /// An observation value does not match the active declared value family.
+    ObservationValueFamilyMismatch,
 }
 
 impl fmt::Display for ModelError {
@@ -85,6 +107,17 @@ impl fmt::Display for ModelError {
             Self::MissingObservationInterval => "interval-mode observation lacks an interval",
             Self::UnexpectedObservationInterval => "non-interval-mode observation has an interval",
             Self::InvalidNoChangeMode => "no-change evidence requires change-only mode",
+            Self::InvalidDeclarationReference => "invalid bounded declaration reference",
+            Self::InvalidDeclarationRevision => "invalid declaration revision",
+            Self::RegistrySeriesCapacityExceeded => "series registry capacity exceeded",
+            Self::RegistryRevisionCapacityExceeded => "declaration revision capacity exceeded",
+            Self::SeriesAlreadyRegistered => "series identity is already registered",
+            Self::SeriesNotFound => "series identity is not registered",
+            Self::SeriesRetired => "series is terminally retired",
+            Self::StaleDeclarationRevision => "declaration revision is stale",
+            Self::DeclarationUnchanged => "declaration payload is unchanged",
+            Self::SeriesMetadataMismatch => "envelope series metadata mismatch",
+            Self::ObservationValueFamilyMismatch => "observation value family mismatch",
         })
     }
 }
