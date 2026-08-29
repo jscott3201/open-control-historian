@@ -64,6 +64,7 @@ dependencies = [
 name = "och-runtime"
 version = "0.0.0"
 dependencies = [
+ "och-core",
  "tokio",
 ]
 
