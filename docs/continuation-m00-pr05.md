@@ -8,10 +8,12 @@ declaration lifecycle. This record crosswalks Open Control Studio
 `main@e629620d7f1104197755b4b6d2566ac9a1286a4f`; it does not import Studio code,
 types, serialization, or dependencies.
 
-M00-PR04 remains the only declaration/revision/retirement authority.
-`och-runtime` remains a volatile non-consumer of the registry,
-`DeclaredCollectionEnvelope`, and `CanonicalAdmission`; it gains no lifecycle,
-source-provenance, or durable-admission authority.
+M00-PR04 remains the only declaration/revision/retirement authority. At this
+historical point, `och-runtime` was a volatile non-consumer of the registry,
+`DeclaredCollectionEnvelope`, and `CanonicalAdmission`. M02-PR01a subsequently
+supersedes only that non-consumer statement by accepting complete admissions in a
+store-scoped volatile runtime; it still grants no lifecycle,
+source-interpretation, persistence, or durability authority.
 
 ## Delivered native contract
 
@@ -149,8 +151,10 @@ observed/no-change lineage. M02-PR01 must not accept a bare envelope, infer a
 declaration revision, reinterpret a historical observation, discard required
 source/capture fields, or equate source transport/idempotency with Historian retry.
 
-This completion authorizes planning M02; it does not claim M02 complete. Journal
-frames, group commit, recovery, and durable receipts remain M02-PR01 work.
+This completion authorized planning M02; it did not claim M02 complete.
+M02-PR01a later split out the store-scoped canonical-admission runtime boundary.
+Journal frames, group commit, recovery, and durable receipts remain in the
+durable M02-PR01b vertical.
 Persistent registry/manifests and durable retry state remain M02-PR02 work.
 
 ## Deferred ledger

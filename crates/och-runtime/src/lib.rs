@@ -3,24 +3,25 @@
 //! Caller-executor lifecycle, bounded volatile ingress, and latest-observation
 //! snapshots for the `OpenControl` Historian writer.
 //!
-//! Each [`HistorianRuntime`] owns exactly one private writer task and a fixed
-//! 16-command admission window on the caller's active Tokio executor. Eligible
-//! positioned observations publish into a separate fixed 16-series volatile
-//! registry. Neither handling nor publication implies persistence, current/held
-//! value, query, or restart semantics.
+//! Each [`HistorianRuntime`] owns one immutable store scope, exactly one private
+//! writer task, and a fixed 16-command canonical-admission window on the caller's
+//! active Tokio executor. Eligible positioned observations publish into a
+//! separate fixed 16-series volatile registry. Neither handling nor publication
+//! implies persistence, current/held value, query, or restart semantics.
 
 mod ingress;
 mod latest;
 
 pub use ingress::{
     HistorianIngress, IngressCommand, MAX_OUTSTANDING_COMMANDS, Receipt, ReceiptOutcome,
-    ScopeMismatchError, Submission, SubmissionDisposition, TrySubmitError, TrySubmitErrorKind,
+    Submission, SubmissionDisposition, TrySubmitError, TrySubmitErrorKind,
 };
 pub use latest::{
     LatestReadError, LatestReadHandle, LatestSnapshot, MAX_PUBLISHED_SERIES, PublishedObservation,
 };
 
 use ingress::{CompletionFaultInjection, IngressShared, NextWork};
+use och_core::StoreId;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -53,10 +54,11 @@ impl fmt::Debug for HistorianRuntime {
 }
 
 impl HistorianRuntime {
-    /// Starts one private writer task on the caller's active Tokio executor.
+    /// Starts one store-scoped private writer task on the active Tokio executor.
     ///
     /// The future returns only after the writer's private mutable state has been
-    /// initialized. The caller remains responsible for the executor; this method
+    /// initialized for `store_id`. The scope cannot change during the instance's
+    /// lifetime. The caller remains responsible for the executor; this method
     /// never constructs an executor, starts a thread, or blocks.
     ///
     /// # Errors
@@ -64,14 +66,14 @@ impl HistorianRuntime {
     /// Returns a sanitized [`StartError`] when there is no active Tokio runtime
     /// or the writer fails before readiness. Dropping this future after it has
     /// spawned the writer aborts that writer rather than detaching it.
-    pub async fn start() -> Result<Self, StartError> {
-        Self::start_inner(WriterOptions::production()).await
+    pub async fn start(store_id: StoreId) -> Result<Self, StartError> {
+        Self::start_inner(store_id, WriterOptions::production()).await
     }
 
-    async fn start_inner(options: WriterOptions) -> Result<Self, StartError> {
+    async fn start_inner(store_id: StoreId, options: WriterOptions) -> Result<Self, StartError> {
         let executor = Handle::try_current().map_err(|_| StartError::NoActiveRuntime)?;
         let (readiness_tx, readiness_rx) = oneshot::channel();
-        let ingress = HistorianIngress::new();
+        let ingress = HistorianIngress::new(store_id);
         #[cfg(test)]
         let cancel_before_readiness = options.behavior == TestBehavior::CancelBeforeReadiness;
         let writer = executor.spawn(run_writer(options, readiness_tx, ingress.shared()));
@@ -105,6 +107,12 @@ impl HistorianRuntime {
     #[must_use]
     pub fn ingress(&self) -> HistorianIngress {
         self.ingress.clone()
+    }
+
+    /// Returns the immutable store scope of this runtime instance.
+    #[must_use]
+    pub fn store_id(&self) -> StoreId {
+        self.ingress.store_id()
     }
 
     /// Returns a cloneable synchronous reader for this runtime's latest registry.
@@ -151,8 +159,11 @@ impl HistorianRuntime {
     }
 
     #[cfg(test)]
-    async fn start_with_options(options: WriterOptions) -> Result<Self, StartError> {
-        Self::start_inner(options).await
+    async fn start_with_options(
+        store_id: StoreId,
+        options: WriterOptions,
+    ) -> Result<Self, StartError> {
+        Self::start_inner(store_id, options).await
     }
 }
 
@@ -598,16 +609,24 @@ enum TestBehavior {
 #[cfg(test)]
 mod tests {
     use super::{
-        HistorianIngress, HistorianRuntime, IngressCommand, LatestReadError, LifecycleProbe,
-        MAX_OUTSTANDING_COMMANDS, MAX_PUBLISHED_SERIES, ReceiptOutcome, ShutdownError, StartError,
-        SubmissionDisposition, TestBehavior, TrySubmitErrorKind, WriterOptions,
+        HistorianIngress, HistorianRuntime, IngressCommand, LatestReadError, LatestReadHandle,
+        LifecycleProbe, MAX_OUTSTANDING_COMMANDS, MAX_PUBLISHED_SERIES, ReceiptOutcome,
+        ShutdownError, StartError, SubmissionDisposition, TestBehavior, TrySubmitErrorKind,
+        WriterOptions,
     };
     use och_core::{
+        ArtifactId, ArtifactReference, CanonicalAdmission, CaptureLifecycle, CaptureRunEvidence,
         CollectionEnvelope, CollectionMode, ContentFormat, ContentIdentity, ContentVersion,
-        ExactValue, Gap, GapReason, NativeStatus, NoChange, Observation, ObservationId,
+        DeclarationEvidence, DeclarationReference, EvidenceId, EvidenceKind, ExactValue, Gap,
+        GapReason, NativeStatus, NoChange, NormalizedRecordEvidence, Observation, ObservationId,
         ObservationTimes, ProducerEpoch, ProducerId, ProducerPosition, ProducerSequence, Quality,
-        QualityFlags, QualityLevel, RetryKey, RetryQualification, SeriesId, SeriesMetadata,
-        TimeInterval, Timestamp,
+        QualityFlags, QualityLevel, QuantityEvidence, RawRecordEvidence, RetryKey,
+        RetryQualification, SeriesBinding, SeriesDeclarationPayload, SeriesId, SeriesMetadata,
+        SeriesRegistry, SeriesRegistryLimits, SourceBatchMetadata, SourceEndpointEvidence,
+        SourceGapEvidence, SourceGapReason, SourceInterpretation, SourceIntervalKind,
+        SourceObservationContext, SourceObservationEvidence, SourceProjection, SourceReference,
+        SourceSchemaIdentity, SourceSchemaVersion, SourceSnapshotEvidence, SourceSystemEvidence,
+        SourceTransport, StoreId, TimeInterval, Timestamp, UnitEvidence, ValueFamily,
     };
     use std::future::{Future, poll_fn};
     use std::pin::Pin;
@@ -649,6 +668,10 @@ mod tests {
         SeriesId::from_bytes(uuid_bytes(tag)).expect("test series identity should be UUIDv7")
     }
 
+    fn store_id(tag: u8) -> StoreId {
+        StoreId::from_bytes(uuid_bytes(tag)).expect("test store identity should be UUIDv7")
+    }
+
     fn producer_id(tag: u8) -> ProducerId {
         ProducerId::from_bytes(uuid_bytes(tag)).expect("test producer identity should be UUIDv7")
     }
@@ -656,6 +679,14 @@ mod tests {
     fn observation_id(tag: u8) -> ObservationId {
         ObservationId::from_bytes(uuid_bytes(tag))
             .expect("test observation identity should be UUIDv7")
+    }
+
+    fn evidence_id(tag: u8) -> EvidenceId {
+        EvidenceId::from_bytes(uuid_bytes(tag)).expect("test evidence identity should be UUIDv7")
+    }
+
+    fn declaration_reference(value: &str) -> DeclarationReference {
+        DeclarationReference::new(value.to_owned()).expect("test reference should be valid")
     }
 
     fn timestamp(seconds: i64) -> Timestamp {
@@ -696,23 +727,180 @@ mod tests {
         )
     }
 
+    fn content(digest_tag: u8) -> ContentIdentity {
+        ContentIdentity::new(
+            ContentFormat::new("application/x-och-test".to_owned())
+                .expect("test content format should be valid"),
+            ContentVersion::new(1),
+            [digest_tag; 32],
+        )
+    }
+
+    fn artifact(tag: u8, digest_tag: u8) -> ArtifactReference {
+        ArtifactReference::new(
+            ArtifactId::from_bytes(uuid_bytes(tag)).expect("test artifact should be UUIDv7"),
+            content(digest_tag),
+        )
+    }
+
     fn retry(series: &SeriesMetadata, key: &str, digest_tag: u8) -> RetryQualification {
         RetryQualification::new(
             series.series_id(),
             series.producer_id(),
             RetryKey::new(key.to_owned()).expect("test retry key should be valid"),
-            ContentIdentity::new(
-                ContentFormat::new("application/x-och-test".to_owned())
-                    .expect("test content format should be valid"),
-                ContentVersion::new(1),
-                [digest_tag; 32],
-            ),
+            content(digest_tag),
         )
+    }
+
+    fn source_reference() -> SourceReference {
+        SourceReference::with_projection(
+            declaration_reference("provider:test"),
+            SourceProjection::new("projection:test".to_owned())
+                .expect("test projection should be valid"),
+            declaration_reference("locator:test"),
+        )
+    }
+
+    fn capture_lifecycle() -> CaptureLifecycle {
+        let system = SourceSystemEvidence::new(
+            evidence_id(200),
+            declaration_reference("provider:test"),
+            SourceProjection::new("projection:test".to_owned())
+                .expect("test projection should be valid"),
+        );
+        let endpoint = SourceEndpointEvidence::new(
+            evidence_id(201),
+            system.evidence_id(),
+            declaration_reference("locator:test"),
+        );
+        let run = CaptureRunEvidence::new(
+            evidence_id(202),
+            endpoint.evidence_id(),
+            timestamp(1),
+            Some(timestamp(2)),
+        )
+        .expect("test capture times should be ordered");
+        let snapshot =
+            SourceSnapshotEvidence::new(evidence_id(203), run.evidence_id(), artifact(204, 204));
+        CaptureLifecycle::new(system, endpoint, run, snapshot)
+            .expect("test capture lifecycle should be linked")
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn canonical_admission(
+        store: StoreId,
+        envelope: CollectionEnvelope,
+        retry: RetryQualification,
+    ) -> CanonicalAdmission {
+        let source = source_reference();
+        let series = envelope.series().clone();
+        let contexts = envelope
+            .observations()
+            .iter()
+            .enumerate()
+            .map(|(index, observation)| {
+                let ordinal = u8::try_from(index).expect("test observation ordinal should fit");
+                let base = ordinal
+                    .checked_mul(3)
+                    .and_then(|value| value.checked_add(10))
+                    .expect("test evidence tag should fit");
+                let source_observation = SourceObservationEvidence::new(
+                    evidence_id(base),
+                    Some(artifact(base.saturating_add(100), base)),
+                    SourceTransport::New,
+                    None,
+                );
+                let raw = RawRecordEvidence::new(
+                    evidence_id(base + 1),
+                    evidence_id(203),
+                    artifact(base.saturating_add(101), base + 1),
+                    None,
+                );
+                let normalized = NormalizedRecordEvidence::new(
+                    evidence_id(base + 2),
+                    raw.evidence_id(),
+                    content(base + 2),
+                    source_observation.evidence_id(),
+                );
+                SourceObservationContext::new(
+                    ordinal,
+                    observation.observation_id(),
+                    SourceInterpretation::new(
+                        source.clone(),
+                        None,
+                        QuantityEvidence::Absent,
+                        UnitEvidence::Absent,
+                    ),
+                    source_observation,
+                    raw,
+                    normalized,
+                )
+            })
+            .collect::<Vec<_>>();
+        let source_gaps = envelope
+            .gaps()
+            .iter()
+            .map(|gap| {
+                SourceGapEvidence::new(
+                    gap.epoch(),
+                    gap.start(),
+                    gap.end(),
+                    SourceGapReason::Unknown,
+                )
+                .expect("test source gap should be valid")
+            })
+            .collect::<Vec<_>>();
+        let interval = match envelope.evidence_kind() {
+            EvidenceKind::Observed => SourceIntervalKind::Observed,
+            EvidenceKind::NoChange => SourceIntervalKind::NoChange,
+        };
+        let batch = SourceBatchMetadata::new(
+            SourceSchemaIdentity::new("runtime.test".to_owned())
+                .expect("test schema should be valid"),
+            SourceSchemaVersion::new(1).expect("test schema version should be valid"),
+            interval,
+        );
+        let lifecycle = capture_lifecycle();
+        let mut registry = SeriesRegistry::new(store, SeriesRegistryLimits::new(1, 1));
+        registry
+            .register(
+                series.series_id(),
+                SeriesBinding::new(source),
+                SeriesDeclarationPayload::new(
+                    series.producer_id(),
+                    series.collection_mode(),
+                    ValueFamily::Unsigned,
+                    QuantityEvidence::Absent,
+                    UnitEvidence::Absent,
+                    None,
+                ),
+                DeclarationEvidence::new(timestamp(0), None),
+            )
+            .expect("test declaration should register");
+        let declared = registry
+            .bind(envelope)
+            .expect("test envelope should bind to its declaration");
+
+        match interval {
+            SourceIntervalKind::Observed => CanonicalAdmission::observed(
+                declared,
+                retry,
+                batch,
+                lifecycle,
+                contexts,
+                source_gaps,
+            )
+            .expect("test observed admission should validate"),
+            SourceIntervalKind::NoChange => {
+                CanonicalAdmission::no_change(declared, retry, batch, lifecycle)
+                    .expect("test no-change admission should validate")
+            }
+        }
     }
 
     fn envelope_command(envelope: CollectionEnvelope, key: &str, digest_tag: u8) -> IngressCommand {
         let qualification = retry(envelope.series(), key, digest_tag);
-        IngressCommand::new(envelope, qualification).expect("test command scope should match")
+        IngressCommand::new(canonical_admission(store_id(1), envelope, qualification))
     }
 
     fn observed_command(
@@ -778,10 +966,19 @@ mod tests {
         (envelope, retry)
     }
 
-    fn command(key: &str, digest_tag: u8, gap_start: u128) -> IngressCommand {
+    fn command_for_store(
+        store: StoreId,
+        key: &str,
+        digest_tag: u8,
+        gap_start: u128,
+    ) -> IngressCommand {
         let (envelope, retry) =
             model_parts(series_id(1), producer_id(2), key, digest_tag, gap_start);
-        IngressCommand::new(envelope, retry).expect("test command scope should match")
+        IngressCommand::new(canonical_admission(store, envelope, retry))
+    }
+
+    fn command(key: &str, digest_tag: u8, gap_start: u128) -> IngressCommand {
+        command_for_store(store_id(1), key, digest_tag, gap_start)
     }
 
     async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
@@ -811,7 +1008,7 @@ mod tests {
 
     #[test]
     fn no_active_runtime_is_a_sanitized_start_error() {
-        let mut start = Box::pin(HistorianRuntime::start());
+        let mut start = Box::pin(HistorianRuntime::start(store_id(1)));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
         let Poll::Ready(Err(error)) = start.as_mut().poll(&mut context) else {
@@ -831,7 +1028,10 @@ mod tests {
             let (open_gate, initialization_gate) = oneshot::channel();
             let mut writer_options = options(&probe, TestBehavior::Normal);
             writer_options.initialization_gate = Some(initialization_gate);
-            let mut start = Box::pin(HistorianRuntime::start_with_options(writer_options));
+            let mut start = Box::pin(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ));
 
             assert!(poll_once(start.as_mut()).await.is_pending());
             wait_until(|| probe.task_started.load(Ordering::SeqCst) == 1).await;
@@ -858,7 +1058,10 @@ mod tests {
             let (_keep_gate_open, initialization_gate) = oneshot::channel();
             let mut writer_options = options(&probe, TestBehavior::Normal);
             writer_options.initialization_gate = Some(initialization_gate);
-            let mut start = Box::pin(HistorianRuntime::start_with_options(writer_options));
+            let mut start = Box::pin(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ));
 
             assert!(poll_once(start.as_mut()).await.is_pending());
             wait_until(|| probe.task_started.load(Ordering::SeqCst) == 1).await;
@@ -875,9 +1078,12 @@ mod tests {
             let (finish_shutdown, shutdown_gate) = oneshot::channel();
             let mut writer_options = options(&probe, TestBehavior::Normal);
             writer_options.shutdown_gate = Some(shutdown_gate);
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(writer_options))
-                .await
-                .expect("writer should start");
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ))
+            .await
+            .expect("writer should start");
             let mut shutdown = Box::pin(runtime.shutdown());
 
             assert!(poll_once(shutdown.as_mut()).await.is_pending());
@@ -904,9 +1110,12 @@ mod tests {
             let (_keep_gate_open, shutdown_gate) = oneshot::channel();
             let mut writer_options = options(&probe, TestBehavior::Normal);
             writer_options.shutdown_gate = Some(shutdown_gate);
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(writer_options))
-                .await
-                .expect("writer should start");
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ))
+            .await
+            .expect("writer should start");
             let read = runtime.read_handle();
             let mut shutdown = Box::pin(runtime.shutdown());
 
@@ -928,10 +1137,10 @@ mod tests {
     fn plain_handle_drop_is_abort_only_and_non_graceful() {
         harness().block_on(async {
             let probe = Arc::new(LifecycleProbe::default());
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                &probe,
-                TestBehavior::Normal,
-            )))
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&probe, TestBehavior::Normal),
+            ))
             .await
             .expect("writer should start");
             let read = runtime.read_handle();
@@ -948,19 +1157,19 @@ mod tests {
     fn premature_writer_exits_are_distinguished() {
         harness().block_on(async {
             let before_ready_probe = Arc::new(LifecycleProbe::default());
-            let start_error = complete_bounded(HistorianRuntime::start_with_options(options(
-                &before_ready_probe,
-                TestBehavior::ExitBeforeReadiness,
-            )))
+            let start_error = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&before_ready_probe, TestBehavior::ExitBeforeReadiness),
+            ))
             .await
             .expect_err("premature startup exit must fail");
             assert_eq!(start_error, StartError::WriterExitedBeforeReadiness);
 
             let before_shutdown_probe = Arc::new(LifecycleProbe::default());
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                &before_shutdown_probe,
-                TestBehavior::ExitBeforeShutdown,
-            )))
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&before_shutdown_probe, TestBehavior::ExitBeforeShutdown),
+            ))
             .await
             .expect("readiness should precede the injected exit");
             let read = runtime.read_handle();
@@ -976,19 +1185,19 @@ mod tests {
     fn task_cancellation_maps_to_closed_errors() {
         harness().block_on(async {
             let start_probe = Arc::new(LifecycleProbe::default());
-            let start_error = complete_bounded(HistorianRuntime::start_with_options(options(
-                &start_probe,
-                TestBehavior::CancelBeforeReadiness,
-            )))
+            let start_error = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&start_probe, TestBehavior::CancelBeforeReadiness),
+            ))
             .await
             .expect_err("aborted startup writer should be cancelled");
             assert_eq!(start_error, StartError::WriterTaskCancelled);
 
             let shutdown_probe = Arc::new(LifecycleProbe::default());
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                &shutdown_probe,
-                TestBehavior::Normal,
-            )))
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&shutdown_probe, TestBehavior::Normal),
+            ))
             .await
             .expect("writer should start");
             let read = runtime.read_handle();
@@ -1009,20 +1218,20 @@ mod tests {
     fn task_panics_map_without_exposing_the_payload() {
         harness().block_on(async {
             let start_probe = Arc::new(LifecycleProbe::default());
-            let start_error = complete_bounded(HistorianRuntime::start_with_options(options(
-                &start_probe,
-                TestBehavior::PanicBeforeReadiness,
-            )))
+            let start_error = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&start_probe, TestBehavior::PanicBeforeReadiness),
+            ))
             .await
             .expect_err("writer panic must fail startup");
             assert_eq!(start_error, StartError::WriterTaskPanicked);
             assert!(!start_error.to_string().contains("hostile"));
 
             let shutdown_probe = Arc::new(LifecycleProbe::default());
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                &shutdown_probe,
-                TestBehavior::PanicBeforeShutdown,
-            )))
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&shutdown_probe, TestBehavior::PanicBeforeShutdown),
+            ))
             .await
             .expect("readiness should precede the injected panic");
             let read = runtime.read_handle();
@@ -1040,16 +1249,16 @@ mod tests {
         harness().block_on(async {
             let first_probe = Arc::new(LifecycleProbe::default());
             let second_probe = Arc::new(LifecycleProbe::default());
-            let first = complete_bounded(HistorianRuntime::start_with_options(options(
-                &first_probe,
-                TestBehavior::Normal,
-            )))
+            let first = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&first_probe, TestBehavior::Normal),
+            ))
             .await
             .expect("first writer should start");
-            let second = complete_bounded(HistorianRuntime::start_with_options(options(
-                &second_probe,
-                TestBehavior::Normal,
-            )))
+            let second = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(2),
+                options(&second_probe, TestBehavior::Normal),
+            ))
             .await
             .expect("second writer should start");
 
@@ -1070,18 +1279,18 @@ mod tests {
         harness().block_on(async {
             for _ in 0..16 {
                 let probe = Arc::new(LifecycleProbe::default());
-                let start_error = complete_bounded(HistorianRuntime::start_with_options(options(
-                    &probe,
-                    TestBehavior::ExitBeforeReadiness,
-                )))
+                let start_error = complete_bounded(HistorianRuntime::start_with_options(
+                    store_id(1),
+                    options(&probe, TestBehavior::ExitBeforeReadiness),
+                ))
                 .await
                 .expect_err("injected early exit must remain bounded");
                 assert_eq!(start_error, StartError::WriterExitedBeforeReadiness);
 
-                let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                    &probe,
-                    TestBehavior::ExitBeforeShutdown,
-                )))
+                let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                    store_id(1),
+                    options(&probe, TestBehavior::ExitBeforeShutdown),
+                ))
                 .await
                 .expect("injected post-readiness exit should start");
                 assert_eq!(
@@ -1089,10 +1298,10 @@ mod tests {
                     Err(ShutdownError::WriterExitedBeforeShutdown)
                 );
 
-                let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                    &probe,
-                    TestBehavior::Normal,
-                )))
+                let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                    store_id(1),
+                    options(&probe, TestBehavior::Normal),
+                ))
                 .await
                 .expect("normal writer should start");
                 drop(runtime);
@@ -1102,22 +1311,89 @@ mod tests {
     }
 
     #[test]
-    fn scope_mismatch_is_sanitized_recoverable_and_uses_no_slot() {
-        let ingress = HistorianIngress::new();
-        let (envelope, _) = model_parts(series_id(1), producer_id(2), "HOSTILE-RETRY-KEY", 3, 0);
-        let (_, retry) = model_parts(series_id(9), producer_id(2), "HOSTILE-RETRY-KEY", 3, 0);
-        let expected_envelope = envelope.clone();
-        let expected_retry = retry.clone();
+    fn command_round_trip_preserves_the_complete_canonical_admission() {
+        let series = SeriesMetadata::new(series_id(1), producer_id(2), CollectionMode::Sampled);
+        let envelope = CollectionEnvelope::observed(
+            series.clone(),
+            vec![observation(
+                CollectionMode::Sampled,
+                3,
+                17,
+                Some(position(1, 1)),
+                1,
+                1,
+            )],
+            Vec::new(),
+        )
+        .expect("round-trip envelope should be valid");
+        let retry = retry(&series, "round-trip", 3);
+        let expected = canonical_admission(store_id(1), envelope, retry);
+        assert_eq!(expected.observations().len(), 1);
+        assert_eq!(
+            expected.lifecycle().system().evidence_id(),
+            evidence_id(200)
+        );
+        let command = IngressCommand::new(expected.clone());
 
-        let Err(error) = IngressCommand::new(envelope, retry) else {
-            panic!("mismatched series scope must be rejected");
-        };
-        assert!(!format!("{error:?}").contains("HOSTILE"));
-        assert!(!error.to_string().contains("HOSTILE"));
-        let (recovered_envelope, recovered_retry) = error.into_parts();
-        assert_eq!(recovered_envelope, expected_envelope);
-        assert_eq!(recovered_retry, expected_retry);
+        assert_eq!(command.admission(), &expected);
+        assert_eq!(command.into_admission(), expected);
+    }
+
+    #[test]
+    fn store_mismatch_precedes_retry_and_capacity_and_recovers_exact_admission() {
+        let ingress = HistorianIngress::new(store_id(1));
+        let read = LatestReadHandle::new(ingress.shared());
+        let empty = read
+            .snapshot()
+            .expect("new latest state should be readable");
+        assert_eq!(empty.store_id(), store_id(1));
+        assert!(empty.is_empty());
+
+        let expected = command_for_store(store_id(2), "hostile-store", 7, 0).into_admission();
+        let mismatch = ingress
+            .try_submit(IngressCommand::new(expected.clone()))
+            .expect_err("another store must be rejected");
+        assert_eq!(mismatch.kind(), TrySubmitErrorKind::StoreMismatch);
+        assert_eq!(mismatch.into_command().into_admission(), expected);
         assert_eq!(ingress.test_counts(), (0, 0, 0));
+        assert_eq!(
+            read.snapshot().expect("mismatch leaves latest available"),
+            empty
+        );
+
+        for index in 0..MAX_OUTSTANDING_COMMANDS {
+            ingress
+                .try_submit(command(
+                    &format!("fill-{index}"),
+                    u8::try_from(index).expect("bounded index"),
+                    u128::try_from(index).expect("bounded index"),
+                ))
+                .expect("same-store command should fill one slot");
+        }
+        assert_eq!(ingress.test_counts(), (MAX_OUTSTANDING_COMMANDS, 16, 0));
+
+        for mismatch in [
+            command_for_store(store_id(2), "fill-0", 0, 100),
+            command_for_store(store_id(2), "fill-0", 99, 101),
+            command_for_store(store_id(2), "distinct-while-full", 99, 102),
+        ] {
+            let error = ingress
+                .try_submit(mismatch)
+                .expect_err("store mismatch must precede retry and capacity");
+            assert_eq!(error.kind(), TrySubmitErrorKind::StoreMismatch);
+            assert_eq!(
+                error.to_string(),
+                "canonical admission store does not match historian runtime"
+            );
+        }
+        assert_eq!(ingress.test_counts(), (MAX_OUTSTANDING_COMMANDS, 16, 0));
+        assert_eq!(read.snapshot().expect("refusals do not publish"), empty);
+
+        ingress.stop();
+        let closed = ingress
+            .try_submit(command_for_store(store_id(2), "closed-store", 9, 103))
+            .expect_err("closed must precede store mismatch");
+        assert_eq!(closed.kind(), TrySubmitErrorKind::Closed);
     }
 
     #[test]
@@ -1127,9 +1403,12 @@ mod tests {
             let (open_command, command_gate) = oneshot::channel();
             let mut writer_options = options(&probe, TestBehavior::Normal);
             writer_options.command_gate = Some(command_gate);
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(writer_options))
-                .await
-                .expect("writer should start");
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ))
+            .await
+            .expect("writer should start");
             let ingress = runtime.ingress();
             let receipt = ingress
                 .try_submit(command("pending", 1, 0))
@@ -1160,9 +1439,12 @@ mod tests {
             let (open_command, command_gate) = oneshot::channel();
             let mut writer_options = options(&probe, TestBehavior::Normal);
             writer_options.command_gate = Some(command_gate);
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(writer_options))
-                .await
-                .expect("writer should start");
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ))
+            .await
+            .expect("writer should start");
             let ingress = runtime.ingress();
 
             let first = ingress
@@ -1192,8 +1474,8 @@ mod tests {
             assert_eq!(full.kind(), TrySubmitErrorKind::Full);
             assert!(!format!("{full:?}").contains("seventeenth-hostile"));
             assert!(!full.to_string().contains("seventeenth-hostile"));
-            let (_, recovered_retry) = full.into_command().into_parts();
-            assert_eq!(recovered_retry.key().as_str(), "seventeenth-hostile");
+            let recovered = full.into_command().into_admission();
+            assert_eq!(recovered.retry().key().as_str(), "seventeenth-hostile");
 
             let equivalent = ingress
                 .try_submit(command("key-0", 10, 1_000))
@@ -1206,8 +1488,8 @@ mod tests {
                 .try_submit(command("key-0", 11, 2_000))
                 .expect_err("different content for an outstanding key must conflict");
             assert_eq!(conflict.kind(), TrySubmitErrorKind::RetryConflict);
-            let (_, recovered_conflict) = conflict.into_command().into_parts();
-            assert_eq!(recovered_conflict.content().sha256(), &[11; 32]);
+            let recovered_conflict = conflict.into_command().into_admission();
+            assert_eq!(recovered_conflict.retry().content().sha256(), &[11; 32]);
             assert_eq!(ingress.test_counts(), (MAX_OUTSTANDING_COMMANDS, 15, 1));
 
             open_command.send(()).expect("command gate should open");
@@ -1234,9 +1516,12 @@ mod tests {
             let (open_command, command_gate) = oneshot::channel();
             let mut writer_options = options(&probe, TestBehavior::Normal);
             writer_options.command_gate = Some(command_gate);
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(writer_options))
-                .await
-                .expect("writer should start");
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ))
+            .await
+            .expect("writer should start");
             let ingress = runtime.ingress();
             let first_receipt = ingress
                 .try_submit(command("storm", 7, 0))
@@ -1274,9 +1559,12 @@ mod tests {
             let (open_command, command_gate) = oneshot::channel();
             let mut writer_options = options(&probe, TestBehavior::Normal);
             writer_options.command_gate = Some(command_gate);
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(writer_options))
-                .await
-                .expect("writer should start");
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ))
+            .await
+            .expect("writer should start");
             let ingress = runtime.ingress();
             let original = ingress
                 .try_submit(command("window", 4, 0))
@@ -1321,9 +1609,12 @@ mod tests {
             let (open_command, command_gate) = oneshot::channel();
             let mut writer_options = options(&probe, TestBehavior::Normal);
             writer_options.command_gate = Some(command_gate);
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(writer_options))
-                .await
-                .expect("writer should start");
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ))
+            .await
+            .expect("writer should start");
             let ingress = runtime.ingress();
             let mut receipts = Vec::new();
             for tag in 1_u8..=6 {
@@ -1362,9 +1653,12 @@ mod tests {
             let (open_command, command_gate) = oneshot::channel();
             let mut writer_options = options(&probe, TestBehavior::Normal);
             writer_options.command_gate = Some(command_gate);
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(writer_options))
-                .await
-                .expect("writer should start");
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ))
+            .await
+            .expect("writer should start");
             let ingress = runtime.ingress();
             let receipt = ingress
                 .try_submit(command("cancel-wait", 8, 0))
@@ -1396,9 +1690,12 @@ mod tests {
             let mut writer_options = options(&probe, TestBehavior::Normal);
             writer_options.command_gate = Some(command_gate);
             writer_options.shutdown_gate = Some(shutdown_gate);
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(writer_options))
-                .await
-                .expect("writer should start");
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ))
+            .await
+            .expect("writer should start");
             let ingress = runtime.ingress();
             let cloned_ingress = ingress.clone();
             let mut receipts = Vec::new();
@@ -1418,7 +1715,12 @@ mod tests {
                 .expect_err("submission linearized after close must recover as closed");
             assert_eq!(closed.kind(), TrySubmitErrorKind::Closed);
             assert_eq!(
-                closed.into_command().into_parts().1.key().as_str(),
+                closed
+                    .into_command()
+                    .into_admission()
+                    .retry()
+                    .key()
+                    .as_str(),
                 "after-close-hostile"
             );
 
@@ -1451,10 +1753,10 @@ mod tests {
     fn runtime_drop_and_cancelled_shutdown_stop_unhandled_receipts() {
         harness().block_on(async {
             let handled_probe = Arc::new(LifecycleProbe::default());
-            let handled_runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                &handled_probe,
-                TestBehavior::Normal,
-            )))
+            let handled_runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&handled_probe, TestBehavior::Normal),
+            ))
             .await
             .expect("writer should start");
             let handled_receipt = handled_runtime
@@ -1478,9 +1780,12 @@ mod tests {
             let (_keep_drop_gate_closed, drop_gate) = oneshot::channel();
             let mut drop_options = options(&drop_probe, TestBehavior::Normal);
             drop_options.command_gate = Some(drop_gate);
-            let drop_runtime = complete_bounded(HistorianRuntime::start_with_options(drop_options))
-                .await
-                .expect("drop writer should start");
+            let drop_runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                drop_options,
+            ))
+            .await
+            .expect("drop writer should start");
             let drop_ingress = drop_runtime.ingress();
             let in_flight = drop_ingress
                 .try_submit(command("drop-in-flight", 2, 0))
@@ -1513,10 +1818,12 @@ mod tests {
             let (_keep_cancel_gate_closed, cancel_gate) = oneshot::channel();
             let mut cancel_options = options(&cancel_probe, TestBehavior::Normal);
             cancel_options.command_gate = Some(cancel_gate);
-            let cancel_runtime =
-                complete_bounded(HistorianRuntime::start_with_options(cancel_options))
-                    .await
-                    .expect("cancel writer should start");
+            let cancel_runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                cancel_options,
+            ))
+            .await
+            .expect("cancel writer should start");
             let cancel_ingress = cancel_runtime.ingress();
             let cancel_in_flight = cancel_ingress
                 .try_submit(command("cancel-in-flight", 5, 0))
@@ -1547,10 +1854,10 @@ mod tests {
     fn early_exit_and_panic_stop_receipts_and_remain_sanitized() {
         harness().block_on(async {
             let exit_probe = Arc::new(LifecycleProbe::default());
-            let exit_runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                &exit_probe,
-                TestBehavior::ExitWhileHandling,
-            )))
+            let exit_runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&exit_probe, TestBehavior::ExitWhileHandling),
+            ))
             .await
             .expect("early-exit writer should start");
             let exit_read = exit_runtime.read_handle();
@@ -1570,10 +1877,10 @@ mod tests {
             assert_eq!(exit_read.snapshot(), Err(LatestReadError::unavailable()));
 
             let panic_probe = Arc::new(LifecycleProbe::default());
-            let panic_runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                &panic_probe,
-                TestBehavior::PanicWhileHandling,
-            )))
+            let panic_runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&panic_probe, TestBehavior::PanicWhileHandling),
+            ))
             .await
             .expect("panic writer should report readiness first");
             let panic_read = panic_runtime.read_handle();
@@ -1602,10 +1909,12 @@ mod tests {
             let (_keep_cancel_gate_closed, cancel_gate) = oneshot::channel();
             let mut cancel_options = options(&cancel_probe, TestBehavior::Normal);
             cancel_options.command_gate = Some(cancel_gate);
-            let cancel_runtime =
-                complete_bounded(HistorianRuntime::start_with_options(cancel_options))
-                    .await
-                    .expect("cancel writer should start");
+            let cancel_runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                cancel_options,
+            ))
+            .await
+            .expect("cancel writer should start");
             let cancel_read = cancel_runtime.read_handle();
             let cancel_receipt = cancel_runtime
                 .ingress()
@@ -1637,10 +1946,12 @@ mod tests {
             let (open_poison_gate, poison_gate) = oneshot::channel();
             let mut poison_options = options(&poison_probe, TestBehavior::Normal);
             poison_options.command_gate = Some(poison_gate);
-            let poison_runtime =
-                complete_bounded(HistorianRuntime::start_with_options(poison_options))
-                    .await
-                    .expect("poison writer should start");
+            let poison_runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                poison_options,
+            ))
+            .await
+            .expect("poison writer should start");
             let poison_ingress = poison_runtime.ingress();
             let poison_read = poison_runtime.read_handle();
             let old_snapshot = poison_read
@@ -1684,12 +1995,18 @@ mod tests {
             first_options.command_gate = Some(first_gate);
             let mut second_options = options(&second_probe, TestBehavior::Normal);
             second_options.command_gate = Some(second_gate);
-            let first = complete_bounded(HistorianRuntime::start_with_options(first_options))
-                .await
-                .expect("first writer should start");
-            let second = complete_bounded(HistorianRuntime::start_with_options(second_options))
-                .await
-                .expect("second writer should start");
+            let first = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                first_options,
+            ))
+            .await
+            .expect("first writer should start");
+            let second = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                second_options,
+            ))
+            .await
+            .expect("second writer should start");
             let first_ingress = first.ingress();
             let second_ingress = second.ingress();
             let first_receipt = first_ingress
@@ -1726,7 +2043,7 @@ mod tests {
     fn repeated_hostile_ingress_sequences_remain_fixed_and_closed() {
         harness().block_on(async {
             for round in 0_u8..16 {
-                let ingress = HistorianIngress::new();
+                let ingress = HistorianIngress::new(store_id(1));
                 let first_receipt = ingress
                     .try_submit(command("repeat-0", round, 0))
                     .expect("first repeated command should queue")
@@ -1791,21 +2108,27 @@ mod tests {
         harness().block_on(async {
             let first_probe = Arc::new(LifecycleProbe::default());
             let second_probe = Arc::new(LifecycleProbe::default());
-            let first = complete_bounded(HistorianRuntime::start_with_options(options(
-                &first_probe,
-                TestBehavior::Normal,
-            )))
+            let first = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&first_probe, TestBehavior::Normal),
+            ))
             .await
             .expect("first writer should start");
-            let second = complete_bounded(HistorianRuntime::start_with_options(options(
-                &second_probe,
-                TestBehavior::Normal,
-            )))
+            let second = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(2),
+                options(&second_probe, TestBehavior::Normal),
+            ))
             .await
             .expect("second writer should start");
             let first_read = first.read_handle();
             let first_read_clone = first_read.clone();
             let second_read = second.read_handle();
+            assert_eq!(first.store_id(), store_id(1));
+            assert_eq!(first.ingress().store_id(), store_id(1));
+            assert_eq!(first_read.store_id(), store_id(1));
+            assert_eq!(second.store_id(), store_id(2));
+            assert_eq!(second.ingress().store_id(), store_id(2));
+            assert_eq!(second_read.store_id(), store_id(2));
 
             let first_empty = first_read
                 .snapshot()
@@ -1814,7 +2137,10 @@ mod tests {
             assert_eq!(first_empty.len(), 0);
             assert_eq!(first_empty.as_slice(), &[]);
             assert_eq!(first_empty.iter().count(), 0);
-            assert!(second_read.snapshot().expect("second registry").is_empty());
+            assert_eq!(first_empty.store_id(), store_id(1));
+            let second_empty = second_read.snapshot().expect("second registry");
+            assert_eq!(second_empty.store_id(), store_id(2));
+            assert!(second_empty.is_empty());
             assert_eq!(format!("{first_read:?}"), "LatestReadHandle { .. }");
 
             let receipt = first
@@ -1837,8 +2163,11 @@ mod tests {
             let published = first_read
                 .snapshot()
                 .expect("first snapshot should advance");
+            assert_eq!(published.store_id(), store_id(1));
             assert_eq!(published.len(), 1);
-            assert!(second_read.snapshot().expect("second snapshot").is_empty());
+            let second_still_empty = second_read.snapshot().expect("second snapshot");
+            assert_eq!(second_still_empty.store_id(), store_id(2));
+            assert!(second_still_empty.is_empty());
 
             drop(first);
             assert_eq!(first_read.snapshot(), Err(LatestReadError::unavailable()));
@@ -1855,7 +2184,9 @@ mod tests {
             complete_bounded(second.shutdown())
                 .await
                 .expect("second writer should seal independently");
-            assert!(second_read.snapshot().expect("sealed snapshot").is_empty());
+            let second_sealed = second_read.snapshot().expect("sealed snapshot");
+            assert_eq!(second_sealed.store_id(), store_id(2));
+            assert!(second_sealed.is_empty());
         });
     }
 
@@ -1864,10 +2195,10 @@ mod tests {
     fn producer_position_alone_selects_exact_observations_for_all_modes() {
         harness().block_on(async {
             let probe = Arc::new(LifecycleProbe::default());
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                &probe,
-                TestBehavior::Normal,
-            )))
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&probe, TestBehavior::Normal),
+            ))
             .await
             .expect("writer should start");
             let ingress = runtime.ingress();
@@ -2041,10 +2372,10 @@ mod tests {
     fn ineligible_evidence_neither_binds_metadata_nor_consumes_capacity() {
         harness().block_on(async {
             let probe = Arc::new(LifecycleProbe::default());
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                &probe,
-                TestBehavior::Normal,
-            )))
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&probe, TestBehavior::Normal),
+            ))
             .await
             .expect("writer should start");
             let ingress = runtime.ingress();
@@ -2166,10 +2497,10 @@ mod tests {
     fn equal_conflict_and_each_metadata_mismatch_fail_closed() {
         harness().block_on(async {
             let equal_probe = Arc::new(LifecycleProbe::default());
-            let equal_runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                &equal_probe,
-                TestBehavior::Normal,
-            )))
+            let equal_runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&equal_probe, TestBehavior::Normal),
+            ))
             .await
             .expect("equal-conflict writer should start");
             let equal_ingress = equal_runtime.ingress();
@@ -2243,10 +2574,10 @@ mod tests {
             .enumerate()
             {
                 let probe = Arc::new(LifecycleProbe::default());
-                let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                    &probe,
-                    TestBehavior::Normal,
-                )))
+                let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                    store_id(1),
+                    options(&probe, TestBehavior::Normal),
+                ))
                 .await
                 .expect("metadata-conflict writer should start");
                 let ingress = runtime.ingress();
@@ -2301,10 +2632,10 @@ mod tests {
     fn fixed_series_capacity_allows_existing_and_ineligible_work_then_faults() {
         harness().block_on(async {
             let probe = Arc::new(LifecycleProbe::default());
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                &probe,
-                TestBehavior::Normal,
-            )))
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                options(&probe, TestBehavior::Normal),
+            ))
             .await
             .expect("capacity writer should start");
             let ingress = runtime.ingress();
@@ -2432,9 +2763,12 @@ mod tests {
             let (open_publication, publication_gate) = oneshot::channel();
             let mut writer_options = options(&probe, TestBehavior::Normal);
             writer_options.publication_gate = Some(publication_gate);
-            let runtime = complete_bounded(HistorianRuntime::start_with_options(writer_options))
-                .await
-                .expect("gated writer should start");
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ))
+            .await
+            .expect("gated writer should start");
             let ingress = runtime.ingress();
             let read = runtime.read_handle();
             let dropped_read_clone = read.clone();
@@ -2476,6 +2810,7 @@ mod tests {
             assert_eq!(ingress.test_counts(), (1, 0, 1));
 
             let old = read.snapshot().expect("old view should be available");
+            assert_eq!(old.store_id(), store_id(1));
             assert!(old.is_empty(), "publication gate precedes atomic swap");
             let mut pending = Box::pin(first_receipt.clone().wait());
             assert!(poll_once(pending.as_mut()).await.is_pending());
@@ -2490,6 +2825,7 @@ mod tests {
             let after_receipt = read
                 .snapshot()
                 .expect("advance must precede handled receipt visibility");
+            assert_eq!(after_receipt.store_id(), store_id(1));
             assert_eq!(after_receipt.len(), 1);
             let entry = after_receipt
                 .get(&metadata.series_id())
@@ -2504,6 +2840,7 @@ mod tests {
             let sealed = read
                 .snapshot()
                 .expect("read handle should outlive shutdown");
+            assert_eq!(sealed.store_id(), store_id(1));
             assert_eq!(sealed, after_receipt);
         });
     }
@@ -2516,9 +2853,10 @@ mod tests {
                 TestBehavior::FaultAfterPublicationSwap,
             ] {
                 let probe = Arc::new(LifecycleProbe::default());
-                let runtime = complete_bounded(HistorianRuntime::start_with_options(options(
-                    &probe, behavior,
-                )))
+                let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                    store_id(1),
+                    options(&probe, behavior),
+                ))
                 .await
                 .expect("fault-injected writer should start");
                 let read = runtime.read_handle();

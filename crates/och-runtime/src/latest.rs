@@ -1,5 +1,5 @@
 use crate::ingress::IngressShared;
-use och_core::{Observation, ProducerPosition, SeriesId, SeriesMetadata};
+use och_core::{Observation, ProducerPosition, SeriesId, SeriesMetadata, StoreId};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -64,30 +64,41 @@ impl fmt::Debug for PublishedObservation {
 
 /// An immutable point-in-time view of one runtime's volatile latest registry.
 ///
-/// Cloning a snapshot is cheap and never changes its entries. A caller may retain
-/// old snapshots after later publication or failure; that caller-owned volatile
-/// memory is not runtime history, durability, or restart recovery. Entry order is
-/// unspecified and conveys no arrival or latest-order authority.
+/// The immutable store scope makes even empty or retained-old snapshots
+/// self-identifying. Cloning a snapshot is cheap and never changes its entries. A
+/// caller may retain old snapshots after later publication or failure; that
+/// caller-owned volatile memory is not runtime history, durability, or restart
+/// recovery. Entry order is unspecified and conveys no arrival or latest-order
+/// authority.
 #[derive(Clone, Eq, PartialEq)]
 pub struct LatestSnapshot {
+    store_id: StoreId,
     entries: Arc<[PublishedObservation]>,
 }
 
 impl LatestSnapshot {
-    pub(crate) fn empty() -> Self {
+    pub(crate) fn empty(store_id: StoreId) -> Self {
         Self {
+            store_id,
             entries: Arc::from([]),
         }
     }
 
-    pub(crate) fn from_entries(entries: Vec<PublishedObservation>) -> Self {
+    pub(crate) fn from_entries(store_id: StoreId, entries: Vec<PublishedObservation>) -> Self {
         Self {
+            store_id,
             entries: Arc::from(entries.into_boxed_slice()),
         }
     }
 
     pub(crate) fn shares_entries_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.entries, &other.entries)
+        self.store_id == other.store_id && Arc::ptr_eq(&self.entries, &other.entries)
+    }
+
+    /// Returns the immutable store scope of this snapshot.
+    #[must_use]
+    pub const fn store_id(&self) -> StoreId {
+        self.store_id
     }
 
     /// Returns the number of retained nominal series.
@@ -156,6 +167,12 @@ impl LatestReadHandle {
         Self { shared }
     }
 
+    /// Returns the immutable store scope of snapshots captured by this handle.
+    #[must_use]
+    pub fn store_id(&self) -> StoreId {
+        self.shared.store_id()
+    }
+
     /// Captures the complete current immutable snapshot synchronously.
     ///
     /// A reader racing an advancing publication receives either the complete old
@@ -214,9 +231,9 @@ pub(crate) struct LatestState {
 }
 
 impl LatestState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(store_id: StoreId) -> Self {
         Self {
-            current: Some(LatestSnapshot::empty()),
+            current: Some(LatestSnapshot::empty(store_id)),
             sealed: false,
         }
     }
@@ -335,7 +352,7 @@ impl PublicationPlan {
                 } else {
                     entries.push(candidate);
                 }
-                let next = LatestSnapshot::from_entries(entries);
+                let next = LatestSnapshot::from_entries(base.store_id(), entries);
                 PreparedPublication::Advance { base, next }
             }
         }
