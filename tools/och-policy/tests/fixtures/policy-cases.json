@@ -1,0 +1,112 @@
+[
+  {
+    "name": "valid shared dependency and cycle terminates",
+    "policy": { "native": ["native-a", "native-b"], "forbidden": ["forbidden-db"] },
+    "default_members": ["native-a", "native-b"],
+    "packages": [
+      { "id": "a", "name": "native-a", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "shared", "name": "shared" }] },
+      { "id": "b", "name": "native-b", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "shared", "name": "shared" }] },
+      { "id": "shared", "name": "shared", "external": true, "dependencies": [{ "package_id": "leaf", "name": "leaf" }] },
+      { "id": "leaf", "name": "leaf", "external": true, "dependencies": [{ "package_id": "shared", "name": "shared" }] }
+    ],
+    "expected": { "pass": true, "closure_packages": 4 }
+  },
+  {
+    "name": "direct forbidden dependency",
+    "policy": { "native": ["native"], "forbidden": ["forbidden-db"] },
+    "default_members": ["native"],
+    "packages": [
+      { "id": "native", "name": "native", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "bad", "name": "forbidden-db" }] },
+      { "id": "bad", "name": "forbidden-db", "external": true }
+    ],
+    "expected": { "pass": false, "message": "native -> forbidden-db" }
+  },
+  {
+    "name": "transitive forbidden dependency",
+    "policy": { "native": ["native"], "forbidden": ["forbidden-db"] },
+    "default_members": ["native"],
+    "packages": [
+      { "id": "native", "name": "native", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "middle", "name": "middle" }] },
+      { "id": "middle", "name": "middle", "external": true, "dependencies": [{ "package_id": "bad", "name": "forbidden-db" }] },
+      { "id": "bad", "name": "forbidden-db", "external": true }
+    ],
+    "expected": { "pass": false, "message": "native -> middle -> forbidden-db" }
+  },
+  {
+    "name": "renamed forbidden package identity",
+    "policy": { "native": ["native"], "forbidden": ["forbidden-db"] },
+    "default_members": ["native"],
+    "packages": [
+      { "id": "native", "name": "native", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "bad", "name": "innocent-alias" }] },
+      { "id": "bad", "name": "forbidden-db", "external": true }
+    ],
+    "expected": { "pass": false, "message": "innocent-alias (package forbidden-db)" }
+  },
+  {
+    "name": "native to adapter direction reversal",
+    "policy": { "native": ["native"], "adapters": ["adapter"] },
+    "default_members": ["native"],
+    "packages": [
+      { "id": "native", "name": "native", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "adapter", "name": "adapter" }] },
+      { "id": "adapter", "name": "adapter", "role": "adapter", "unsafe_policy": "forbid", "missing_docs_policy": "deny" }
+    ],
+    "expected": { "pass": false, "message": "native dependency direction reaches workspace adapter package `adapter`" }
+  },
+  {
+    "name": "tooling cannot enter native closure",
+    "policy": { "native": ["native"], "tools": ["tool"] },
+    "default_members": ["native"],
+    "packages": [
+      { "id": "native", "name": "native", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "tool", "name": "tool" }] },
+      { "id": "tool", "name": "tool", "role": "tooling" }
+    ],
+    "expected": { "pass": false, "message": "native dependency direction reaches workspace tooling package `tool`" }
+  },
+  {
+    "name": "adapter cannot be an implicit default",
+    "policy": { "native": ["native"], "adapters": ["adapter"] },
+    "default_members": ["native", "adapter"],
+    "packages": [
+      { "id": "native", "name": "native", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny" },
+      { "id": "adapter", "name": "adapter", "role": "adapter", "unsafe_policy": "forbid", "missing_docs_policy": "deny" }
+    ],
+    "expected": { "pass": false, "message": "adapters and tooling cannot be implicit defaults" }
+  },
+  {
+    "name": "unsafe policy absence fails closed",
+    "policy": { "native": ["native"] },
+    "default_members": ["native"],
+    "packages": [
+      { "id": "native", "name": "native", "role": "native", "missing_docs_policy": "deny" }
+    ],
+    "expected": { "pass": false, "message": "unsafe-policy = \"forbid\"" }
+  },
+  {
+    "name": "missing role metadata fails closed",
+    "policy": { "native": ["native"] },
+    "default_members": ["native"],
+    "packages": [
+      { "id": "native", "name": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny" }
+    ],
+    "expected": { "pass": false, "message": "missing a valid `package.metadata.och.role`" }
+  },
+  {
+    "name": "malformed role metadata fails closed",
+    "policy": { "native": ["native"] },
+    "default_members": ["native"],
+    "packages": [
+      { "id": "native", "name": "native", "role": "product", "unsafe_policy": "forbid", "missing_docs_policy": "deny" }
+    ],
+    "expected": { "pass": false, "message": "missing a valid `package.metadata.och.role`" }
+  },
+  {
+    "name": "forbidden prefix is enforced",
+    "policy": { "native": ["native"], "forbidden_prefixes": ["heavy-"] },
+    "default_members": ["native"],
+    "packages": [
+      { "id": "native", "name": "native", "role": "native", "unsafe_policy": "forbid", "missing_docs_policy": "deny", "dependencies": [{ "package_id": "heavy", "name": "heavy-query" }] },
+      { "id": "heavy", "name": "heavy-query", "external": true }
+    ],
+    "expected": { "pass": false, "message": "forbidden package identity `heavy-query`" }
+  }
+]

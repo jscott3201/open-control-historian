@@ -1,0 +1,31 @@
+name: PR gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Lean Linux foundation gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
+      - name: Install pinned prebuilt Cargo tools
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2, resolved 2026-08-29
+        with:
+          tool: cargo-nextest@0.9.143,cargo-deny@0.20.2
+          fallback: none
+      - name: Run the canonical PR gate
+        run: ./scripts/gate.sh pr

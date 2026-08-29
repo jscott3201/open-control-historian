@@ -1,0 +1,21 @@
+[package]
+name = "och-core"
+description = "Native dependency boundary anchor for OpenControl Historian"
+readme = "../../README.md"
+keywords = ["historian", "industrial", "opencontrol"]
+categories = ["data-structures"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata.och]
+role = "native"
+unsafe-policy = "forbid"
+missing-docs-policy = "deny"
+
+[lints]
+workspace = true

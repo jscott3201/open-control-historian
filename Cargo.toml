@@ -1,0 +1,74 @@
+[workspace]
+resolver = "3"
+members = ["crates/och-core", "tools/och-policy"]
+default-members = ["crates/och-core"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98.0"
+authors = ["OpenControl contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jscott3201/open-control-historian"
+publish = false
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+multiple_crate_versions = "allow"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
+
+# This metadata is the source of truth consumed by `och-policy`. Package roles
+# are explicit so workspace membership cannot silently make tooling or a future
+# adapter part of the default native product boundary.
+[workspace.metadata.och-policy]
+schema = 1
+native-packages = ["och-core"]
+adapter-packages = []
+tool-packages = ["och-policy"]
+forbidden-packages = [
+    "arrow",
+    "arrow-array",
+    "arrow-flight",
+    "arrow-schema",
+    "aws-config",
+    "aws-sdk-s3",
+    "azure_core",
+    "azure_storage",
+    "datafusion",
+    "heed",
+    "libsql",
+    "memmap2",
+    "object_store",
+    "parquet",
+    "prost",
+    "redb",
+    "rocksdb",
+    "rusqlite",
+    "sled",
+    "sqlx",
+    "tokio",
+    "tonic",
+]
+forbidden-package-prefixes = ["arrow-", "aws-sdk-", "azure_", "datafusion-"]
