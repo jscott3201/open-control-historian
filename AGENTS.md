@@ -18,14 +18,17 @@ declaration-authorized canonical admission record. Further `och-core` changes
 require another explicitly reviewed successor. `och-core` owns identity, exact
 value/content, time, quality/status, producer ordering, declaration lifecycle,
 source/capture provenance, collection, gap/no-change, envelope, canonical
-admission, and retry-comparison semantics. `och-runtime` owns one private writer
-task per instance, readiness, a fixed 16-command admission window, outstanding-only
-retry coalescing, shared terminal receipts, a separately fixed 16-series volatile
-registry, immutable snapshots, graceful drain/seal/join, and abort-only Drop. It
-has no persistence, durable history, query, storage, restart recovery, wire, or
-adapter behavior; it does not consume the M00-PR04 registry, declaration-bound
-envelopes, or M00-PR05 admissions and gains no declaration or admission authority.
-Published observations never imply current or held values.
+admission, and retry-comparison semantics. M02-PR01a is the reviewed runtime
+successor: each `och-runtime` instance is scoped to one explicit `StoreId`, and
+its command boundary consumes only complete M00-PR05 `CanonicalAdmission`
+evidence. `och-runtime` owns one private writer task per instance, readiness, a
+fixed 16-command admission window, outstanding-only retry coalescing, shared
+terminal receipts, a separately fixed 16-series volatile registry, store-scoped
+immutable snapshots, graceful drain/seal/join, and abort-only Drop. It does not
+consume or mutate `SeriesRegistry`, and gains no declaration-lifecycle or source
+interpretation authority. It has no persistence, durable history, query,
+storage, restart recovery, wire, or adapter behavior. Published observations
+never imply current or held values.
 
 The ignored `_roadmap/` directory is local and unpublished.
 Do not commit or push the `_roadmap/` directory to github. Preserve unrelated

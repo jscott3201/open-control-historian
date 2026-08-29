@@ -2,7 +2,7 @@ use crate::latest::{
     LatestReadError, LatestSnapshot, LatestState, PreparedPublication, PublicationFault,
     PublishedObservation,
 };
-use och_core::{CollectionEnvelope, RetryClassification, RetryQualification};
+use och_core::{CanonicalAdmission, RetryClassification, RetryQualification, StoreId};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -12,82 +12,45 @@ use tokio::sync::Notify;
 /// Maximum distinct commands that may be queued or in flight for one runtime.
 pub const MAX_OUTSTANDING_COMMANDS: usize = 16;
 
-/// One atomic envelope and its caller-supplied retry qualification.
+/// One declaration-authorized canonical admission owned by volatile ingress.
 ///
-/// Construction verifies only that the envelope and retry qualification name
-/// the same series and producer. The runtime trusts the external content
-/// identity for retry comparison; it never hashes or verifies envelope content.
+/// Core has already validated the envelope, retry scope, declaration, and source
+/// evidence. The runtime trusts the retained content identity for retry
+/// comparison; it never hashes or verifies canonical admission content.
 pub struct IngressCommand {
-    envelope: CollectionEnvelope,
-    retry: RetryQualification,
+    admission: CanonicalAdmission,
 }
 
 impl IngressCommand {
-    /// Constructs one command after verifying its series and producer scope.
-    ///
-    /// # Errors
-    ///
-    /// Returns a sanitized [`ScopeMismatchError`] retaining both inputs when
-    /// either scope component differs.
-    pub fn new(
-        envelope: CollectionEnvelope,
-        retry: RetryQualification,
-    ) -> Result<Self, ScopeMismatchError> {
-        if envelope.series().series_id() != retry.series_id()
-            || envelope.series().producer_id() != retry.producer_id()
-        {
-            return Err(ScopeMismatchError {
-                parts: Box::new((envelope, retry)),
-            });
-        }
-        Ok(Self { envelope, retry })
+    /// Constructs one command from already-authorized canonical admission.
+    #[must_use]
+    pub const fn new(admission: CanonicalAdmission) -> Self {
+        Self { admission }
     }
 
-    /// Recovers the owned envelope and retry qualification.
+    /// Borrows the complete canonical admission.
     #[must_use]
-    pub fn into_parts(self) -> (CollectionEnvelope, RetryQualification) {
-        (self.envelope, self.retry)
+    pub const fn admission(&self) -> &CanonicalAdmission {
+        &self.admission
+    }
+
+    /// Recovers the complete owned canonical admission.
+    #[must_use]
+    pub fn into_admission(self) -> CanonicalAdmission {
+        self.admission
     }
 
     fn publication_candidate(&self) -> Option<PublishedObservation> {
-        let observation = self.envelope.observations().last()?;
+        let envelope = self.admission.envelope();
+        let observation = envelope.observations().last()?;
         let position = observation.producer_position()?;
         Some(PublishedObservation::new(
-            self.envelope.series().clone(),
+            envelope.series().clone(),
             observation.clone(),
             position,
         ))
     }
 }
-
-/// A sanitized command-construction failure caused by mismatched scope.
-pub struct ScopeMismatchError {
-    parts: Box<(CollectionEnvelope, RetryQualification)>,
-}
-
-impl ScopeMismatchError {
-    /// Recovers the exact envelope and retry qualification supplied by the caller.
-    #[must_use]
-    pub fn into_parts(self) -> (CollectionEnvelope, RetryQualification) {
-        *self.parts
-    }
-}
-
-impl fmt::Debug for ScopeMismatchError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ScopeMismatchError")
-            .finish_non_exhaustive()
-    }
-}
-
-impl fmt::Display for ScopeMismatchError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("envelope and retry qualification scopes differ")
-    }
-}
-
-impl Error for ScopeMismatchError {}
 
 /// A cloneable, synchronous handle to one runtime's bounded volatile ingress.
 ///
@@ -99,10 +62,16 @@ pub struct HistorianIngress {
 }
 
 impl HistorianIngress {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(store_id: StoreId) -> Self {
         Self {
-            shared: Arc::new(IngressShared::new()),
+            shared: Arc::new(IngressShared::new(store_id)),
         }
+    }
+
+    /// Returns the immutable store scope of this ingress instance.
+    #[must_use]
+    pub fn store_id(&self) -> StoreId {
+        self.shared.store_id()
     }
 
     /// Immediately attempts to admit one owned command without waiting.
@@ -114,7 +83,7 @@ impl HistorianIngress {
     /// # Errors
     ///
     /// Returns a sanitized [`TrySubmitError`] that retains the incoming command
-    /// when admission is full, conflicting, or closed.
+    /// when its store differs or admission is full, conflicting, or closed.
     pub fn try_submit(&self, command: IngressCommand) -> Result<Submission, TrySubmitError> {
         self.shared.try_submit(command)
     }
@@ -163,7 +132,7 @@ impl fmt::Debug for HistorianIngress {
 pub enum SubmissionDisposition {
     /// The command became a new outstanding FIFO work item.
     Queued,
-    /// The incoming envelope was discarded and the first command's receipt shared.
+    /// The incoming admission was discarded and the first command's receipt shared.
     Coalesced,
 }
 
@@ -202,9 +171,11 @@ impl fmt::Debug for Submission {
     }
 }
 
-/// The closed reason an immediate submission was rejected.
+/// The reason an immediate submission was rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrySubmitErrorKind {
+    /// The canonical admission belongs to a different store authority.
+    StoreMismatch,
     /// All 16 distinct slots are outstanding.
     Full,
     /// The same retry scope and key are outstanding with different content identity.
@@ -227,7 +198,7 @@ impl TrySubmitError {
         }
     }
 
-    /// Returns the closed rejection reason.
+    /// Returns the rejection reason.
     #[must_use]
     pub const fn kind(&self) -> TrySubmitErrorKind {
         self.kind
@@ -252,6 +223,9 @@ impl fmt::Debug for TrySubmitError {
 impl fmt::Display for TrySubmitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self.kind {
+            TrySubmitErrorKind::StoreMismatch => {
+                "canonical admission store does not match historian runtime"
+            }
             TrySubmitErrorKind::Full => "historian ingress is full",
             TrySubmitErrorKind::RetryConflict => {
                 "retry qualification conflicts with outstanding work"
@@ -384,16 +358,22 @@ impl TerminalNotifications {
 }
 
 pub(crate) struct IngressShared {
+    store_id: StoreId,
     state: Mutex<IngressState>,
     notify: Notify,
 }
 
 impl IngressShared {
-    fn new() -> Self {
+    fn new(store_id: StoreId) -> Self {
         Self {
-            state: Mutex::new(IngressState::new()),
+            store_id,
+            state: Mutex::new(IngressState::new(store_id)),
             notify: Notify::new(),
         }
+    }
+
+    pub(crate) const fn store_id(&self) -> StoreId {
+        self.store_id
     }
 
     fn try_submit(&self, command: IngressCommand) -> Result<Submission, TrySubmitError> {
@@ -414,8 +394,16 @@ impl IngressShared {
             return Err(TrySubmitError::new(TrySubmitErrorKind::Closed, command));
         }
 
+        if command.admission.store_id() != self.store_id {
+            drop(state);
+            return Err(TrySubmitError::new(
+                TrySubmitErrorKind::StoreMismatch,
+                command,
+            ));
+        }
+
         for slot in state.slots.iter().flatten() {
-            match slot.qualification.classify(&command.retry) {
+            match slot.qualification.classify(command.admission.retry()) {
                 RetryClassification::Equivalent => {
                     let receipt = Receipt {
                         terminal: Arc::clone(&slot.terminal),
@@ -458,7 +446,7 @@ impl IngressShared {
             return Err(TrySubmitError::new(TrySubmitErrorKind::Closed, command));
         }
 
-        let qualification = command.retry.clone();
+        let qualification = command.admission.retry().clone();
         let terminal = Arc::new(ReceiptTerminal::new());
         state.slots[slot_index] = Some(Slot {
             qualification,
@@ -767,7 +755,8 @@ impl InFlightCommand {
         self.command
             .as_ref()
             .expect("in-flight command should exist before completion")
-            .retry
+            .admission
+            .retry()
             .content()
             .sha256()[0]
     }
@@ -810,14 +799,14 @@ struct IngressState {
 }
 
 impl IngressState {
-    fn new() -> Self {
+    fn new(store_id: StoreId) -> Self {
         let mut slots = Vec::with_capacity(MAX_OUTSTANDING_COMMANDS);
         slots.resize_with(MAX_OUTSTANDING_COMMANDS, || None);
         Self {
             closed: false,
             slots,
             queue: FixedQueue::new(),
-            latest: LatestState::new(),
+            latest: LatestState::new(store_id),
         }
     }
 

@@ -20,25 +20,27 @@ content-qualified retry contracts described in the
 oracle for both the original model and series lifecycle, public-model adapter
 comparison, and checked-in schema-v1 ASCII golden
 ledger under [`crates/och-core/tests/`](crates/och-core/tests/).
-`och-runtime` adds async startup-after-readiness, one private writer, a synchronous
-fixed 16-command ingress, outstanding-only retry coalescing/conflict rejection,
-shared terminal receipts, and a separately fixed 16-series runtime-local volatile
-latest registry. Cloneable synchronous read handles capture immutable snapshots;
+`och-runtime` adds async startup-after-readiness, one explicit immutable store
+scope, one private writer, a synchronous fixed 16-command ingress that accepts
+only complete `CanonicalAdmission` evidence, outstanding-only retry
+coalescing/conflict rejection, shared terminal receipts, and a separately fixed
+16-series runtime-local volatile latest registry. Cloneable synchronous read
+handles capture store-scoped immutable snapshots;
 graceful shutdown drains, seals the final registry, and joins, while Drop remains
 nonblocking and abort-only on the caller's active Tokio executor. `WriterHandled`
 means the writer consumed the command and completed its publication decision;
 ineligible and stale commands remain handled no-ops. Published exact observations
 are not current/held values and prove no storage, persistence, durable history,
 query result, restart recovery, wire format, or adapter behavior. The volatile
-runtime deliberately does not consume the series registry, declaration-bound
-envelopes, or canonical admissions and gains no lifecycle or admission authority.
+runtime never consumes or mutates the series registry and gains no declaration,
+source-interpretation, persistence, or durability authority.
 
 The current workspace contains:
 
 | Package | Role | Purpose |
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model, bounded series declaration authority, and a measurement-only example |
-| [`och-runtime`](crates/och-runtime/) | native | Caller-executor writer, bounded ingress, and volatile immutable latest snapshots |
+| [`och-runtime`](crates/och-runtime/) | native | Store-scoped caller-executor writer, canonical-admission ingress, and volatile immutable latest snapshots |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
 `och-core` has no dependencies. `och-runtime` depends inward on `och-core`; the
@@ -101,7 +103,10 @@ through nextest rather than being repeated with `cargo test`.
   then-required pre-M02 source/capture successor, and explicit deferred ledger.
 - [M00-PR05 source/capture crosswalk record](docs/continuation-m00-pr05.md)
   records the pinned Studio field crosswalk, bounded canonical admission contract,
-  M02-PR01 input boundary, and remaining deferred ledger.
+  original M02-PR01 input boundary, and remaining deferred ledger.
+- [M02-PR01a canonical-admission runtime record](docs/continuation-m02-pr01a.md)
+  records the store-scoped runtime authority transition, exact volatile proof,
+  accepted durable-journal split, and remaining M02 hard boundary.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

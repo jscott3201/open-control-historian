@@ -8,7 +8,9 @@ explicit reviewed successor for store identity, bounded series declaration
 revision/retirement authority, historical resolution, and registry-issued active
 envelope binding. M00-PR05 is the reviewed successor for source projection,
 capture/batch provenance, and the final bounded declaration-authorized canonical
-admission record. All pre-existing exact value, time, quality, order, collection,
+admission record. M02-PR01a changes no core model: it consumes that final record
+as the only runtime command input and scopes each runtime/latest view to one
+explicit `StoreId`. All pre-existing exact value, time, quality, order, collection,
 gap/no-change, envelope, and retry semantics remain unchanged. The model is native
 Historian authority rather than a serialization of a Studio, Engine, transport,
 or persistence schema. Future adapters must preserve supported values exactly and
@@ -111,10 +113,11 @@ All registry refusal paths preserve equality with the pre-call state. Registry
 iteration and snapshots order series by nominal `SeriesId` and declarations by
 revision.
 
-The current `och-runtime` does not consume `SeriesRegistry`,
-`DeclaredCollectionEnvelope`, or `CanonicalAdmission`. Its existing volatile `SeriesMetadata` equality
-check remains a read-optimization invariant only and gains no declaration,
-historical, or durable-admission authority.
+`och-runtime` consumes only complete `CanonicalAdmission` values; it does not
+consume or mutate `SeriesRegistry` or accept `DeclaredCollectionEnvelope`
+directly. Its volatile `SeriesMetadata` equality check remains a read-optimization
+invariant only and gains no declaration, historical, or durable-admission
+authority.
 
 ## Source/capture provenance and canonical admission
 
@@ -164,9 +167,14 @@ immutable evidence. Source transport redelivery and both source idempotency
 records remain evidence only and are never derived from, equated with, or used to
 classify `RetryQualification`.
 
-`CanonicalAdmission` is the exact native semantic input that M02-PR01 may encode.
-It defines no frame, codec, persistence, group commit, receipt, recovery, or
-adapter behavior. A future adapter may split one Studio batch into per-series
+`CanonicalAdmission` is the exact native semantic input accepted by the
+store-scoped M02-PR01a runtime and the only semantic record M02-PR01b may encode.
+`IngressCommand` adds no bypass constructor or second validation authority: it
+owns one admission, retry coalescing reads `admission.retry()`, and volatile
+publication reads `admission.envelope()`. The runtime rejects a foreign StoreId
+after closed-state precedence and before retry/capacity without mutating slots or
+latest state. It defines no frame, codec, persistence, group commit, durable
+receipt, recovery, or adapter behavior. A future adapter may split one Studio batch into per-series
 admissions by copying the shared lifecycle and preserving original ordinals;
 cross-series atomicity and active binding uniqueness are deliberately absent.
 

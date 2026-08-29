@@ -5,9 +5,10 @@
 M00 established the reviewed dependency-free canonical model. M01-PR01 added a
 separate native lifecycle root, M01-PR02 connected it inward through bounded
 volatile ingress, and M01-PR03 added bounded runtime-local latest publication.
-M00-PR04 added bounded canonical series declaration authority, and M00-PR05 adds
-bounded source/capture provenance and canonical admission without wiring either
-successor into the volatile runtime:
+M00-PR04 added bounded canonical series declaration authority, M00-PR05 added
+bounded source/capture provenance and canonical admission, and M02-PR01a wires
+only that complete admission evidence into an explicitly store-scoped volatile
+runtime:
 
 ```text
 default workspace selection
@@ -15,9 +16,9 @@ default workspace selection
         v
   och-core (native) <---- och-runtime (native)       och-policy (tooling)
   canonical model         caller-owned executor      cargo_metadata + parsing
-  series + admission      volatile bare envelopes
+  series + admission      canonical admissions
   no dependencies         one writer + 16 slots      support
-                          16 published series
+                          store-scoped latest
                                    |
                                    v
                            tokio rt + sync only
@@ -35,26 +36,31 @@ comparison. It retains no product dependencies. Its only executable remains a
 baseline example used to verify buildability and measure a native binary bound;
 that example is not a runtime or supported product command.
 
-[`och-runtime`](../crates/och-runtime/) owns async writer lifecycle, one fixed
-volatile admission window, and one fixed volatile latest registry per instance.
-Its public runtime starts one private task on the caller's active Tokio executor
-and returns after private state, ingress, and an empty latest view are ready. A
-custom cloneable ingress synchronously admits at most 16 outstanding distinct
-commands, including in-flight work, and exposes no Tokio type. Exact core retry
-classification coalesces only equivalent outstanding work; conflicts, full
-capacity, and closure recover the incoming command. A separate synchronous read
-handle captures immutable snapshots of at most 16 nominal series. Multiple
-runtimes are independent; there is no global singleton, restart path, or exposed
-writer state. Tokio remains admitted only on the direct runtime edge with default
-features disabled and `rt` plus `sync` enabled.
+[`och-runtime`](../crates/och-runtime/) owns async writer lifecycle, one immutable
+`StoreId`, one fixed volatile admission window, and one fixed volatile latest
+registry per instance. Its public runtime starts one private task on the caller's
+active Tokio executor and returns after private state, store-scoped ingress, and
+an empty store-scoped latest view are ready. `IngressCommand` owns exactly one
+already-authorized `CanonicalAdmission`; there is no bare-envelope command path.
+A custom cloneable ingress synchronously admits at most 16 outstanding distinct
+commands, including in-flight work, and exposes no Tokio type. Closed state takes
+precedence, then a foreign store is recoverably refused before retry comparison
+or capacity. Exact core retry classification coalesces only equivalent
+outstanding work; conflicts, full capacity, and closure recover the complete
+incoming command. A separate synchronous read handle captures immutable
+store-scoped snapshots of at most 16 nominal series. Multiple runtimes, including
+ones for different stores, are independent; there is no global singleton,
+restart path, or exposed writer state. Tokio remains admitted only on the direct
+runtime edge with default features disabled and `rt` plus `sync` enabled.
 
-The runtime continues to accept ordinary `CollectionEnvelope` values and has no
-`SeriesRegistry` or `DeclaredCollectionEnvelope` input. Its exact
-`SeriesMetadata` bind is only a volatile latest-publication invariant. It neither
-authorizes a declaration revision nor makes an envelope eligible for future
-durable admission. Producer or collection-mode corrections accepted by the
-canonical registry therefore have no effect on a running volatile registry; a
-future explicitly reviewed integration must consume registry-issued bindings.
+The runtime neither consumes nor mutates `SeriesRegistry`; core remains the sole
+declaration and source-admission authority. Retry classification reads the
+admission's exact `RetryQualification`, while volatile publication reads only its
+validated envelope. The exact `SeriesMetadata` bind remains a runtime-local read
+optimization invariant and cannot authorize a declaration or reinterpret an old
+revision. Source/declaration evidence stays owned by the command until terminal
+completion or recoverable rejection. This transition defines no journal bytes or
+durable acceptance.
 
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`
@@ -115,9 +121,9 @@ One short private synchronous mutex linearizes submission, snapshot capture,
 publication swap, terminal receipt assignment, slot release, stop, and shutdown;
 no guard crosses an await. A fixed slot table and FIFO index ring bound queued plus
 in-flight distinct work at 16. Equivalent retries share one fixed terminal state
-and do not retain the duplicate envelope. Retry comparison precedes the full
-check, but closure takes precedence once graceful shutdown has atomically closed
-admission. The retry window ends at terminal completion and has no durable horizon.
+and do not retain the duplicate admission. Closure takes precedence, then the
+exact runtime StoreId is enforced before retry comparison and the full check. The
+retry window ends at terminal completion and has no durable horizon.
 
 Only an envelope with at least one observation and explicit positions on all its
 observations is publication-eligible. Core validation makes the final observation
@@ -145,7 +151,7 @@ close admission, single-assign every unresolved receipt to `WriterStopped`, and
 make future snapshot capture unavailable; snapshots acquired earlier remain
 immutable. Handled state cannot be overwritten. Caller-supplied content identity
 is trusted only for core retry classification and is never recomputed from
-envelope content.
+admission or envelope content.
 
 ## Intentionally absent
 
@@ -164,4 +170,6 @@ recorded by [M01-PR03](continuation-m01-pr03.md).
 The canonical declaration transition and its pre-M02 hard stop are recorded by
 [M00-PR04](continuation-m00-pr04.md). The accepted source/capture crosswalk and
 exact future journal input boundary are recorded by
-[M00-PR05](continuation-m00-pr05.md).
+[M00-PR05](continuation-m00-pr05.md). The store-scoped canonical-admission runtime
+transition and accepted split before journal bytes are recorded by
+[M02-PR01a](continuation-m02-pr01a.md).
