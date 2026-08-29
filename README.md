@@ -1,21 +1,24 @@
 # OpenControl Historian
 
-OpenControl Historian is at its foundation stage. This repository currently
-proves a small Rust workspace and an enforceable native dependency boundary; it
-does **not** yet provide Historian behavior.
+OpenControl Historian is at its canonical-model stage. This repository provides
+a small Rust workspace, an enforceable native dependency boundary, and the
+dependency-free canonical Historian data model. It does **not** yet provide a
+Historian runtime or storage behavior.
 
 ## Current status
 
-There is no canonical observation model, identity/value/time/quality contract,
-runtime, storage engine, persistence format, query layer, or adapter. Those
-capabilities must not be inferred from the project name or the baseline example.
-M00-PR02 is reserved for the first semantic model work.
+`och-core` now defines the canonical identity, exact value/content, timestamp,
+quality/status, producer-order, collection-mode, gap/no-change, atomic envelope,
+and content-qualified retry contracts described in the
+[model contract](docs/model-contract.md). There is still no runtime, storage
+engine, persistence or wire format, query layer, or adapter. Those absent
+capabilities must not be inferred from the model or the baseline example.
 
 The current workspace contains:
 
 | Package | Role | Purpose |
 | --- | --- | --- |
-| [`och-core`](crates/och-core/) | native | Empty product-boundary anchor and a measurement-only example |
+| [`och-core`](crates/och-core/) | native | Dependency-free canonical model and a measurement-only example |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
 `och-core` has no product dependencies. `och-policy` and its dependencies are
@@ -49,16 +52,22 @@ through nextest rather than being repeated with `cargo test`.
 
 ## Design boundaries
 
-- [Architecture](docs/architecture.md) describes the current package roles and
-  intentionally absent components.
+- [Architecture](docs/architecture.md) describes the current package roles,
+  canonical model boundary, and intentionally absent components.
+- [Canonical model contract](docs/model-contract.md) records the exact public
+  semantics, bounds, validation, and non-goals.
 - [Dependency policy](docs/dependency-policy.md) explains the executable native
   closure law and how future adapters must point inward.
-- [Foundation implementation brief](docs/implementation-brief.md) records this
-  slice's scope and acceptance evidence.
+- [M00-PR02 implementation brief](docs/implementation-brief-m00-pr02.md) records
+  this model slice's scope and acceptance evidence.
+- [Foundation implementation brief](docs/implementation-brief.md) remains the
+  historical M00-PR01 record.
 - [Baseline](docs/baseline.md) records the initial dependency and binary-size
   evidence without inventing runtime measurements.
-- [M00-PR02 continuation](docs/continuation-m00-pr02.md) preserves the semantic
-  authority boundary for the next delivery.
+- [M00-PR03 continuation](docs/continuation-m00-pr03.md) defines the independent
+  oracle, golden, and fixture-builder handoff.
+- [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
+  handoff into this model delivery.
 
 Contributor workflow is in [CONTRIBUTING.md](CONTRIBUTING.md), and automation or
 coding-agent constraints are in [AGENTS.md](AGENTS.md).

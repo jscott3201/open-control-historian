@@ -12,14 +12,17 @@ from urllib.parse import unquote
 ROOT = Path(__file__).resolve().parent.parent
 MAX_FILE_BYTES = 1_048_576
 REQUIRED_TEXT = {
-    "README.md": ("no canonical observation model", "cargo nextest"),
+    "README.md": ("canonical Historian data model", "cargo nextest"),
     "CONTRIBUTING.md": ("cargo nextest", "test --workspace --doc --locked"),
-    "AGENTS.md": ("_roadmap/", "M00-PR02"),
-    "docs/architecture.md": ("native", "adapter", "tooling"),
+    "AGENTS.md": ("_roadmap/", "M00-PR03"),
+    "docs/architecture.md": ("native", "adapter", "tooling", "canonical model"),
     "docs/dependency-policy.md": ("package identity", "default-members"),
     "docs/implementation-brief.md": ("M00-PR01", "foundation"),
+    "docs/implementation-brief-m00-pr02.md": ("M00-PR02", "canonical model"),
+    "docs/model-contract.md": ("UUIDv7", "CollectionEnvelope", "256", "64"),
     "docs/baseline.md": ("Idle RSS", "N/A"),
     "docs/continuation-m00-pr02.md": ("M00-PR02", "semantic"),
+    "docs/continuation-m00-pr03.md": ("M00-PR03", "independent oracle"),
 }
 SECRET_PATTERNS = {
     "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),

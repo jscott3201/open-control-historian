@@ -4,10 +4,12 @@ These instructions apply to the entire repository.
 
 ## Current authority boundary
 
-This workspace proves only the M00-PR01 foundation. It has no Historian semantic
-model, runtime, storage, persistence, query, or adapter implementation. M00-PR02
-owns canonical identity, value, time, quality, ordering, collection, and gap
-semantics. Do not invent those APIs in foundation work.
+This workspace proves the M00-PR01 foundation and M00-PR02 dependency-free
+canonical Historian model. `och-core` owns reviewed identity, exact value/content,
+time, quality/status, producer ordering, collection, gap/no-change, envelope, and
+retry-comparison semantics. It has no runtime, storage, persistence, wire, query,
+or adapter implementation. M00-PR03 owns independent oracle, golden, and fixture
+evidence; do not silently change the model while building that evidence.
 
 The ignored `_roadmap/` directory is local and unpublished. Do not read, edit,
 stage, copy, summarize, or publish it. Do not read PDF files. Preserve unrelated
@@ -28,8 +30,8 @@ public documentation.
 
 Do not introduce Tokio, Arrow, Parquet, DataFusion, Flight, tonic/prost, SQLx,
 PostgreSQL, object/cloud providers, embedded databases, memory mapping, Studio,
-Engine, or donor code in this foundation. A dependency needed only by a policy
-or build check belongs under `tools/`, not in a native crate.
+Engine, or donor code into the native model. A dependency needed only by a
+policy or build check belongs under `tools/`, not in a native crate.
 
 ## Required workflow
 
@@ -47,6 +49,6 @@ fresh advisories, clean feature configurations, and baseline work belong to the
 manual/release-cycle workflow.
 
 Comments and docs should explain why a constraint exists and who owns future
-behavior. Do not add speculative abstractions, empty crates, semantic types, or
-compatibility claims. Do not publish crates or mutate remote repository state
-unless a separate owner instruction explicitly authorizes it.
+behavior. Do not add speculative abstractions, empty crates, unreviewed semantic
+types, or compatibility claims. Do not publish crates or mutate remote repository
+state unless a separate owner instruction explicitly authorizes it.

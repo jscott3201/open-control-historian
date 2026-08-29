@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Measure the deliberately tiny native anchor without claiming runtime behavior.
+# Measure the deliberately tiny native example without claiming runtime behavior.
 set -euo pipefail
 
 readonly ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,7 +71,7 @@ PY
 )"
 
 if [[ "${closure_packages}" != "1" ]]; then
-    echo "native closure contains ${closure_packages} packages; expected foundation baseline is 1" >&2
+    echo "native closure contains ${closure_packages} packages; expected native baseline is 1" >&2
     exit 1
 fi
 
@@ -84,5 +84,5 @@ fi
     echo "native closure packages: ${closure_packages}"
     echo "baseline executable bytes: ${binary_bytes}"
     echo "baseline executable limit bytes: ${MAX_BINARY_BYTES}"
-    echo "idle RSS: N/A (the anchor has no long-running process to measure)"
+    echo "idle RSS: N/A (the measurement example has no long-running process to measure)"
 } | tee "${OUTPUT_FILE}"

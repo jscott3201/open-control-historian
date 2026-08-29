@@ -1,6 +1,6 @@
 [package]
 name = "och-core"
-description = "Native dependency boundary anchor for OpenControl Historian"
+description = "Dependency-free canonical model for OpenControl Historian"
 readme = "../../README.md"
 keywords = ["historian", "industrial", "opencontrol"]
 categories = ["data-structures"]
