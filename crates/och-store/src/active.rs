@@ -123,6 +123,7 @@ pub struct ActiveJournalConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveryPolicy {
     Converge,
+    ManifestGenesis,
     Strict,
 }
 
@@ -173,6 +174,11 @@ impl ActiveJournalConfig {
 
     pub(crate) fn manifest_create(mut self) -> Self {
         self.recovery_policy = RecoveryPolicy::Strict;
+        self
+    }
+
+    pub(crate) fn manifest_genesis(mut self) -> Self {
+        self.recovery_policy = RecoveryPolicy::ManifestGenesis;
         self
     }
 
@@ -577,6 +583,11 @@ impl ActiveJournal {
         if journal_len < JOURNAL_V1_HEADER_LEN as u64 || journal_len > limits.active_bytes {
             return Err(ActiveJournalError::InvalidLayout);
         }
+        if recovery_policy == RecoveryPolicy::ManifestGenesis
+            && journal_len != JOURNAL_V1_HEADER_LEN as u64
+        {
+            return Err(ActiveJournalError::InvalidLayout);
+        }
         let mut header_bytes = [0_u8; JOURNAL_V1_HEADER_LEN];
         journal
             .read_exact(&mut header_bytes)
@@ -588,7 +599,7 @@ impl ActiveJournal {
         let (checkpoint, mut initialized_state) = match open_artifact(checkpoint_path) {
             Ok(checkpoint) => (checkpoint, None),
             Err(ActiveJournalError::MissingArtifact)
-                if recovery_policy == RecoveryPolicy::Converge
+                if recovery_policy != RecoveryPolicy::Strict
                     && journal_len == JOURNAL_V1_HEADER_LEN as u64 =>
             {
                 let checkpoint = create_artifact(checkpoint_path)?;
@@ -603,7 +614,7 @@ impl ActiveJournal {
             .map_err(|error| io_error(StoreIoOperation::Metadata, error))?
             .len();
         if checkpoint_len == 0
-            && recovery_policy == RecoveryPolicy::Converge
+            && recovery_policy != RecoveryPolicy::Strict
             && journal_len == JOURNAL_V1_HEADER_LEN as u64
         {
             if initialized_state.is_none() {
@@ -621,6 +632,11 @@ impl ActiveJournal {
             Some(state) => Some(state),
             None => read_checkpoint(&checkpoint, identity, sequence_floor, journal_len)?,
         };
+        if recovery_policy == RecoveryPolicy::ManifestGenesis
+            && checkpoint_state != Some(genesis_checkpoint_state(sequence_floor))
+        {
+            return Err(ActiveJournalError::InvalidLayout);
+        }
         if checkpoint_state.is_none() && journal_len != JOURNAL_V1_HEADER_LEN as u64 {
             return Err(ActiveJournalError::InvalidLayout);
         }
@@ -1083,6 +1099,69 @@ fn open_artifact(path: &Path) -> Result<File, ActiveJournalError> {
         })
 }
 
+/// Proves an existing premanifest active pair is an exact current genesis
+/// without acquiring its writer lock or changing either artifact.
+pub(crate) fn preflight_manifest_genesis(
+    directory: &Path,
+    store_id: StoreId,
+) -> Result<(), ActiveJournalError> {
+    let identity = JournalIdentity {
+        store_id,
+        generation: ACTIVE_JOURNAL_GENERATION,
+    };
+    let journal_path = directory.join(ACTIVE_JOURNAL_FILE_NAME);
+    let mut journal = File::open(&journal_path).map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            ActiveJournalError::MissingArtifact
+        } else {
+            io_error(StoreIoOperation::OpenArtifact, error)
+        }
+    })?;
+    if journal
+        .metadata()
+        .map_err(|error| io_error(StoreIoOperation::Metadata, error))?
+        .len()
+        != JOURNAL_V1_HEADER_LEN as u64
+    {
+        return Err(ActiveJournalError::InvalidLayout);
+    }
+    let mut header = [0_u8; JOURNAL_V1_HEADER_LEN];
+    journal
+        .read_exact(&mut header)
+        .map_err(|error| io_error(StoreIoOperation::Read, error))?;
+    if JournalHeaderV1::decode(&header)?.store_id() != store_id {
+        return Err(ActiveJournalError::StoreMismatch);
+    }
+
+    let checkpoint_path = directory.join(ACTIVE_CHECKPOINT_FILE_NAME);
+    let mut checkpoint = match File::open(&checkpoint_path) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error(StoreIoOperation::OpenArtifact, error)),
+    };
+    let checkpoint_len = checkpoint
+        .metadata()
+        .map_err(|error| io_error(StoreIoOperation::Metadata, error))?
+        .len();
+    if checkpoint_len == 0 {
+        return Ok(());
+    }
+    if checkpoint_len != CHECKPOINT_FILE_LEN as u64 {
+        return Err(ActiveJournalError::InvalidLayout);
+    }
+    let mut bytes = [0_u8; CHECKPOINT_FILE_LEN];
+    checkpoint
+        .read_exact(&mut bytes)
+        .map_err(|error| io_error(StoreIoOperation::Read, error))?;
+    let expected = encode_checkpoint(identity, genesis_checkpoint_state(0));
+    if bytes[..CHECKPOINT_SLOT_LEN] != expected
+        || bytes[CHECKPOINT_SLOT_LEN..].iter().any(|byte| *byte != 0)
+    {
+        return Err(ActiveJournalError::InvalidLayout);
+    }
+    Ok(())
+}
+
 fn lock_journal(file: &File) -> Result<(), ActiveJournalError> {
     file.try_lock().map_err(|error| match error {
         std::fs::TryLockError::WouldBlock => ActiveJournalError::AlreadyOpen,
@@ -1099,11 +1178,7 @@ fn initialize_checkpoint(
     checkpoint
         .set_len(CHECKPOINT_FILE_LEN as u64)
         .map_err(|error| io_error(StoreIoOperation::Write, error))?;
-    let state = CheckpointState {
-        slot_generation: 1,
-        append_sequence: sequence_floor,
-        end_offset: JOURNAL_V1_HEADER_LEN as u64,
-    };
+    let state = genesis_checkpoint_state(sequence_floor);
     write_checkpoint_slot(checkpoint, identity, state)?;
     checkpoint
         .sync_all()
@@ -1112,6 +1187,14 @@ fn initialize_checkpoint(
         .sync_all()
         .map_err(|error| io_error(StoreIoOperation::SyncDirectory, error))?;
     Ok(state)
+}
+
+const fn genesis_checkpoint_state(sequence_floor: u64) -> CheckpointState {
+    CheckpointState {
+        slot_generation: 1,
+        append_sequence: sequence_floor,
+        end_offset: JOURNAL_V1_HEADER_LEN as u64,
+    }
 }
 
 fn write_checkpoint_slot(

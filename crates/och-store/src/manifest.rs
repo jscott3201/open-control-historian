@@ -2,6 +2,7 @@
 
 use crate::active::{
     ActiveJournal, ActiveJournalConfig, active_checkpoint_file_name, active_journal_file_name,
+    preflight_manifest_genesis,
 };
 use crate::codec::{
     Cursor, Encoder, crc32c, decode_declaration, decode_declaration_evidence, encode_declaration,
@@ -691,7 +692,9 @@ impl ManifestStore {
         let active_config = if strict_create {
             active_config.manifest_create()
         } else {
-            active_config
+            preflight_manifest_genesis(&config.directory, config.store_id)
+                .map_err(map_manifest_genesis_preflight)?;
+            active_config.manifest_genesis()
         };
         let journal = ActiveJournal::open(active_config)?;
         if !journal.recovered_records().is_empty()
@@ -3604,6 +3607,14 @@ fn declaration_matches(
 
 fn invalid_registry_journal(_: JournalV1Error) -> ManifestStoreError {
     ManifestStoreError::InvalidRegistry
+}
+
+fn map_manifest_genesis_preflight(error: ActiveJournalError) -> ManifestStoreError {
+    if matches!(error, ActiveJournalError::Io(_)) {
+        ManifestStoreError::Active(error)
+    } else {
+        ManifestStoreError::UnsupportedStoreFormat
+    }
 }
 
 fn manifest_io(operation: ManifestIoOperation, error: &std::io::Error) -> ManifestStoreError {

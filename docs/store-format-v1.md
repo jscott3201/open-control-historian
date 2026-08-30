@@ -41,6 +41,14 @@ journal carries Journal Header V1, and every retry artifact is the always-extend
 Retry State V1 layout. A forged valid marker paired with historical, malformed,
 or mixed artifacts is unsupported.
 
+When no manifest exists but the generation-one active journal does, a separate
+read-only proof runs before the active-journal writer lock. The journal must be
+exactly the 28-byte current header with the configured `StoreId` and no suffix.
+Its checkpoint must be absent, zero-length, or the exact canonical generation-one
+genesis slot followed by the zero alternate slot. Any suffix, non-genesis cutoff,
+foreign scope, malformed/trailing checkpoint, or ambiguous slot refuses unchanged;
+only the absent and zero-length checkpoint cases may then be initialized.
+
 After preflight, the stable lock is acquired and inventory and marker validation
 are repeated. Only current genesis publication, current reusable-slot cleanup,
 and the narrow existing rotation transaction may mutate. A rejected directory is

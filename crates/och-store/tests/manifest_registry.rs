@@ -10,8 +10,9 @@ use och_core::{
     SeriesRegistryLimits, Timestamp, ValueFamily,
 };
 use och_store::{
-    ACTIVE_JOURNAL_FILE_NAME, ActiveJournalLimits, ActiveJournalOpenMode, AppendSequenceV1,
-    JOURNAL_V1_HEADER_LEN, JournalHeaderV1, MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME,
+    ACTIVE_CHECKPOINT_FILE_NAME, ACTIVE_JOURNAL_FILE_NAME, ActiveJournal, ActiveJournalConfig,
+    ActiveJournalLimits, ActiveJournalOpenMode, AppendSequenceV1, JOURNAL_V1_HEADER_LEN,
+    JournalHeaderV1, MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME,
     MANIFEST_STAGING_FILE_NAME, MAX_ADMISSION_PAYLOAD_V1, ManifestStore, ManifestStoreConfig,
     ManifestStoreError, PendingRetryOutcome, PreparedAdmissionV1, REGISTRY_SLOT_0_FILE_NAME,
     REGISTRY_STAGING_FILE_NAME, RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME,
@@ -158,6 +159,30 @@ fn install_format_marker(directory: &TestDirectory) {
         manifest_oracle::store_format_v1(support::uuid_bytes(1)),
     )
     .expect("install forged current marker fixture");
+}
+
+fn create_active_genesis(directory: &TestDirectory) -> ActiveJournal {
+    ActiveJournal::open(
+        ActiveJournalConfig::new(
+            directory.path().to_path_buf(),
+            support::store_id(1),
+            ActiveJournalOpenMode::CreateNew,
+            journal_limits(),
+        )
+        .expect("active genesis config"),
+    )
+    .expect("create active genesis")
+}
+
+fn assert_premanifest_checkpoint_refuses(name: &str, mutate: impl FnOnce(&mut Vec<u8>)) {
+    let directory = TestDirectory::new(name);
+    drop(create_active_genesis(&directory));
+    let checkpoint_path = directory.path().join(ACTIVE_CHECKPOINT_FILE_NAME);
+    let mut checkpoint = fs::read(&checkpoint_path).expect("read genesis checkpoint");
+    mutate(&mut checkpoint);
+    fs::write(checkpoint_path, checkpoint).expect("install hostile checkpoint");
+    install_format_marker(&directory);
+    assert_unsupported_unchanged(&directory);
 }
 
 #[test]
@@ -405,6 +430,110 @@ fn malformed_marker_and_lock_only_refuse_unchanged() {
     let lock_only = TestDirectory::new("lock-only");
     fs::write(lock_only.path().join(STORE_LOCK_FILE_NAME), []).expect("write interrupted lock");
     assert_unsupported_unchanged(&lock_only);
+}
+
+#[test]
+fn premanifest_suffix_and_nongenesis_checkpoint_refuse_before_active_mutation() {
+    let valid_suffix = TestDirectory::new("premanifest-valid-suffix");
+    let mut retained = create_active_genesis(&valid_suffix);
+    retained
+        .append(&frame(support::no_change_admission(), 1))
+        .expect("append valid premanifest suffix");
+    install_format_marker(&valid_suffix);
+    assert_unsupported_unchanged(&valid_suffix);
+    drop(retained);
+
+    let torn_suffix = TestDirectory::new("premanifest-torn-suffix");
+    drop(create_active_genesis(&torn_suffix));
+    let journal_path = torn_suffix.path().join(ACTIVE_JOURNAL_FILE_NAME);
+    let mut journal_bytes = fs::read(&journal_path).expect("read active genesis");
+    journal_bytes.extend_from_slice(&frame(support::no_change_admission(), 1).bytes()[..11]);
+    fs::write(&journal_path, journal_bytes).expect("install torn premanifest suffix");
+    install_format_marker(&torn_suffix);
+    assert_unsupported_unchanged(&torn_suffix);
+
+    let torn_without_checkpoint = TestDirectory::new("premanifest-torn-no-checkpoint");
+    drop(create_active_genesis(&torn_without_checkpoint));
+    let checkpoint_path = torn_without_checkpoint
+        .path()
+        .join(ACTIVE_CHECKPOINT_FILE_NAME);
+    fs::remove_file(&checkpoint_path).expect("remove checkpoint fixture");
+    let journal_path = torn_without_checkpoint
+        .path()
+        .join(ACTIVE_JOURNAL_FILE_NAME);
+    let mut journal_bytes = fs::read(&journal_path).expect("read active genesis");
+    journal_bytes.extend_from_slice(&[0xa5; 11]);
+    fs::write(&journal_path, journal_bytes).expect("install malformed premanifest suffix");
+    install_format_marker(&torn_without_checkpoint);
+    assert_unsupported_unchanged(&torn_without_checkpoint);
+    assert!(!checkpoint_path.exists());
+
+    assert_premanifest_checkpoint_refuses("premanifest-nongenesis-checkpoint", |checkpoint| {
+        checkpoint[36..44].copy_from_slice(&3_u64.to_be_bytes());
+        let checksum = crc32c(&checkpoint[..60]);
+        checkpoint[60..64].copy_from_slice(&checksum.to_be_bytes());
+    });
+    assert_premanifest_checkpoint_refuses("premanifest-foreign-checkpoint", |checkpoint| {
+        checkpoint[12..28].copy_from_slice(&support::uuid_bytes(2));
+        let checksum = crc32c(&checkpoint[..60]);
+        checkpoint[60..64].copy_from_slice(&checksum.to_be_bytes());
+    });
+    assert_premanifest_checkpoint_refuses("premanifest-trailing-checkpoint", |checkpoint| {
+        checkpoint.push(0);
+    });
+    assert_premanifest_checkpoint_refuses("premanifest-ambiguous-checkpoint", |checkpoint| {
+        let first_slot = checkpoint[..64].to_vec();
+        checkpoint[64..128].copy_from_slice(&first_slot);
+    });
+    assert_premanifest_checkpoint_refuses("premanifest-malformed-checkpoint", |checkpoint| {
+        checkpoint[0] ^= 1;
+    });
+}
+
+#[test]
+fn exact_premanifest_genesis_checkpoint_shapes_converge_and_reopen() {
+    for mode in [
+        ActiveJournalOpenMode::OpenExisting,
+        ActiveJournalOpenMode::CreateNew,
+    ] {
+        for checkpoint_shape in ["absent", "zero", "canonical"] {
+            let directory = TestDirectory::new(&format!(
+                "premanifest-{checkpoint_shape}-{}",
+                if mode == ActiveJournalOpenMode::OpenExisting {
+                    "open"
+                } else {
+                    "create"
+                }
+            ));
+            drop(create_active_genesis(&directory));
+            let checkpoint_path = directory.path().join(ACTIVE_CHECKPOINT_FILE_NAME);
+            match checkpoint_shape {
+                "absent" => fs::remove_file(&checkpoint_path).expect("remove checkpoint"),
+                "zero" => fs::write(&checkpoint_path, []).expect("zero checkpoint"),
+                "canonical" => {}
+                _ => unreachable!("closed checkpoint fixture"),
+            }
+            install_format_marker(&directory);
+            let store = ManifestStore::open(manifest_config(&directory, mode, registry_options()))
+                .expect("exact premanifest genesis converges");
+            assert_eq!(store.inspection().committed().manifest_generation(), 1);
+            assert_eq!(
+                store
+                    .inspection()
+                    .committed()
+                    .durable_cutoff()
+                    .append_sequence(),
+                0
+            );
+            drop(store);
+            ManifestStore::open(manifest_config(
+                &directory,
+                ActiveJournalOpenMode::OpenExisting,
+                registry_options(),
+            ))
+            .expect("converged genesis reopens");
+        }
+    }
 }
 
 #[test]
