@@ -59,6 +59,39 @@ prior 87 plus three Recovery State finals and one staging name. A rejected direc
 left byte-for-byte and name-for-name unchanged. Error displays contain operation
 classes and standard I/O kinds where applicable, never paths or artifact content.
 
+## Logical preflight and volatile pressure custody
+
+Before the first owned mutation in a transaction, the store validates every
+configured/hard active bound, exact prepared frame length and count, selected
+generation and reusable slot, transaction relationship, and exact registry,
+retry, catalog, recovery, and manifest encoding that the transaction can know.
+Multi-artifact durability, lifecycle, rotation, genesis, and recovery paths keep
+one bounded prepared representation through publication rather than discovering
+a deterministic size or generation refusal after an earlier durable step.
+Logical refusal is mutation-free and leaves the live handle writable.
+
+This preflight is not a free-space probe or reservation. Passing it says nothing
+about physical blocks, quotas, inodes, device health, synchronization success,
+cleanup success, or future availability. There is no aggregate storage quota.
+
+At store-owned create, write, resize, truncate, synchronization, rename/publish,
+remove, and post-mutation directory-sync boundaries, only
+`std::io::ErrorKind::StorageFull` and `QuotaExceeded` are normalized as typed
+storage pressure. Raw OS codes are retained as optional diagnostic evidence but
+never classify an error. `FileTooLarge`, `ReadOnlyFilesystem`,
+`PermissionDenied`, `Other` (including raw code 28), and unknown kinds remain
+generic I/O/fault behavior. Read, metadata, seek, lock, and open-existing errors
+remain generic I/O even if their error kind is unusual.
+
+The first normalized pressure error is returned with bounded path/content-free
+operation evidence. A returned live `ActiveJournal` or `ManifestStore` then has
+sticky `ReopenRequired` custody; every later mutation or authorization request
+refuses before I/O or model mutation. Sanitized inspection remains available and
+does not claim that the failed operation committed. Drop, external remediation,
+and a full current-V1 reopen are the only recovery path. This state is volatile:
+no marker, version, artifact, inventory entry, manifest field, or recovery
+authority changes.
+
 ## Crash boundary
 
 If marker publication fails before a complete marker exists, reopen returns the

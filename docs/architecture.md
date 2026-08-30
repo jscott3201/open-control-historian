@@ -15,7 +15,9 @@ retry replay/guard projection, and M02-PR02c adds one bounded store-owned
 rotation/seal transition. The durable-format reset now places one current V1
 contract for each artifact family behind a fixed Store Format V1 marker.
 M02-PR03a adds a manifest-rooted transaction that reports and removes only one
-proven terminal invalid/torn active suffix. Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
+proven terminal invalid/torn active suffix. M02-PR03b1 adds store-only logical
+transaction preflight plus typed observed pressure and sticky reopen custody.
+Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
 ```text
@@ -27,7 +29,7 @@ default workspace selection
   16 slots + byte bounds       Journal V1 + checkpoints     |
   one control gate             manifest + registry/retry    |
   safe-boundary rotation       catalog + raw seals          |
-  recovery inspection         terminal-suffix recovery     |
+  recovery inspection         recovery + pressure custody  |
        |                                                    |
        v                                      future adapters (not created yet)
   tokio rt + sync only
@@ -161,7 +163,14 @@ unchanged manifest/checkpoint cutoff, then commits an otherwise byte-identical
 next manifest. A valid post-root frame, valid-plus-torn bytes, later candidate
 bytes, identity/sequence mismatch, interior corruption, or ambiguity refuses
 unchanged. `och-store` still owns no final native segment encoding, broad repair,
-reclamation, latest projection, stale-restore custody, disk-pressure mode, or query behavior.
+reclamation, latest projection, stale-restore custody, runtime degraded mode, or query behavior.
+At a store-owned create/write/resize/truncate/sync/rename/publish/remove boundary,
+only `StorageFull` and `QuotaExceeded` are typed as pressure. The first such live
+failure makes the direct active journal or composed manifest store require reopen;
+all later mutation and authorization requests refuse before I/O or model mutation.
+Inspection remains path-free and reports only the last in-memory/mechanical and
+committed evidence plus volatile write custody. Reopen remains exactly the
+current conservative PR03a path.
 Exact contracts are in [Store Format V1](store-format-v1.md),
 [Manifest V1](manifest-v1-format.md), [Retry State V1](retry-state-v1-format.md),
 [Generation Catalog V1](generation-catalog-v1-format.md),
@@ -300,8 +309,8 @@ and is never recomputed from admission or envelope content.
 There is currently no async/blocking admission wait, eviction, subscription/wait
 API, mutable read guard, final native segment format, sealed-history read/query
 API, retention/reclamation, unbounded/time-based retry, manifest-backed latest
-reconstruction, broad repair or stale-restore event model, disk-pressure/degraded
-mode, query
+reconstruction, broad repair or stale-restore event model, runtime pressure-degraded
+latest/receipt mode, query
 engine, network service, SQL layer, cloud/object provider, embedded database,
 memory mapping, Studio/Engine link, adapter, or donor-code compatibility layer.
 
@@ -330,3 +339,5 @@ The current-only artifact epoch is recorded by the
 [durable-format reset](continuation-m02-v1-durable-format-reset.md). The
 manifest-rooted terminal-suffix transaction and deferred successor boundary are
 recorded by [M02-PR03a](continuation-m02-pr03a.md).
+Store-only pressure custody and its runtime-policy handoff are recorded by
+[M02-PR03b1](continuation-m02-pr03b1.md).

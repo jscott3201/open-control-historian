@@ -1,10 +1,11 @@
 //! Bounded active-journal ownership and crash-safe durable high-water state.
 
 use crate::codec::{crc32c, frame_len_from_prefix_v1};
+use crate::pressure::is_storage_pressure;
 use crate::{
     AppendSequenceV1, DecodeLimitsV1, DecodedAdmissionV1, JOURNAL_V1_FRAME_PREFIX_LEN,
     JOURNAL_V1_HEADER_LEN, JournalHeaderV1, JournalV1Error, PreparedFrameV1,
-    RecoveryClassification,
+    RecoveryClassification, StoreWriteState,
 };
 use och_core::{RetryQualification, StoreId};
 use std::error::Error;
@@ -51,21 +52,39 @@ const CHECKPOINT_FILE_LEN: usize = CHECKPOINT_SLOT_LEN * 2;
 #[cfg(test)]
 std::thread_local! {
     static RECOVERY_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static RECOVERY_FAULT_KIND: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn set_recovery_fault(code: u8) {
     RECOVERY_FAULT.with(|fault| fault.set(code));
+    RECOVERY_FAULT_KIND.with(|kind| kind.set(0));
 }
 
 #[cfg(test)]
-fn take_recovery_fault(code: u8) -> bool {
+pub(crate) fn set_recovery_pressure_fault(code: u8, kind: ErrorKind) {
+    let encoded = match kind {
+        ErrorKind::StorageFull => 1,
+        ErrorKind::QuotaExceeded => 2,
+        _ => 0,
+    };
+    RECOVERY_FAULT.with(|fault| fault.set(code));
+    RECOVERY_FAULT_KIND.with(|stored| stored.set(encoded));
+}
+
+#[cfg(test)]
+fn take_recovery_fault(code: u8) -> Option<InjectedIo> {
     RECOVERY_FAULT.with(|fault| {
         if fault.get() == code {
             fault.set(0);
-            true
+            let encoded = RECOVERY_FAULT_KIND.with(|kind| kind.replace(0));
+            Some(match encoded {
+                1 => InjectedIo::STORAGE_FULL,
+                2 => InjectedIo::QUOTA_EXCEEDED,
+                _ => InjectedIo::OTHER_RAW_28,
+            })
         } else {
-            false
+            None
         }
     })
 }
@@ -252,6 +271,8 @@ pub enum StoreIoOperation {
     Seek,
     /// Write active journal or checkpoint bytes.
     Write,
+    /// Resize a newly created checkpoint artifact to its fixed length.
+    Resize,
     /// Resize a proven invalid unacknowledged suffix.
     Truncate,
     /// Synchronize journal content.
@@ -264,7 +285,7 @@ pub enum StoreIoOperation {
     Metadata,
 }
 
-/// Generic path-free I/O evidence preserving the platform error classification.
+/// Path-free I/O evidence preserving the platform error classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoreIoEvidence {
     operation: StoreIoOperation,
@@ -313,12 +334,16 @@ pub enum ActiveJournalError {
     FrameTooLarge,
     /// Append sequence is not the exact writer-owned successor.
     SequenceMismatch,
-    /// A prior append I/O failure may have changed bytes, so this handle is unusable.
+    /// A prior non-pressure mutation failure may have changed durable evidence.
     Faulted,
+    /// A prior mutating boundary observed storage pressure; validated reopen is required.
+    ReopenRequired,
     /// Journal V1 framing or semantic decode refused the bytes.
     Journal(JournalV1Error),
     /// Generic path-free standard-library I/O evidence.
     Io(StoreIoEvidence),
+    /// A store-owned mutating boundary observed normalized storage pressure.
+    StoragePressure(StoreIoEvidence),
 }
 
 impl fmt::Display for ActiveJournalError {
@@ -334,8 +359,10 @@ impl fmt::Display for ActiveJournalError {
             Self::FrameTooLarge => "Journal V1 frame exceeds empty active generation capacity",
             Self::SequenceMismatch => "active journal append sequence mismatch",
             Self::Faulted => "active journal authority is faulted",
+            Self::ReopenRequired => "active journal requires validated reopen",
             Self::Journal(_) => "invalid Journal V1 evidence",
             Self::Io(_) => "active journal I/O failed",
+            Self::StoragePressure(_) => "active journal storage pressure",
         })
     }
 }
@@ -413,6 +440,7 @@ pub struct ActiveJournalInspection {
     last_append_sequence: u64,
     durable_cutoff: DurableCutoff,
     sync_count: u64,
+    write_state: StoreWriteState,
 }
 
 impl ActiveJournalInspection {
@@ -450,6 +478,12 @@ impl ActiveJournalInspection {
     #[must_use]
     pub const fn sync_count(self) -> u64 {
         self.sync_count
+    }
+
+    /// Returns volatile write custody for this live handle.
+    #[must_use]
+    pub const fn write_state(self) -> StoreWriteState {
+        self.write_state
     }
 }
 
@@ -497,7 +531,7 @@ pub struct ActiveJournal {
     active_bytes: u64,
     records: Vec<RecoveredAdmissionV1>,
     sync_count: u64,
-    faulted: bool,
+    write_state: StoreWriteState,
     #[cfg(test)]
     faults: Faults,
 }
@@ -637,9 +671,11 @@ impl ActiveJournal {
         sequence_floor: u64,
         limits: ActiveJournalLimits,
     ) -> Result<Self, ActiveJournalError> {
+        let checkpoint_state = genesis_checkpoint_state(sequence_floor);
+        let checkpoint_slot = prepare_checkpoint_slot(identity, checkpoint_state)?;
+        let header_bytes = JournalHeaderV1::new(identity.store_id).encode();
         let mut journal = create_artifact(journal_path)?;
         lock_journal(&journal)?;
-        let header_bytes = JournalHeaderV1::new(identity.store_id).encode();
         journal
             .write_all(&header_bytes)
             .map_err(|error| io_error(StoreIoOperation::Write, error))?;
@@ -647,8 +683,7 @@ impl ActiveJournal {
             .sync_all()
             .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))?;
         let checkpoint = create_artifact(checkpoint_path)?;
-        let checkpoint_state =
-            initialize_checkpoint(&checkpoint, directory, identity, sequence_floor)?;
+        initialize_prepared_checkpoint(&checkpoint, directory, &checkpoint_slot)?;
         Ok(Self {
             journal,
             checkpoint,
@@ -658,7 +693,7 @@ impl ActiveJournal {
             active_bytes: JOURNAL_V1_HEADER_LEN as u64,
             records: Vec::new(),
             sync_count: 0,
-            faulted: false,
+            write_state: StoreWriteState::Writable,
             #[cfg(test)]
             faults: Faults::default(),
         })
@@ -779,6 +814,25 @@ impl ActiveJournal {
         {
             return Err(ActiveJournalError::InvalidLayout.into());
         }
+        let active_bytes = scan.valid_end;
+        let last_sequence = scan
+            .records
+            .last()
+            .map_or(sequence_floor, |record| record.admission.append_sequence());
+        let adoption_checkpoint =
+            if expected_root.is_none() && active_bytes > checkpoint_state.end_offset {
+                let next = CheckpointState {
+                    slot_generation: checkpoint_state
+                        .slot_generation
+                        .checked_add(1)
+                        .ok_or(ActiveJournalError::InvalidLayout)?,
+                    append_sequence: last_sequence,
+                    end_offset: active_bytes,
+                };
+                Some((next, prepare_checkpoint_slot(identity, next)?))
+            } else {
+                None
+            };
         if expected_root.is_none()
             && let Some(truncate_to) = scan.truncate_to
         {
@@ -789,27 +843,14 @@ impl ActiveJournal {
                 .sync_all()
                 .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))?;
         }
-        let active_bytes = scan.valid_end;
-        let last_sequence = scan
-            .records
-            .last()
-            .map_or(sequence_floor, |record| record.admission.append_sequence());
         if expected_root.is_some() {
             // Root-aware open is deliberately read-only until the manifest
             // transaction validates every other authority family.
-        } else if active_bytes > checkpoint_state.end_offset {
+        } else if let Some((next, prepared)) = adoption_checkpoint {
             journal
                 .sync_all()
                 .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))?;
-            let next = CheckpointState {
-                slot_generation: checkpoint_state
-                    .slot_generation
-                    .checked_add(1)
-                    .ok_or(ActiveJournalError::InvalidLayout)?,
-                append_sequence: last_sequence,
-                end_offset: active_bytes,
-            };
-            write_checkpoint_slot(&checkpoint, identity, next)?;
+            write_prepared_checkpoint_slot(&checkpoint, &prepared)?;
             checkpoint
                 .sync_all()
                 .map_err(|error| io_error(StoreIoOperation::SyncCheckpoint, error))?;
@@ -833,7 +874,7 @@ impl ActiveJournal {
                 active_bytes,
                 records: scan.records,
                 sync_count: 0,
-                faulted: false,
+                write_state: StoreWriteState::Writable,
                 #[cfg(test)]
                 faults: Faults::default(),
             },
@@ -856,6 +897,7 @@ impl ActiveJournal {
                 }),
             durable_cutoff: self.durable_cutoff(),
             sync_count: self.sync_count,
+            write_state: self.write_state,
         }
     }
 
@@ -889,28 +931,45 @@ impl ActiveJournal {
             return Err(ActiveJournalError::InvalidLayout);
         }
         #[cfg(test)]
-        if take_recovery_fault(50) {
-            return Err(injected_io(StoreIoOperation::Truncate));
+        if let Some(injected) = take_recovery_fault(50) {
+            let error = classify_io(
+                StoreIoOperation::Truncate,
+                injected.kind,
+                injected.raw_os_error,
+            );
+            return Err(self.record_mutation_error(error));
         }
-        self.journal
-            .set_len(self.active_bytes)
-            .map_err(|error| io_error(StoreIoOperation::Truncate, error))?;
-        #[cfg(test)]
-        if take_recovery_fault(51) {
-            return Err(injected_io(StoreIoOperation::SyncJournal));
+        if let Err(error) = self.journal.set_len(self.active_bytes) {
+            let error = io_error(StoreIoOperation::Truncate, error);
+            return Err(self.record_mutation_error(error));
         }
-        self.journal
-            .sync_all()
-            .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))?;
         #[cfg(test)]
-        if take_recovery_fault(52) {
-            return Err(injected_io(StoreIoOperation::SyncJournal));
+        if let Some(injected) = take_recovery_fault(51) {
+            let error = classify_io(
+                StoreIoOperation::SyncJournal,
+                injected.kind,
+                injected.raw_os_error,
+            );
+            return Err(self.record_mutation_error(error));
+        }
+        if let Err(error) = self.journal.sync_all() {
+            let error = io_error(StoreIoOperation::SyncJournal, error);
+            return Err(self.record_mutation_error(error));
+        }
+        #[cfg(test)]
+        if let Some(injected) = take_recovery_fault(52) {
+            let error = classify_io(
+                StoreIoOperation::SyncJournal,
+                injected.kind,
+                injected.raw_os_error,
+            );
+            return Err(self.record_mutation_error(error));
         }
         Ok(())
     }
 
     pub(crate) fn synchronize_recovery_cutoff(
-        &self,
+        &mut self,
         cutoff: DurableCutoff,
     ) -> Result<(), ActiveJournalError> {
         self.ensure_usable()?;
@@ -925,9 +984,11 @@ impl ActiveJournal {
         {
             return Err(ActiveJournalError::InvalidLayout);
         }
-        self.journal
-            .sync_all()
-            .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))
+        if let Err(error) = self.journal.sync_all() {
+            let error = io_error(StoreIoOperation::SyncJournal, error);
+            return Err(self.record_mutation_error(error));
+        }
+        Ok(())
     }
 
     /// Returns the next exact writer-owned append sequence.
@@ -994,22 +1055,22 @@ impl ActiveJournal {
             .seek(SeekFrom::End(0))
             .map_err(|error| io_error(StoreIoOperation::Seek, error))?;
         #[cfg(test)]
-        if let Some(length) = self.faults.short_write.take() {
+        if let Some((length, injected)) = self.faults.short_write.take() {
             let partial = length.min(frame.bytes().len());
             if let Err(error) = self.journal.write_all(&frame.bytes()[..partial]) {
-                self.faulted = true;
-                return Err(io_error(StoreIoOperation::Write, error));
+                let error = io_error(StoreIoOperation::Write, error);
+                return Err(self.record_mutation_error(error));
             }
-            self.faulted = true;
-            return Err(ActiveJournalError::Io(StoreIoEvidence {
-                operation: StoreIoOperation::Write,
-                kind: ErrorKind::WriteZero,
-                raw_os_error: None,
-            }));
+            let error = classify_io(
+                StoreIoOperation::Write,
+                injected.kind,
+                injected.raw_os_error,
+            );
+            return Err(self.record_mutation_error(error));
         }
         if let Err(error) = self.journal.write_all(frame.bytes()) {
-            self.faulted = true;
-            return Err(io_error(StoreIoOperation::Write, error));
+            let error = io_error(StoreIoOperation::Write, error);
+            return Err(self.record_mutation_error(error));
         }
         self.active_bytes = end_offset;
         self.records.push(RecoveredAdmissionV1 {
@@ -1038,48 +1099,57 @@ impl ActiveJournal {
     /// # Errors
     ///
     /// On failure the in-memory durable cutoff is not advanced. A handle whose
-    /// append may have partially changed bytes refuses all synchronization.
+    /// mutation may have changed bytes refuses all later mutation until reopen.
     pub fn sync_pending(&mut self) -> Result<DurableCutoff, ActiveJournalError> {
         self.ensure_usable()?;
-        let last_sequence = self
-            .records
-            .last()
-            .map_or(self.checkpoint_state.append_sequence, |record| {
-                record.admission.append_sequence()
-            });
+        let last_sequence = self.last_append_sequence();
         if last_sequence == self.checkpoint_state.append_sequence
             && self.active_bytes == self.checkpoint_state.end_offset
         {
             return Ok(self.durable_cutoff());
         }
+        // Every arithmetic relationship and exact checkpoint byte is prepared
+        // before the journal synchronization starts this durability transaction.
+        let next = self.pending_checkpoint_state(last_sequence)?;
+        let checkpoint = prepare_checkpoint_slot(self.identity, next)?;
         #[cfg(test)]
-        if self.faults.journal_sync {
-            return Err(injected_io(StoreIoOperation::SyncJournal));
+        if let Some(injected) = self.faults.journal_sync.take() {
+            let error = classify_io(
+                StoreIoOperation::SyncJournal,
+                injected.kind,
+                injected.raw_os_error,
+            );
+            return Err(self.record_mutation_error(error));
         }
-        self.journal
-            .sync_all()
-            .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))?;
-        let next = CheckpointState {
-            slot_generation: self
-                .checkpoint_state
-                .slot_generation
-                .checked_add(1)
-                .ok_or(ActiveJournalError::InvalidLayout)?,
-            append_sequence: last_sequence,
-            end_offset: self.active_bytes,
-        };
+        if let Err(error) = self.journal.sync_all() {
+            let error = io_error(StoreIoOperation::SyncJournal, error);
+            return Err(self.record_mutation_error(error));
+        }
         #[cfg(test)]
-        if self.faults.checkpoint_write {
-            return Err(injected_io(StoreIoOperation::Write));
+        if let Some(injected) = self.faults.checkpoint_write.take() {
+            let error = classify_io(
+                StoreIoOperation::Write,
+                injected.kind,
+                injected.raw_os_error,
+            );
+            return Err(self.record_mutation_error(error));
         }
-        write_checkpoint_slot(&self.checkpoint, self.identity, next)?;
+        if let Err(error) = write_prepared_checkpoint_slot(&self.checkpoint, &checkpoint) {
+            return Err(self.record_mutation_error(error));
+        }
         #[cfg(test)]
-        if self.faults.checkpoint_sync {
-            return Err(injected_io(StoreIoOperation::SyncCheckpoint));
+        if let Some(injected) = self.faults.checkpoint_sync.take() {
+            let error = classify_io(
+                StoreIoOperation::SyncCheckpoint,
+                injected.kind,
+                injected.raw_os_error,
+            );
+            return Err(self.record_mutation_error(error));
         }
-        self.checkpoint
-            .sync_all()
-            .map_err(|error| io_error(StoreIoOperation::SyncCheckpoint, error))?;
+        if let Err(error) = self.checkpoint.sync_all() {
+            let error = io_error(StoreIoOperation::SyncCheckpoint, error);
+            return Err(self.record_mutation_error(error));
+        }
         self.checkpoint_state = next;
         self.sync_count = self.sync_count.saturating_add(1);
         Ok(self.durable_cutoff())
@@ -1094,12 +1164,72 @@ impl ActiveJournal {
         }
     }
 
-    fn ensure_usable(&self) -> Result<(), ActiveJournalError> {
-        if self.faulted {
-            Err(ActiveJournalError::Faulted)
-        } else {
-            Ok(())
+    pub(crate) fn pending_durable_cutoff(&self) -> Result<DurableCutoff, ActiveJournalError> {
+        self.ensure_usable()?;
+        let last_sequence = self.last_append_sequence();
+        if last_sequence == self.checkpoint_state.append_sequence
+            && self.active_bytes == self.checkpoint_state.end_offset
+        {
+            return Ok(self.durable_cutoff());
         }
+        let next = self.pending_checkpoint_state(last_sequence)?;
+        let _ = prepare_checkpoint_slot(self.identity, next)?;
+        Ok(durable_cutoff_from_state(self.identity, next))
+    }
+
+    fn last_append_sequence(&self) -> u64 {
+        self.records
+            .last()
+            .map_or(self.checkpoint_state.append_sequence, |record| {
+                record.admission.append_sequence()
+            })
+    }
+
+    fn pending_checkpoint_state(
+        &self,
+        last_sequence: u64,
+    ) -> Result<CheckpointState, ActiveJournalError> {
+        Ok(CheckpointState {
+            slot_generation: self
+                .checkpoint_state
+                .slot_generation
+                .checked_add(1)
+                .ok_or(ActiveJournalError::InvalidLayout)?,
+            append_sequence: last_sequence,
+            end_offset: self.active_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_append_pressure(&mut self, partial: usize, kind: ErrorKind) {
+        self.faults.short_write = Some((partial, InjectedIo::from_pressure_kind(kind)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_sync_pressure(&mut self, point: u8, kind: ErrorKind) {
+        let injected = InjectedIo::from_pressure_kind(kind);
+        match point {
+            0 => self.faults.journal_sync = Some(injected),
+            1 => self.faults.checkpoint_write = Some(injected),
+            _ => self.faults.checkpoint_sync = Some(injected),
+        }
+    }
+
+    fn ensure_usable(&self) -> Result<(), ActiveJournalError> {
+        match self.write_state {
+            StoreWriteState::Writable => Ok(()),
+            StoreWriteState::ReopenRequired => Err(ActiveJournalError::ReopenRequired),
+            StoreWriteState::Faulted => Err(ActiveJournalError::Faulted),
+        }
+    }
+
+    fn record_mutation_error(&mut self, error: ActiveJournalError) -> ActiveJournalError {
+        self.write_state = if matches!(error, ActiveJournalError::StoragePressure(_)) {
+            StoreWriteState::ReopenRequired
+        } else {
+            StoreWriteState::Faulted
+        };
+        error
     }
 }
 
@@ -1567,18 +1697,28 @@ fn initialize_checkpoint(
     identity: JournalIdentity,
     sequence_floor: u64,
 ) -> Result<CheckpointState, ActiveJournalError> {
+    let state = genesis_checkpoint_state(sequence_floor);
+    let prepared = prepare_checkpoint_slot(identity, state)?;
+    initialize_prepared_checkpoint(checkpoint, directory, &prepared)?;
+    Ok(state)
+}
+
+fn initialize_prepared_checkpoint(
+    checkpoint: &File,
+    directory: &File,
+    prepared: &PreparedCheckpointSlot,
+) -> Result<(), ActiveJournalError> {
     checkpoint
         .set_len(CHECKPOINT_FILE_LEN as u64)
-        .map_err(|error| io_error(StoreIoOperation::Write, error))?;
-    let state = genesis_checkpoint_state(sequence_floor);
-    write_checkpoint_slot(checkpoint, identity, state)?;
+        .map_err(|error| io_error(StoreIoOperation::Resize, error))?;
+    write_prepared_checkpoint_slot(checkpoint, prepared)?;
     checkpoint
         .sync_all()
         .map_err(|error| io_error(StoreIoOperation::SyncCheckpoint, error))?;
     directory
         .sync_all()
         .map_err(|error| io_error(StoreIoOperation::SyncDirectory, error))?;
-    Ok(state)
+    Ok(())
 }
 
 const fn genesis_checkpoint_state(sequence_floor: u64) -> CheckpointState {
@@ -1589,20 +1729,31 @@ const fn genesis_checkpoint_state(sequence_floor: u64) -> CheckpointState {
     }
 }
 
-fn write_checkpoint_slot(
-    file: &File,
+struct PreparedCheckpointSlot {
+    bytes: [u8; CHECKPOINT_SLOT_LEN],
+    offset: u64,
+}
+
+fn prepare_checkpoint_slot(
     identity: JournalIdentity,
     state: CheckpointState,
-) -> Result<(), ActiveJournalError> {
+) -> Result<PreparedCheckpointSlot, ActiveJournalError> {
     let bytes = encode_checkpoint(identity, state);
     let index = usize::try_from((state.slot_generation - 1) % 2)
         .map_err(|_| ActiveJournalError::InvalidLayout)?;
     let offset = u64::try_from(index * CHECKPOINT_SLOT_LEN)
         .map_err(|_| ActiveJournalError::InvalidLayout)?;
+    Ok(PreparedCheckpointSlot { bytes, offset })
+}
+
+fn write_prepared_checkpoint_slot(
+    file: &File,
+    prepared: &PreparedCheckpointSlot,
+) -> Result<(), ActiveJournalError> {
     let mut file = file;
-    file.seek(SeekFrom::Start(offset))
+    file.seek(SeekFrom::Start(prepared.offset))
         .map_err(|error| io_error(StoreIoOperation::Seek, error))?;
-    file.write_all(&bytes)
+    file.write_all(&prepared.bytes)
         .map_err(|error| io_error(StoreIoOperation::Write, error))
 }
 
@@ -1723,39 +1874,101 @@ fn decode_checkpoint_slot(
 
 #[allow(clippy::needless_pass_by_value)]
 fn io_error(operation: StoreIoOperation, error: std::io::Error) -> ActiveJournalError {
-    ActiveJournalError::Io(StoreIoEvidence {
+    classify_io(operation, error.kind(), error.raw_os_error())
+}
+
+const fn classify_io(
+    operation: StoreIoOperation,
+    kind: ErrorKind,
+    raw_os_error: Option<i32>,
+) -> ActiveJournalError {
+    let evidence = StoreIoEvidence {
         operation,
-        kind: error.kind(),
-        raw_os_error: error.raw_os_error(),
-    })
+        kind,
+        raw_os_error,
+    };
+    if operation.is_mutating() && is_storage_pressure(kind) {
+        ActiveJournalError::StoragePressure(evidence)
+    } else {
+        ActiveJournalError::Io(evidence)
+    }
+}
+
+impl StoreIoOperation {
+    const fn is_mutating(self) -> bool {
+        matches!(
+            self,
+            Self::CreateArtifact
+                | Self::Write
+                | Self::Resize
+                | Self::Truncate
+                | Self::SyncJournal
+                | Self::SyncCheckpoint
+                | Self::SyncDirectory
+        )
+    }
 }
 
 #[cfg(test)]
-fn injected_io(operation: StoreIoOperation) -> ActiveJournalError {
-    ActiveJournalError::Io(StoreIoEvidence {
-        operation,
+#[derive(Clone, Copy)]
+struct InjectedIo {
+    kind: ErrorKind,
+    raw_os_error: Option<i32>,
+}
+
+#[cfg(test)]
+impl InjectedIo {
+    const fn from_pressure_kind(kind: ErrorKind) -> Self {
+        match kind {
+            ErrorKind::StorageFull => Self::STORAGE_FULL,
+            ErrorKind::QuotaExceeded => Self::QUOTA_EXCEEDED,
+            _ => Self::OTHER_RAW_28,
+        }
+    }
+
+    const WRITE_ZERO: Self = Self {
+        kind: ErrorKind::WriteZero,
+        raw_os_error: None,
+    };
+
+    const OTHER_RAW_28: Self = Self {
         kind: ErrorKind::Other,
         raw_os_error: Some(28),
-    })
+    };
+
+    const STORAGE_FULL: Self = Self {
+        kind: ErrorKind::StorageFull,
+        raw_os_error: Some(28),
+    };
+
+    const QUOTA_EXCEEDED: Self = Self {
+        kind: ErrorKind::QuotaExceeded,
+        raw_os_error: Some(122),
+    };
 }
 
 #[cfg(test)]
 #[derive(Default)]
 struct Faults {
-    short_write: Option<usize>,
-    journal_sync: bool,
-    checkpoint_write: bool,
-    checkpoint_sync: bool,
+    short_write: Option<(usize, InjectedIo)>,
+    journal_sync: Option<InjectedIo>,
+    checkpoint_write: Option<InjectedIo>,
+    checkpoint_sync: Option<InjectedIo>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_JOURNAL_FILE_NAME, ActiveJournal, ActiveJournalConfig, ActiveJournalError,
-        ActiveJournalLimits, ActiveJournalOpenMode, StoreIoOperation,
+        ACTIVE_CHECKPOINT_FILE_NAME, ACTIVE_JOURNAL_FILE_NAME, ActiveJournal, ActiveJournalConfig,
+        ActiveJournalError, ActiveJournalLimits, ActiveJournalOpenMode, InjectedIo,
+        StoreIoOperation, classify_io,
     };
-    use crate::{AppendSequenceV1, MAX_ADMISSION_PAYLOAD_V1, PreparedAdmissionV1, test_support};
+    use crate::{
+        AppendSequenceV1, MAX_ADMISSION_PAYLOAD_V1, PreparedAdmissionV1, StoreWriteState,
+        test_support,
+    };
     use std::fs;
+    use std::io::ErrorKind;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1803,14 +2016,19 @@ mod tests {
         let mut journal = ActiveJournal::open(config(&directory, ActiveJournalOpenMode::CreateNew))
             .expect("create fault journal");
         let before = journal.inspection();
-        journal.faults.short_write = Some(11);
+        journal.faults.short_write = Some((11, InjectedIo::WRITE_ZERO));
         let error = journal.append(&frame()).expect_err("short write refuses");
         let ActiveJournalError::Io(evidence) = error else {
             panic!("short write must retain generic I/O evidence");
         };
         assert_eq!(evidence.operation(), StoreIoOperation::Write);
         assert_eq!(evidence.raw_os_error(), None);
-        assert_eq!(journal.inspection(), before);
+        let faulted = journal.inspection();
+        assert_eq!(faulted.write_state(), StoreWriteState::Faulted);
+        assert_eq!(faulted.active_bytes(), before.active_bytes());
+        assert_eq!(faulted.active_records(), before.active_records());
+        assert_eq!(faulted.durable_cutoff(), before.durable_cutoff());
+        assert_eq!(faulted.sync_count(), before.sync_count());
         let journal_path = directory.0.join(ACTIVE_JOURNAL_FILE_NAME);
         let torn_len = fs::metadata(&journal_path)
             .expect("torn journal metadata")
@@ -1822,7 +2040,7 @@ mod tests {
         );
         assert_eq!(journal.append(&frame()), Err(ActiveJournalError::Faulted));
         assert_eq!(journal.sync_pending(), Err(ActiveJournalError::Faulted));
-        assert_eq!(journal.inspection(), before);
+        assert_eq!(journal.inspection(), faulted);
         assert_eq!(
             fs::metadata(&journal_path)
                 .expect("faulted journal metadata")
@@ -1851,9 +2069,9 @@ mod tests {
                 .append(&frame())
                 .expect("append before barrier fault");
             match point {
-                0 => journal.faults.journal_sync = true,
-                1 => journal.faults.checkpoint_write = true,
-                _ => journal.faults.checkpoint_sync = true,
+                0 => journal.faults.journal_sync = Some(InjectedIo::OTHER_RAW_28),
+                1 => journal.faults.checkpoint_write = Some(InjectedIo::OTHER_RAW_28),
+                _ => journal.faults.checkpoint_sync = Some(InjectedIo::OTHER_RAW_28),
             }
             let error = journal.sync_pending().expect_err("barrier fault refuses");
             let ActiveJournalError::Io(evidence) = error else {
@@ -1867,6 +2085,159 @@ mod tests {
             assert_eq!(evidence.operation(), expected);
             assert_eq!(evidence.raw_os_error(), Some(28));
             assert_eq!(journal.inspection().durable_cutoff().append_sequence(), 0);
+            assert_eq!(journal.inspection().write_state(), StoreWriteState::Faulted);
+        }
+    }
+
+    #[test]
+    fn pressure_classification_uses_only_error_kind_and_only_mutating_boundaries() {
+        for kind in [ErrorKind::StorageFull, ErrorKind::QuotaExceeded] {
+            let ActiveJournalError::StoragePressure(evidence) =
+                classify_io(StoreIoOperation::Write, kind, Some(777))
+            else {
+                panic!("normalized pressure kind must be typed at a write boundary");
+            };
+            assert_eq!(evidence.kind(), kind);
+            assert_eq!(evidence.raw_os_error(), Some(777));
+        }
+        for kind in [
+            ErrorKind::FileTooLarge,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+        ] {
+            let ActiveJournalError::Io(evidence) =
+                classify_io(StoreIoOperation::Write, kind, Some(28))
+            else {
+                panic!("non-pressure kind must retain generic I/O evidence");
+            };
+            assert_eq!(evidence.kind(), kind);
+            assert_eq!(evidence.raw_os_error(), Some(28));
+        }
+        assert!(matches!(
+            classify_io(StoreIoOperation::Read, ErrorKind::StorageFull, Some(28)),
+            ActiveJournalError::Io(_)
+        ));
+    }
+
+    #[test]
+    fn partial_write_pressure_is_sticky_and_reopen_uses_terminal_suffix_recovery() {
+        let directory = Directory::new();
+        let mut journal = ActiveJournal::open(config(&directory, ActiveJournalOpenMode::CreateNew))
+            .expect("create pressure journal");
+        let before = journal.inspection();
+        journal.faults.short_write = Some((11, InjectedIo::STORAGE_FULL));
+        let error = journal
+            .append(&frame())
+            .expect_err("pressure write refuses");
+        let ActiveJournalError::StoragePressure(evidence) = error else {
+            panic!("first mutating pressure must retain exact evidence");
+        };
+        assert_eq!(evidence.operation(), StoreIoOperation::Write);
+        assert_eq!(evidence.kind(), ErrorKind::StorageFull);
+        assert_eq!(evidence.raw_os_error(), Some(28));
+        let pressured = journal.inspection();
+        assert_eq!(pressured.write_state(), StoreWriteState::ReopenRequired);
+        assert_eq!(pressured.active_bytes(), before.active_bytes());
+        assert_eq!(pressured.active_records(), before.active_records());
+        assert_eq!(pressured.durable_cutoff(), before.durable_cutoff());
+        assert_eq!(pressured.sync_count(), before.sync_count());
+        let journal_path = directory.0.join(ACTIVE_JOURNAL_FILE_NAME);
+        let torn_len = fs::metadata(&journal_path)
+            .expect("pressure suffix metadata")
+            .len();
+        assert!(torn_len > before.active_bytes());
+        for _ in 0..16 {
+            assert_eq!(
+                journal.next_append_sequence(),
+                Err(ActiveJournalError::ReopenRequired)
+            );
+            assert_eq!(
+                journal.append(&frame()),
+                Err(ActiveJournalError::ReopenRequired)
+            );
+            assert_eq!(
+                journal.sync_pending(),
+                Err(ActiveJournalError::ReopenRequired)
+            );
+        }
+        assert_eq!(journal.inspection(), pressured);
+        assert_eq!(
+            fs::metadata(&journal_path)
+                .expect("pressure suffix remains")
+                .len(),
+            torn_len
+        );
+        drop(journal);
+
+        let reopened = ActiveJournal::open(config(&directory, ActiveJournalOpenMode::OpenExisting))
+            .expect("existing terminal-suffix recovery reopens");
+        assert_eq!(reopened.inspection(), before);
+        assert_eq!(
+            fs::metadata(journal_path)
+                .expect("terminal suffix truncated")
+                .len(),
+            before.active_bytes()
+        );
+    }
+
+    #[test]
+    fn pressure_at_each_barrier_boundary_retains_cutoff_and_requires_reopen() {
+        for (point, injected) in [
+            (0, InjectedIo::STORAGE_FULL),
+            (1, InjectedIo::QUOTA_EXCEEDED),
+            (2, InjectedIo::STORAGE_FULL),
+        ] {
+            let directory = Directory::new();
+            let mut journal =
+                ActiveJournal::open(config(&directory, ActiveJournalOpenMode::CreateNew))
+                    .expect("create pressure barrier journal");
+            journal
+                .append(&frame())
+                .expect("append before pressure barrier");
+            match point {
+                0 => journal.faults.journal_sync = Some(injected),
+                1 => journal.faults.checkpoint_write = Some(injected),
+                _ => journal.faults.checkpoint_sync = Some(injected),
+            }
+            let error = journal
+                .sync_pending()
+                .expect_err("pressure barrier refuses");
+            let ActiveJournalError::StoragePressure(evidence) = error else {
+                panic!("barrier pressure must be typed");
+            };
+            let expected_operation = match point {
+                0 => StoreIoOperation::SyncJournal,
+                1 => StoreIoOperation::Write,
+                _ => StoreIoOperation::SyncCheckpoint,
+            };
+            assert_eq!(evidence.operation(), expected_operation);
+            assert_eq!(evidence.kind(), injected.kind);
+            let pressured = journal.inspection();
+            assert_eq!(pressured.write_state(), StoreWriteState::ReopenRequired);
+            assert_eq!(pressured.durable_cutoff().append_sequence(), 0);
+            assert_eq!(pressured.sync_count(), 0);
+            let journal_bytes = fs::read(directory.0.join(ACTIVE_JOURNAL_FILE_NAME))
+                .expect("read pressured journal");
+            let checkpoint_bytes = fs::read(directory.0.join(ACTIVE_CHECKPOINT_FILE_NAME))
+                .expect("read pressured checkpoint");
+            for _ in 0..16 {
+                assert_eq!(
+                    journal.sync_pending(),
+                    Err(ActiveJournalError::ReopenRequired)
+                );
+            }
+            assert_eq!(journal.inspection(), pressured);
+            assert_eq!(
+                fs::read(directory.0.join(ACTIVE_JOURNAL_FILE_NAME))
+                    .expect("journal unchanged after repeated refusal"),
+                journal_bytes
+            );
+            assert_eq!(
+                fs::read(directory.0.join(ACTIVE_CHECKPOINT_FILE_NAME))
+                    .expect("checkpoint unchanged after repeated refusal"),
+                checkpoint_bytes
+            );
         }
     }
 }
