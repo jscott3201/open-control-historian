@@ -2,9 +2,8 @@
 
 use crate::codec::{crc32c, frame_len_from_prefix_v1};
 use crate::{
-    ACTIVE_JOURNAL_HEADER_V2_VERSION, AppendSequenceV1, DecodeLimitsV1, DecodedAdmissionV1,
-    JOURNAL_V1_FRAME_PREFIX_LEN, JOURNAL_V1_HEADER_LEN, JOURNAL_V1_VERSION, JournalHeaderV1,
-    JournalHeaderV2, JournalV1Error, PreparedFrameV1,
+    AppendSequenceV1, DecodeLimitsV1, DecodedAdmissionV1, JOURNAL_V1_FRAME_PREFIX_LEN,
+    JOURNAL_V1_HEADER_LEN, JournalHeaderV1, JournalV1Error, PreparedFrameV1,
 };
 use och_core::{RetryQualification, StoreId};
 use std::error::Error;
@@ -116,17 +115,9 @@ pub struct ActiveJournalConfig {
     store_id: StoreId,
     mode: ActiveJournalOpenMode,
     limits: ActiveJournalLimits,
-    header_requirement: HeaderRequirement,
     recovery_policy: RecoveryPolicy,
     generation: u64,
     sequence_floor: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HeaderRequirement {
-    LegacyV1,
-    ManifestV2,
-    BootstrapEither,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,7 +147,6 @@ impl ActiveJournalConfig {
             store_id,
             mode,
             limits,
-            header_requirement: HeaderRequirement::LegacyV1,
             recovery_policy: RecoveryPolicy::Converge,
             generation: ACTIVE_JOURNAL_GENERATION,
             sequence_floor: 0,
@@ -182,20 +172,12 @@ impl ActiveJournalConfig {
     }
 
     pub(crate) fn manifest_create(mut self) -> Self {
-        self.header_requirement = HeaderRequirement::ManifestV2;
         self.recovery_policy = RecoveryPolicy::Strict;
         self
     }
 
     pub(crate) fn manifest_existing(mut self) -> Self {
-        self.header_requirement = HeaderRequirement::ManifestV2;
         self.recovery_policy = RecoveryPolicy::Strict;
-        self
-    }
-
-    pub(crate) fn manifest_bootstrap(mut self) -> Self {
-        self.header_requirement = HeaderRequirement::BootstrapEither;
-        self.recovery_policy = RecoveryPolicy::Converge;
         self
     }
 
@@ -487,7 +469,6 @@ pub struct ActiveJournal {
     records: Vec<RecoveredAdmissionV1>,
     sync_count: u64,
     faulted: bool,
-    header_version: u16,
     #[cfg(test)]
     faults: Faults,
 }
@@ -509,7 +490,6 @@ impl ActiveJournal {
             store_id,
             mode,
             limits,
-            header_requirement,
             recovery_policy,
             generation,
             sequence_floor,
@@ -529,7 +509,6 @@ impl ActiveJournal {
                 identity,
                 sequence_floor,
                 limits,
-                header_requirement,
             ),
             ActiveJournalOpenMode::OpenExisting => Self::open_existing(
                 &directory,
@@ -538,7 +517,6 @@ impl ActiveJournal {
                 identity,
                 sequence_floor,
                 limits,
-                header_requirement,
                 recovery_policy,
             ),
         }
@@ -551,20 +529,10 @@ impl ActiveJournal {
         identity: JournalIdentity,
         sequence_floor: u64,
         limits: ActiveJournalLimits,
-        header_requirement: HeaderRequirement,
     ) -> Result<Self, ActiveJournalError> {
         let mut journal = create_artifact(journal_path)?;
         lock_journal(&journal)?;
-        let (header_version, header_bytes) = match header_requirement {
-            HeaderRequirement::LegacyV1 => (
-                JOURNAL_V1_VERSION,
-                JournalHeaderV1::new(identity.store_id).encode(),
-            ),
-            HeaderRequirement::ManifestV2 | HeaderRequirement::BootstrapEither => (
-                ACTIVE_JOURNAL_HEADER_V2_VERSION,
-                JournalHeaderV2::new(identity.store_id).encode(),
-            ),
-        };
+        let header_bytes = JournalHeaderV1::new(identity.store_id).encode();
         journal
             .write_all(&header_bytes)
             .map_err(|error| io_error(StoreIoOperation::Write, error))?;
@@ -584,7 +552,6 @@ impl ActiveJournal {
             records: Vec::new(),
             sync_count: 0,
             faulted: false,
-            header_version,
             #[cfg(test)]
             faults: Faults::default(),
         })
@@ -599,7 +566,6 @@ impl ActiveJournal {
         identity: JournalIdentity,
         sequence_floor: u64,
         limits: ActiveJournalLimits,
-        header_requirement: HeaderRequirement,
         recovery_policy: RecoveryPolicy,
     ) -> Result<Self, ActiveJournalError> {
         let mut journal = open_artifact(journal_path)?;
@@ -615,24 +581,7 @@ impl ActiveJournal {
         journal
             .read_exact(&mut header_bytes)
             .map_err(|error| io_error(StoreIoOperation::Read, error))?;
-        let (header_version, header_store_id) = match header_requirement {
-            HeaderRequirement::LegacyV1 => {
-                let header = JournalHeaderV1::decode(&header_bytes)?;
-                (JOURNAL_V1_VERSION, header.store_id())
-            }
-            HeaderRequirement::ManifestV2 => {
-                let header = JournalHeaderV2::decode(&header_bytes)?;
-                (ACTIVE_JOURNAL_HEADER_V2_VERSION, header.store_id())
-            }
-            HeaderRequirement::BootstrapEither => match JournalHeaderV1::decode(&header_bytes) {
-                Ok(header) => (JOURNAL_V1_VERSION, header.store_id()),
-                Err(JournalV1Error::UnsupportedHeaderVersion) => {
-                    let header = JournalHeaderV2::decode(&header_bytes)?;
-                    (ACTIVE_JOURNAL_HEADER_V2_VERSION, header.store_id())
-                }
-                Err(error) => return Err(error.into()),
-            },
-        };
+        let header_store_id = JournalHeaderV1::decode(&header_bytes)?.store_id();
         if header_store_id != identity.store_id {
             return Err(ActiveJournalError::StoreMismatch);
         }
@@ -740,7 +689,6 @@ impl ActiveJournal {
             records: scan.records,
             sync_count: 0,
             faulted: false,
-            header_version,
             #[cfg(test)]
             faults: Faults::default(),
         })
@@ -770,39 +718,8 @@ impl ActiveJournal {
         &self.records
     }
 
-    pub(crate) const fn header_version(&self) -> u16 {
-        self.header_version
-    }
-
     pub(crate) const fn limits(&self) -> ActiveJournalLimits {
         self.limits
-    }
-
-    pub(crate) fn upgrade_to_manifest_header(&mut self) -> Result<(), ActiveJournalError> {
-        self.ensure_usable()?;
-        if self.header_version == ACTIVE_JOURNAL_HEADER_V2_VERSION {
-            return Ok(());
-        }
-        if self.header_version != JOURNAL_V1_VERSION {
-            return Err(ActiveJournalError::InvalidLayout);
-        }
-        if let Err(error) = self.journal.seek(SeekFrom::Start(0)) {
-            self.faulted = true;
-            return Err(io_error(StoreIoOperation::Seek, error));
-        }
-        if let Err(error) = self
-            .journal
-            .write_all(&JournalHeaderV2::new(self.identity.store_id).encode())
-        {
-            self.faulted = true;
-            return Err(io_error(StoreIoOperation::Write, error));
-        }
-        if let Err(error) = self.journal.sync_all() {
-            self.faulted = true;
-            return Err(io_error(StoreIoOperation::SyncJournal, error));
-        }
-        self.header_version = ACTIVE_JOURNAL_HEADER_V2_VERSION;
-        Ok(())
     }
 
     /// Returns the next exact writer-owned append sequence.

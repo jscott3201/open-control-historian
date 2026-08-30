@@ -16,16 +16,16 @@ The header is exactly 28 bytes:
 | Offset | Length | Field | V1 value |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | ASCII `OCHJNL01` |
-| 8 | 2 | active-header version | unsigned `1` premanifest; unsigned `2` for manifest stores |
+| 8 | 2 | active-header version | unsigned `1` |
 | 10 | 2 | header length | unsigned `28` |
 | 12 | 16 | store identity | validated network-order UUIDv7 bytes |
 
-Decode accepts exactly 28 bytes. Magic, selected version, header length, identity
-version, identity variant, truncation, and trailing input fail closed. The V2
-header changes only the version field; all admission frames remain format version
-one. `JournalHeaderV1` rejects V2, so a premanifest writer fails closed after a
-store is upgraded. V1/V2 bootstrap and committed publication are specified in
-[Manifest V1/V2/V3](manifest-v1-format.md).
+Decode accepts exactly 28 bytes. Magic, version, header length, identity version,
+identity variant, truncation, and trailing input fail closed. The Store Format V1
+marker and current Manifest V1 authority prevent historical bare journals from
+being adopted. There is no alternate header type or header-upgrade path. All
+admission frames remain format version one. Current genesis and publication are
+specified in [Manifest V1](manifest-v1-format.md).
 
 ## Independent admission frame
 
@@ -56,8 +56,7 @@ value is `0xe3069283`.
 
 ## Active artifacts and bounds
 
-Generation one preserves its exact legacy pair in one caller-supplied existing
-directory:
+Generation one uses its fixed pair in one caller-supplied existing directory:
 
 - `active-journal-v1.och`: one header followed by independent frames;
 - `active-journal-v1.checkpoint`: exactly two 64-byte checkpoint slots.
@@ -69,8 +68,8 @@ to names. Each active open binds the exact positive generation and one exclusive
 global append-sequence floor. End offsets, checkpoint-slot generations, byte
 limits, and record limits are generation-local; append sequence is store-global.
 
-Legacy premanifest create-new follows one exact order: exclusively create and lock the single
-read/write journal, write and synchronize its header, exclusively create the
+After Store Format V1 marker publication, current genesis follows one exact
+order: exclusively create and lock the single read/write journal, write and synchronize its header, exclusively create the
 checkpoint, initialize its 128 bytes with generation-one genesis in slot zero and
 an all-zero alternate slot, synchronize the checkpoint, then synchronize the
 directory before readiness. Append mode is not used: every frame write seeks
@@ -117,7 +116,8 @@ The checkpoint is only store/journal binding and mechanical cutoff evidence. It
 carries no declaration registry, retry outcome, latest state, or source
 interpretation authority.
 
-Legacy premanifest open-existing requires exact fixed artifacts and a retained writer lock. It
+Current open-existing requires the Store Format V1 marker, exact fixed artifacts,
+and a retained writer lock. It
 validates the header, checkpoint length, StoreId/generation/checksums, slot parity,
 and strict consecutive generations. Two valid consecutive slots must also advance
 both append sequence and end offset strictly. Any invalid or non-progressing
@@ -149,7 +149,7 @@ truncate a proven torn terminal suffix and establish a new writer authority.
 Rotation requires an exact fully durable nonempty active range and no unpublished
 append. A frame that cannot fit even an empty configured active generation returns
 typed `FrameTooLarge`; it never starts an empty rotation loop. The successor is
-created with header version 2, checkpoint slot generation one, header-only end
+created with Journal Header V1, checkpoint slot generation one, header-only end
 offset, and durable append sequence equal to the prior inclusive global cutoff.
 Its first frame is that cutoff's exact successor.
 

@@ -31,9 +31,9 @@ pub use active::{
 };
 
 pub use codec::{
-    AppendSequenceV1, DecodeLimitsV1, JournalHeaderV1, JournalHeaderV2, PrepareAdmissionError,
-    PreparedAdmissionV1, PreparedFrameV1, admission_frame_len_v1, decode_admission_frame_v1,
-    encode_admission_frame_v1, encode_decoded_admission_frame_v1,
+    AppendSequenceV1, DecodeLimitsV1, JournalHeaderV1, PrepareAdmissionError, PreparedAdmissionV1,
+    PreparedFrameV1, admission_frame_len_v1, decode_admission_frame_v1, encode_admission_frame_v1,
+    encode_decoded_admission_frame_v1,
 };
 pub use decoded::{DecodedAdmissionV1, DecodedDeclarationV1, DecodedObservationLineageV1};
 pub use error::JournalV1Error;
@@ -49,7 +49,8 @@ pub use manifest::{
     ManifestStoreError, ManifestStoreInspection, REGISTRY_SLOT_0_FILE_NAME,
     REGISTRY_SLOT_1_FILE_NAME, REGISTRY_SLOT_2_FILE_NAME, REGISTRY_STAGING_FILE_NAME,
     RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME, RETRY_SLOT_2_FILE_NAME,
-    RETRY_STAGING_FILE_NAME, RegistryPersistenceOptions, STORE_LOCK_FILE_NAME,
+    RETRY_STAGING_FILE_NAME, RegistryPersistenceOptions, STORE_FORMAT_FILE_NAME, STORE_FORMAT_LEN,
+    STORE_FORMAT_MAGIC, STORE_FORMAT_STAGING_FILE_NAME, STORE_FORMAT_VERSION, STORE_LOCK_FILE_NAME,
 };
 pub use retry::{
     MAX_PERSISTED_RETRY_ENTRIES, MAX_RETRY_STATE_BYTES, PendingRetryOutcome, RetryGuardEntry,
@@ -57,10 +58,8 @@ pub use retry::{
     RetryStateReference, RetryStateSnapshot,
 };
 
-/// Journal V1 format version written in premanifest headers and every admission frame.
+/// Journal V1 format version written in every header and admission frame.
 pub const JOURNAL_V1_VERSION: u16 = 1;
-/// Manifest-required active-header version; Journal V1 frame bytes remain version one.
-pub const ACTIVE_JOURNAL_HEADER_V2_VERSION: u16 = 2;
 /// Fixed Journal V1 file-header length in bytes.
 pub const JOURNAL_V1_HEADER_LEN: usize = 28;
 /// Fixed admission-frame prefix length before its variable payload.

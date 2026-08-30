@@ -1,5 +1,8 @@
 # M02-PR02c implementation brief: bounded journal rotation and sealing
 
+> Historical delivery record. Its durable-format compatibility and opening
+> claims are superseded by the current-only V1 durable-format reset.
+
 ## Exact baseline and authority
 
 - Repository: `open-control-historian`

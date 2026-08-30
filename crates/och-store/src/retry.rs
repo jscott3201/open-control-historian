@@ -1,4 +1,4 @@
-//! Bounded durable retry projection and compatible Retry State V1/V2 codec.
+//! Bounded durable retry projection and current Retry State V1 codec.
 
 use crate::codec::{Cursor, Encoder, crc32c, decode_retry, encode_retry};
 use crate::{
@@ -11,12 +11,11 @@ use std::fmt;
 
 /// Hard maximum replay plus guard entries in one durable retry projection.
 pub const MAX_PERSISTED_RETRY_ENTRIES: usize = 4_096;
-/// Hard maximum bytes in one Retry State V1 or V2 artifact.
+/// Hard maximum bytes in one Retry State V1 artifact.
 pub const MAX_RETRY_STATE_BYTES: usize = 2 * 1_024 * 1_024;
 
 pub(crate) const RETRY_MAGIC: [u8; 8] = *b"OCHRET01";
 pub(crate) const RETRY_VERSION: u16 = 1;
-pub(crate) const RETRY_V2_VERSION: u16 = 2;
 pub(crate) const RETRY_HEADER_LEN: usize = 64;
 const RETRY_HEADER_LEN_U16: u16 = 64;
 const RETRY_CRC_LEN: usize = 4;
@@ -232,7 +231,7 @@ pub struct RetryStateSnapshot {
 }
 
 impl RetryStateSnapshot {
-    /// Creates the empty legacy-V1 in-memory projection with no durable reference.
+    /// Creates an empty in-memory projection before startup installs durable state.
     #[must_use]
     pub fn empty(store_id: StoreId, options: RetryPersistenceOptions) -> Self {
         Self {
@@ -270,7 +269,7 @@ impl RetryStateSnapshot {
         self.options
     }
 
-    /// Returns durable snapshot identity, absent only for a legacy V1 manifest.
+    /// Returns durable snapshot identity, absent only before startup installation.
     #[must_use]
     pub const fn reference(&self) -> Option<RetryStateReference> {
         self.reference
@@ -428,17 +427,8 @@ pub(crate) fn encode_retry_state_with_limit(
 ) -> Result<Vec<u8>, RetryStateCodecError> {
     validate_state(snapshot)?;
     let reference = snapshot.reference.ok_or(RetryStateCodecError::Invalid)?;
-    let version = if snapshot
-        .replay
-        .iter()
-        .any(|outcome| outcome.committed.generation_catalog().is_some())
-    {
-        RETRY_V2_VERSION
-    } else {
-        RETRY_VERSION
-    };
     let mut counter = Encoder::counting();
-    encode_payload(&mut counter, snapshot, version)?;
+    encode_payload(&mut counter, snapshot)?;
     let payload_len = counter.len();
     let total = RETRY_HEADER_LEN
         .checked_add(payload_len)
@@ -448,14 +438,14 @@ pub(crate) fn encode_retry_state_with_limit(
         return Err(RetryStateCodecError::Invalid);
     }
     let mut payload = Encoder::new();
-    encode_payload(&mut payload, snapshot, version)?;
+    encode_payload(&mut payload, snapshot)?;
     let payload = payload.finish();
     if payload.len() != payload_len {
         return Err(RetryStateCodecError::Invalid);
     }
     let mut bytes = vec![0_u8; total];
     bytes[..8].copy_from_slice(&RETRY_MAGIC);
-    bytes[8..10].copy_from_slice(&version.to_be_bytes());
+    bytes[8..10].copy_from_slice(&RETRY_VERSION.to_be_bytes());
     bytes[10..12].copy_from_slice(&RETRY_HEADER_LEN_U16.to_be_bytes());
     bytes[12..28].copy_from_slice(snapshot.store_id.as_bytes());
     bytes[28..36].copy_from_slice(&reference.generation.to_be_bytes());
@@ -494,7 +484,6 @@ pub(crate) fn encode_retry_state_with_limit(
 fn encode_payload(
     encoder: &mut Encoder,
     snapshot: &RetryStateSnapshot,
-    version: u16,
 ) -> Result<(), RetryStateCodecError> {
     for outcome in &snapshot.replay {
         encode_retry(encoder, &outcome.qualification).map_err(invalid_journal)?;
@@ -510,24 +499,22 @@ fn encode_payload(
         encoder.u64(cutoff.checkpoint_generation());
         encoder.u64(cutoff.append_sequence());
         encoder.u64(cutoff.end_offset());
-        let retry = commit.retry_state().ok_or(RetryStateCodecError::Invalid)?;
+        let retry = commit.retry_state();
         encoder.u8(retry.slot());
         encoder.bytes(&[0; 7]);
         encoder.u64(retry.generation());
-        if version == RETRY_V2_VERSION {
-            encoder.u64(commit.sequence_floor());
-            match commit.generation_catalog() {
-                Some(catalog) => {
-                    encoder.u8(1);
-                    encoder.u8(catalog.slot());
-                    encoder.bytes(&[0; 6]);
-                    encoder.u64(catalog.generation());
-                    encoder.u64(catalog.length());
-                    encoder.u32(catalog.checksum());
-                    encoder.bytes(&[0; 12]);
-                }
-                None => encoder.bytes(&[0; 40]),
+        encoder.u64(commit.sequence_floor());
+        match commit.generation_catalog() {
+            Some(catalog) => {
+                encoder.u8(1);
+                encoder.u8(catalog.slot());
+                encoder.bytes(&[0; 6]);
+                encoder.u64(catalog.generation());
+                encoder.u64(catalog.length());
+                encoder.u32(catalog.checksum());
+                encoder.bytes(&[0; 12]);
             }
+            None => encoder.bytes(&[0; 40]),
         }
     }
     for entry in &snapshot.guard {
@@ -553,8 +540,7 @@ pub(crate) fn decode_retry_state_at_slot(
     {
         return Err(RetryStateCodecError::Invalid);
     }
-    let version = u16::from_be_bytes(bytes[8..10].try_into().unwrap_or_default());
-    if version != RETRY_VERSION && version != RETRY_V2_VERSION {
+    if u16::from_be_bytes(bytes[8..10].try_into().unwrap_or_default()) != RETRY_VERSION {
         return Err(RetryStateCodecError::Invalid);
     }
     let checksum_offset = bytes.len() - RETRY_CRC_LEN;
@@ -634,50 +620,45 @@ pub(crate) fn decode_retry_state_at_slot(
             return Err(RetryStateCodecError::Invalid);
         }
         let retry_generation = cursor.u64().map_err(invalid_journal)?;
-        let (sequence_floor, catalog) = if version == RETRY_V2_VERSION {
-            let sequence_floor = cursor.u64().map_err(invalid_journal)?;
-            let present = cursor.u8().map_err(invalid_journal)?;
-            let catalog_slot = cursor.u8().map_err(invalid_journal)?;
-            if cursor
-                .take(6)
-                .map_err(invalid_journal)?
-                .iter()
-                .any(|byte| *byte != 0)
+        let sequence_floor = cursor.u64().map_err(invalid_journal)?;
+        let present = cursor.u8().map_err(invalid_journal)?;
+        let catalog_slot = cursor.u8().map_err(invalid_journal)?;
+        if cursor
+            .take(6)
+            .map_err(invalid_journal)?
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(RetryStateCodecError::Invalid);
+        }
+        let catalog_generation = cursor.u64().map_err(invalid_journal)?;
+        let catalog_length = cursor.u64().map_err(invalid_journal)?;
+        let catalog_checksum = cursor.u32().map_err(invalid_journal)?;
+        if cursor
+            .take(12)
+            .map_err(invalid_journal)?
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(RetryStateCodecError::Invalid);
+        }
+        let catalog = match present {
+            0 if catalog_slot == 0
+                && catalog_generation == 0
+                && catalog_length == 0
+                && catalog_checksum == 0 =>
             {
-                return Err(RetryStateCodecError::Invalid);
+                None
             }
-            let catalog_generation = cursor.u64().map_err(invalid_journal)?;
-            let catalog_length = cursor.u64().map_err(invalid_journal)?;
-            let catalog_checksum = cursor.u32().map_err(invalid_journal)?;
-            if cursor
-                .take(12)
-                .map_err(invalid_journal)?
-                .iter()
-                .any(|byte| *byte != 0)
-            {
-                return Err(RetryStateCodecError::Invalid);
+            1 if catalog_slot < 3 && catalog_generation > 0 && catalog_length > 0 => {
+                Some(GenerationCatalogReference::new(
+                    catalog_slot,
+                    catalog_generation,
+                    catalog_length,
+                    catalog_checksum,
+                ))
             }
-            let catalog = match present {
-                0 if catalog_slot == 0
-                    && catalog_generation == 0
-                    && catalog_length == 0
-                    && catalog_checksum == 0 =>
-                {
-                    None
-                }
-                1 if catalog_slot < 3 && catalog_generation > 0 && catalog_length > 0 => {
-                    Some(GenerationCatalogReference::new(
-                        catalog_slot,
-                        catalog_generation,
-                        catalog_length,
-                        catalog_checksum,
-                    ))
-                }
-                _ => return Err(RetryStateCodecError::Invalid),
-            };
-            (sequence_floor, catalog)
-        } else {
-            (0, None)
+            _ => return Err(RetryStateCodecError::Invalid),
         };
         let cutoff = DurableCutoff::from_manifest(
             store_id,
@@ -691,7 +672,7 @@ pub(crate) fn decode_retry_state_at_slot(
             registry_generation,
             registry_slot,
             cutoff,
-            Some(RetryStateReference::new(retry_slot, retry_generation)),
+            RetryStateReference::new(retry_slot, retry_generation),
             sequence_floor,
             catalog,
         );
@@ -762,7 +743,6 @@ fn validate_state(snapshot: &RetryStateSnapshot) -> Result<(), RetryStateCodecEr
         if outcome.append_sequence == 0
             || outcome.append_sequence <= previous
             || outcome.end_offset == 0
-            || outcome.committed.retry_state().is_none()
             || outcome.committed.manifest_generation() == 0
             || outcome.committed.registry_generation() == 0
             || outcome.committed.registry_slot() >= 3
@@ -770,10 +750,7 @@ fn validate_state(snapshot: &RetryStateSnapshot) -> Result<(), RetryStateCodecEr
             return Err(RetryStateCodecError::Invalid);
         }
         let cutoff = outcome.committed.durable_cutoff();
-        let retry = outcome
-            .committed
-            .retry_state()
-            .ok_or(RetryStateCodecError::Invalid)?;
+        let retry = outcome.committed.retry_state();
         if cutoff.journal().store_id() != snapshot.store_id
             || cutoff.journal().generation() == 0
             || cutoff.checkpoint_generation() == 0
@@ -851,7 +828,7 @@ fn validate_root(
     catalog: Option<&GenerationCatalogSnapshot>,
 ) -> Result<(), RetryStateCodecError> {
     validate_state(snapshot)?;
-    let root_reference = root.retry_state().ok_or(RetryStateCodecError::Invalid)?;
+    let root_reference = root.retry_state();
     let root_cutoff = root.durable_cutoff();
     if snapshot.reference != Some(root_reference)
         || snapshot.store_id != root_cutoff.journal().store_id()
@@ -885,7 +862,7 @@ fn validate_root(
     if (!snapshot.guard.is_empty() && snapshot.replay.len() != snapshot.options.replay_capacity)
         || newest.append_sequence != root_cutoff.append_sequence()
         || !newest_covered
-        || newest.committed.retry_state() != Some(root_reference)
+        || newest.committed.retry_state() != root_reference
     {
         return Err(RetryStateCodecError::Invalid);
     }
@@ -917,7 +894,7 @@ fn validate_root(
     for (index, outcome) in snapshot.replay.iter().enumerate() {
         let commit = outcome.committed;
         let cutoff = commit.durable_cutoff();
-        let reference = commit.retry_state().ok_or(RetryStateCodecError::Invalid)?;
+        let reference = commit.retry_state();
         if commit.manifest_generation() > root.manifest_generation()
             || commit.registry_generation() > root.registry_generation()
             || (commit.registry_generation() == root.registry_generation()
@@ -948,7 +925,7 @@ fn validate_root(
         let group_ends = snapshot
             .replay
             .get(index + 1)
-            .is_none_or(|next| next.committed.retry_state() != Some(reference));
+            .is_none_or(|next| next.committed.retry_state() != reference);
         if group_ends
             && (outcome.append_sequence != cutoff.append_sequence()
                 || outcome.end_offset != cutoff.end_offset())
@@ -978,7 +955,7 @@ fn validate_transition_preflight(
                 .ok_or(RetryStateCodecError::Invalid)?,
         )
         .ok_or(RetryStateCodecError::Invalid)?;
-    if committed.retry_state() != Some(reference)
+    if committed.retry_state() != reference
         || pending.len() > MAX_PERSISTED_RETRY_ENTRIES
         || cutoff.journal().store_id() != snapshot.store_id
         || first.append_sequence != expected_first
@@ -1004,8 +981,8 @@ fn validate_commit_progression(
     prior: ManifestCommit,
     current: ManifestCommit,
 ) -> Result<(), RetryStateCodecError> {
-    let prior_reference = prior.retry_state().ok_or(RetryStateCodecError::Invalid)?;
-    let current_reference = current.retry_state().ok_or(RetryStateCodecError::Invalid)?;
+    let prior_reference = prior.retry_state();
+    let current_reference = current.retry_state();
     if current_reference.generation() == prior_reference.generation() {
         return if current == prior {
             Ok(())
@@ -1049,7 +1026,7 @@ mod tests {
     use crate::test_support;
     use och_core::RetryKey;
 
-    const REPLAY_SUFFIX_BYTES: usize = 88;
+    const REPLAY_SUFFIX_BYTES: usize = 136;
 
     fn qualification(key: &str) -> RetryQualification {
         let base = test_support::no_change_admission().retry().clone();
@@ -1103,7 +1080,7 @@ mod tests {
             (MAX_PERSISTED_RETRY_ENTRIES + 1) as u64,
             500,
         );
-        let commit = ManifestCommit::from_parts(2, 1, 0, cutoff, Some(reference));
+        let commit = ManifestCommit::from_parts(2, 1, 0, cutoff, reference);
         let repeated = PendingRetryOutcome::new(qualification("bounded"), 1, 1);
         let oversized = vec![repeated; MAX_PERSISTED_RETRY_ENTRIES + 1];
         assert_eq!(
@@ -1117,7 +1094,7 @@ mod tests {
             1,
             0,
             DurableCutoff::from_manifest(store_id, 1, 2, 3, 500),
-            Some(reference),
+            reference,
         );
         assert_eq!(
             initial.advance(reference, &wrong_suffix, suffix_commit),
@@ -1135,7 +1112,7 @@ mod tests {
             1,
             0,
             DurableCutoff::from_manifest(store_id, 1, 2, 5, 500),
-            Some(reference),
+            reference,
         );
         let initial =
             RetryStateSnapshot::empty_persisted(store_id, options, RetryStateReference::new(0, 1));
@@ -1191,7 +1168,7 @@ mod tests {
 
         let mut unequal_same_generation = candidate.clone();
         unequal_same_generation.replay[0].committed =
-            ManifestCommit::from_parts(3, 1, 0, root.durable_cutoff(), Some(reference));
+            ManifestCommit::from_parts(3, 1, 0, root.durable_cutoff(), reference);
         let unequal_bytes = encode_retry_state(&unequal_same_generation)
             .expect("checksummed unequal same-generation commit");
         let unequal_same_generation =
@@ -1205,14 +1182,14 @@ mod tests {
             1,
             0,
             DurableCutoff::from_manifest(store_id, 1, 4, 5, 500),
-            Some(RetryStateReference::new(1, 4)),
+            RetryStateReference::new(1, 4),
         );
         let earlier_generation = ManifestCommit::from_parts(
             2,
             1,
             0,
             DurableCutoff::from_manifest(store_id, 1, 2, 4, 400),
-            Some(RetryStateReference::new(0, 2)),
+            RetryStateReference::new(0, 2),
         );
         assert_eq!(
             validate_commit_progression(earlier_generation, skipped_generation),
@@ -1229,7 +1206,7 @@ mod tests {
             1,
             0,
             DurableCutoff::from_manifest(store_id, 1, 2, 0, 64),
-            Some(RetryStateReference::new(1, 2)),
+            RetryStateReference::new(1, 2),
         );
         let hostile =
             RetryStateSnapshot::empty_persisted(store_id, options, RetryStateReference::new(1, 2));
@@ -1315,7 +1292,7 @@ mod tests {
         let reference = RetryStateReference::new(1, 2);
         let qualification = test_support::no_change_admission().retry().clone();
         let cutoff = DurableCutoff::from_manifest(store_id, 1, 2, 1, 500);
-        let commit = ManifestCommit::from_parts(2, 1, 0, cutoff, Some(reference));
+        let commit = ManifestCommit::from_parts(2, 1, 0, cutoff, reference);
         let candidate = initial
             .advance(
                 reference,
@@ -1382,7 +1359,7 @@ mod tests {
                     1,
                     0,
                     DurableCutoff::from_manifest(store_id, 1, 2, 2, 500),
-                    Some(reference),
+                    reference,
                 ),
             ),
             Err(RetryStateCodecError::Invalid)
@@ -1390,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_v2_round_trips_exact_commits_and_refuses_hostile_catalog_extension_fields() {
+    fn current_retry_v1_round_trips_exact_commits_and_refuses_hostile_catalog_fields() {
         let store_id = test_support::store_id(1);
         let options = RetryPersistenceOptions::new(2, 2).expect("retry options");
         let first_reference = RetryStateReference::new(1, 2);
@@ -1400,7 +1377,7 @@ mod tests {
             2,
             1,
             DurableCutoff::from_manifest(store_id, 1, 2, 1, 400),
-            Some(first_reference),
+            first_reference,
         );
         let catalog = GenerationCatalogReference::new(0, 1, 132, 7);
         let root = ManifestCommit::from_generation_parts(
@@ -1408,12 +1385,12 @@ mod tests {
             2,
             1,
             DurableCutoff::from_manifest(store_id, 2, 2, 2, 500),
-            Some(root_reference),
+            root_reference,
             1,
             Some(catalog),
         );
-        let first_qualification = qualification("v2-first");
-        let second_qualification = qualification("v2-second");
+        let first_qualification = qualification("current-first");
+        let second_qualification = qualification("current-second");
         let snapshot = RetryStateSnapshot {
             store_id,
             options,
@@ -1435,11 +1412,11 @@ mod tests {
             .into_boxed_slice(),
             guard: Box::new([]),
         };
-        let canonical = encode_retry_state(&snapshot).expect("Retry State V2 bytes");
-        assert_eq!(&canonical[8..10], &RETRY_V2_VERSION.to_be_bytes());
+        let canonical = encode_retry_state(&snapshot).expect("current Retry State V1 bytes");
+        assert_eq!(&canonical[8..10], &RETRY_VERSION.to_be_bytes());
         assert_eq!(
             decode_retry_state_at_slot(&canonical, 2, store_id, options)
-                .expect("Retry State V2 decode")
+                .expect("current Retry State V1 decode")
                 .1,
             snapshot
         );
@@ -1464,7 +1441,7 @@ mod tests {
             repair_checksum(&mut hostile);
             assert!(
                 decode_retry_state_at_slot(&hostile, 2, store_id, options).is_err(),
-                "hostile Retry State V2 field at {offset} must refuse"
+                "hostile current Retry State V1 field at {offset} must refuse"
             );
         }
         let mut unknown_version = canonical.clone();

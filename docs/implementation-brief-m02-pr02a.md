@@ -1,5 +1,8 @@
 # M02-PR02a implementation brief: manifest-rooted registry authority
 
+> Historical delivery record. Its durable-format compatibility and opening
+> claims are superseded by the current-only V1 durable-format reset.
+
 ## Exact baseline and authority
 
 - Repository: `open-control-historian`

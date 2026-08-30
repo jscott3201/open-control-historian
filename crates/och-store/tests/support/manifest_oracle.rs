@@ -1,7 +1,7 @@
 //! Primitive-only manifest, registry, retry, catalog, and sealed-journal oracle.
 
-const MANIFEST_LEN: usize = 128;
-const MANIFEST_V3_LEN: usize = 160;
+const HISTORICAL_MANIFEST_LEN: usize = 128;
+const MANIFEST_V1_LEN: usize = 160;
 
 pub struct CatalogEntry {
     pub journal_generation: u64,
@@ -21,7 +21,7 @@ pub struct CatalogReference {
     pub checksum: u32,
 }
 
-pub struct RetryV2Outcome<'a> {
+pub struct RetryV1Outcome<'a> {
     pub series: [u8; 16],
     pub producer: [u8; 16],
     pub key: &'a str,
@@ -59,11 +59,22 @@ pub fn checksum(bytes: &[u8]) -> u32 {
     crc32c(bytes)
 }
 
+pub fn store_format_v1(store: [u8; 16]) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    bytes[..8].copy_from_slice(b"OCHFMT01");
+    bytes[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    bytes[10..12].copy_from_slice(&32_u16.to_be_bytes());
+    bytes[12..28].copy_from_slice(&store);
+    let checksum = crc32c(&bytes[..28]);
+    bytes[28..32].copy_from_slice(&checksum.to_be_bytes());
+    bytes
+}
+
 pub fn sealed_raw_journal_v1(store: [u8; 16], frames: &[&[u8]]) -> Vec<u8> {
     let capacity = 28 + frames.iter().map(|frame| frame.len()).sum::<usize>();
     let mut bytes = Vec::with_capacity(capacity);
     bytes.extend_from_slice(b"OCHJNL01");
-    bytes.extend_from_slice(&2_u16.to_be_bytes());
+    bytes.extend_from_slice(&1_u16.to_be_bytes());
     bytes.extend_from_slice(&28_u16.to_be_bytes());
     bytes.extend_from_slice(&store);
     for frame in frames {
@@ -112,7 +123,7 @@ pub fn generation_catalog_v1(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn manifest_v3(
+pub fn current_manifest_v1(
     store: [u8; 16],
     generation: u64,
     journal_generation: u64,
@@ -126,11 +137,11 @@ pub fn manifest_v3(
     retry_generation: u64,
     retry_bytes: &[u8],
     sequence_floor: u64,
-    catalog: CatalogReference,
-) -> [u8; MANIFEST_V3_LEN] {
-    let mut bytes = [0_u8; MANIFEST_V3_LEN];
+    catalog: Option<CatalogReference>,
+) -> [u8; MANIFEST_V1_LEN] {
+    let mut bytes = [0_u8; MANIFEST_V1_LEN];
     bytes[..8].copy_from_slice(b"OCHMAN01");
-    bytes[8..10].copy_from_slice(&3_u16.to_be_bytes());
+    bytes[8..10].copy_from_slice(&1_u16.to_be_bytes());
     bytes[10..12].copy_from_slice(&160_u16.to_be_bytes());
     bytes[12..28].copy_from_slice(&store);
     bytes[28..36].copy_from_slice(&generation.to_be_bytes());
@@ -147,21 +158,62 @@ pub fn manifest_v3(
     bytes[104..112].copy_from_slice(&(retry_bytes.len() as u64).to_be_bytes());
     bytes[112..116].copy_from_slice(&crc32c(retry_bytes).to_be_bytes());
     bytes[124..132].copy_from_slice(&sequence_floor.to_be_bytes());
-    bytes[132] = catalog.slot;
-    bytes[136..144].copy_from_slice(&catalog.generation.to_be_bytes());
-    bytes[144..152].copy_from_slice(&catalog.length.to_be_bytes());
-    bytes[152..156].copy_from_slice(&catalog.checksum.to_be_bytes());
+    if let Some(catalog) = catalog {
+        bytes[132] = catalog.slot;
+        bytes[136..144].copy_from_slice(&catalog.generation.to_be_bytes());
+        bytes[144..152].copy_from_slice(&catalog.length.to_be_bytes());
+        bytes[152..156].copy_from_slice(&catalog.checksum.to_be_bytes());
+    }
     let checksum = crc32c(&bytes[..156]);
     bytes[156..160].copy_from_slice(&checksum.to_be_bytes());
     bytes
 }
 
-pub fn retry_v2(
+#[allow(clippy::too_many_arguments)]
+pub fn historical_manifest_v3(
+    store: [u8; 16],
+    generation: u64,
+    journal_generation: u64,
+    checkpoint_generation: u64,
+    append_sequence: u64,
+    end_offset: u64,
+    registry_slot: u8,
+    registry_generation: u64,
+    registry_bytes: &[u8],
+    retry_slot: u8,
+    retry_generation: u64,
+    retry_bytes: &[u8],
+    sequence_floor: u64,
+    catalog: CatalogReference,
+) -> [u8; MANIFEST_V1_LEN] {
+    let mut bytes = current_manifest_v1(
+        store,
+        generation,
+        journal_generation,
+        checkpoint_generation,
+        append_sequence,
+        end_offset,
+        registry_slot,
+        registry_generation,
+        registry_bytes,
+        retry_slot,
+        retry_generation,
+        retry_bytes,
+        sequence_floor,
+        Some(catalog),
+    );
+    bytes[8..10].copy_from_slice(&3_u16.to_be_bytes());
+    let checksum = crc32c(&bytes[..156]);
+    bytes[156..160].copy_from_slice(&checksum.to_be_bytes());
+    bytes
+}
+
+pub fn retry_v1(
     store: [u8; 16],
     generation: u64,
     replay_capacity: u32,
     guard_capacity: u32,
-    outcomes: &[RetryV2Outcome<'_>],
+    outcomes: &[RetryV1Outcome<'_>],
 ) -> Vec<u8> {
     fn string(bytes: &mut Vec<u8>, value: &str) {
         let length = u32::try_from(value.len()).expect("oracle string length fits u32");
@@ -205,7 +257,7 @@ pub fn retry_v2(
     }
     let mut bytes = vec![0_u8; 64 + payload.len() + 4];
     bytes[..8].copy_from_slice(b"OCHRET01");
-    bytes[8..10].copy_from_slice(&2_u16.to_be_bytes());
+    bytes[8..10].copy_from_slice(&1_u16.to_be_bytes());
     bytes[10..12].copy_from_slice(&64_u16.to_be_bytes());
     bytes[12..28].copy_from_slice(&store);
     bytes[28..36].copy_from_slice(&generation.to_be_bytes());
@@ -311,6 +363,7 @@ pub fn retry_with_one_replay(
     payload.push(retry_slot);
     payload.extend_from_slice(&[0; 7]);
     payload.extend_from_slice(&retry_generation.to_be_bytes());
+    payload.extend_from_slice(&[0; 48]);
 
     let mut bytes = vec![0_u8; 64 + payload.len() + 4];
     bytes[..8].copy_from_slice(b"OCHRET01");
@@ -334,6 +387,69 @@ pub fn retry_with_one_replay(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn historical_retry_v1_with_one_replay(
+    store: [u8; 16],
+    generation: u64,
+    replay_capacity: u32,
+    guard_capacity: u32,
+    series: [u8; 16],
+    producer: [u8; 16],
+    key: &str,
+    content_format: &str,
+    content_version: u128,
+    digest: [u8; 32],
+    append_sequence: u64,
+    end_offset: u64,
+    manifest_generation: u64,
+    registry_slot: u8,
+    registry_generation: u64,
+    checkpoint_generation: u64,
+    cutoff_sequence: u64,
+    cutoff_end: u64,
+    retry_slot: u8,
+    retry_generation: u64,
+) -> Vec<u8> {
+    let current = retry_with_one_replay(
+        store,
+        generation,
+        replay_capacity,
+        guard_capacity,
+        series,
+        producer,
+        key,
+        content_format,
+        content_version,
+        digest,
+        append_sequence,
+        end_offset,
+        manifest_generation,
+        registry_slot,
+        registry_generation,
+        checkpoint_generation,
+        cutoff_sequence,
+        cutoff_end,
+        retry_slot,
+        retry_generation,
+    );
+    let mut historical = current[..current.len() - 52].to_vec();
+    historical.extend_from_slice(&[0; 4]);
+    let payload_len = u64::from_be_bytes(historical[52..60].try_into().expect("payload length"));
+    historical[52..60].copy_from_slice(&(payload_len - 48).to_be_bytes());
+    let checksum_offset = historical.len() - 4;
+    let checksum = crc32c(&historical[..checksum_offset]);
+    historical[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+    historical
+}
+
+pub fn historical_retry_v2(mut bytes: Vec<u8>) -> Vec<u8> {
+    bytes[8..10].copy_from_slice(&2_u16.to_be_bytes());
+    let checksum_offset = bytes.len() - 4;
+    let checksum = crc32c(&bytes[..checksum_offset]);
+    bytes[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+    bytes
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn manifest(
     store: [u8; 16],
     generation: u64,
@@ -346,8 +462,8 @@ pub fn manifest(
     retry_slot: u8,
     retry_generation: u64,
     retry_bytes: &[u8],
-) -> [u8; MANIFEST_LEN] {
-    let mut bytes = [0_u8; MANIFEST_LEN];
+) -> [u8; HISTORICAL_MANIFEST_LEN] {
+    let mut bytes = [0_u8; HISTORICAL_MANIFEST_LEN];
     bytes[..8].copy_from_slice(b"OCHMAN01");
     bytes[8..10].copy_from_slice(&2_u16.to_be_bytes());
     bytes[10..12].copy_from_slice(&128_u16.to_be_bytes());
@@ -388,8 +504,8 @@ pub fn manifest_v1(
     registry_slot: u8,
     registry_generation: u64,
     registry_bytes: &[u8],
-) -> [u8; MANIFEST_LEN] {
-    let mut bytes = [0_u8; MANIFEST_LEN];
+) -> [u8; HISTORICAL_MANIFEST_LEN] {
+    let mut bytes = [0_u8; HISTORICAL_MANIFEST_LEN];
     bytes[..8].copy_from_slice(b"OCHMAN01");
     bytes[8..10].copy_from_slice(&1_u16.to_be_bytes());
     bytes[10..12].copy_from_slice(&128_u16.to_be_bytes());

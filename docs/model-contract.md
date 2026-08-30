@@ -218,13 +218,14 @@ convert into `CanonicalAdmission`, bind new evidence, resolve missing declaratio
 history, mutate a registry, or be submitted to runtime.
 
 M02-PR01b1 first placed those frames in one fixed generation-one active journal
-paired with a two-slot mechanical checkpoint. M02-PR02a adds a stable store lock, a
-header-v2 compatibility fence in the unchanged 28-byte layout, two manifest
-slots, and three complete registry snapshot slots. M02-PR02b adds Manifest V2
-within the same 128-byte slots and three reusable Retry State V1 slots.
-M02-PR02c preserves every old byte and adds deterministic successor active pairs,
-raw-Journal seals, Generation Catalog V1, 160-byte Manifest V3, and Retry State
-V2 only when a retained replay outcome carries generation/catalog identity.
+paired with a two-slot mechanical checkpoint. M02-PR02a added a stable store lock,
+manifest, and complete registry snapshots; M02-PR02b added bounded durable retry;
+and M02-PR02c added deterministic successor active pairs, raw-Journal seals, and
+Generation Catalog V1. The durable-format reset now requires a fixed root Store
+Format V1 marker and one current V1 layout per artifact family: 28-byte Journal
+Header V1, 160-byte Manifest V1 with mandatory retry reference, and Retry State V1
+with the generation/floor/catalog extension on every replay entry. Historical or
+mixed stores are rejected before stable-lock creation or durable mutation.
 Admission-frame bytes remain
 Journal V1. The runtime computes the exact frame size
 without allocating, reserves count and bytes atomically, then allocates and
@@ -232,7 +233,7 @@ encodes under that retained reservation. The sole blocking writer assigns one
 store-global append sequence across active generations and validates frame and
 declaration StoreId against the journal header.
 Durable order is append, volatile publication, journal sync, alternate checkpoint
-write, checkpoint sync, retry snapshot publication, Manifest V2/V3 publication
+write, checkpoint sync, Retry State V1 publication, Manifest V1 publication
 naming that exact cutoff and the current registry/retry snapshots, then one
 atomic runtime projection/receipt transition and waiter wake. The checkpoint
 retains only store and journal identity, slot generation, append sequence, end
@@ -242,18 +243,19 @@ valid consecutive slots must advance append sequence and end offset strictly; a
 recomputed checksum cannot legitimize a non-progressing cutoff. The checkpoint is
 neither registry nor retry authority.
 
-Manifest open bounds the exact non-recursive inventory, selects only strict
-manifest candidates, restores the referenced registry solely by public
+Manifest open first bounds the exact non-recursive inventory and validates the
+Store Format V1 marker without mutation. Markerless, historical, malformed, and
+mixed durable evidence returns path-free `UnsupportedStoreFormat`. After acquiring
+the stable lock and repeating validation, open selects only strict manifest
+candidates, restores the referenced registry solely by public
 register/revise/retire replay, and requires exact snapshot equality. Every
-recovered declaration must resolve historically. A nonempty premanifest V1 or V2
-store requires an explicit matching snapshot; an exact header-only store may
-bootstrap empty. New binding uses the current active registry, while append
+recovered declaration must resolve historically. There is no premanifest adoption,
+format migration, or compatibility decoder. New binding uses the current active registry, while append
 requires exact equality with `resolve(series, revision)` and therefore preserves
 already-issued historical evidence after correction or retirement. Returned
 reopen records remain `DecodedAdmissionV1` inspection evidence and do not rebuild
-volatile latest. A referenced Retry State V1/V2 snapshot, rather than decoded
-journal history, restores the bounded completed-retry projection. A legacy
-Manifest V1 restores empty retry tiers and deliberately receives no backfill.
+volatile latest. The mandatory referenced Retry State V1 snapshot, rather than
+decoded journal history, restores the bounded completed-retry projection.
 Rotation applies only to an exact fully durable nonempty active range. It creates
 an empty successor whose exclusive sequence floor is the prior inclusive cutoff;
 offset and checkpoint generations restart locally, while every returned receipt
@@ -267,7 +269,8 @@ cleanup interruption is the sole narrow redundancy. Open does not reinterpret
 sealed payloads or make them queryable. Final native
 segments, reclamation, broad recovery, latest projection, and an unbounded or
 time-based durable retry horizon remain absent. Exact law is specified in
-[Manifest V1/V2/V3](manifest-v1-format.md), [Retry State V1/V2](retry-state-v1-format.md),
+[Store Format V1](store-format-v1.md), [Manifest V1](manifest-v1-format.md),
+[Retry State V1](retry-state-v1-format.md),
 [Generation Catalog V1](generation-catalog-v1-format.md), and
 [sealed raw Journal V1](sealed-journal-v1-format.md).
 
@@ -368,11 +371,11 @@ it. The sole blocking store writer mutates this projection; runtime ingress hold
 only the immutable committed snapshot installed atomically with the receipts it
 covers.
 
-M02-PR02c changes neither classification nor FIFO horizon. Retry State V2 extends
-only persisted replay evidence so outcomes may span journal generations. Global
+The durable-format reset changes neither classification nor FIFO horizon. Retry
+State V1 always retains extended replay evidence so outcomes may span journal generations. Global
 append order remains strict; end offsets and checkpoint generations compare only
 within their owning generation. Older outcomes must be covered by the exact
-catalog referenced from the current Manifest V3, and their embedded original
+catalog referenced from the current Manifest V1, and their embedded original
 commit is never rewritten merely because rotation occurred.
 
 ## Evidence ownership
