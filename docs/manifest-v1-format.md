@@ -107,6 +107,12 @@ Unknown tags, wrong store/series scope, noncanonical order, count mismatch,
 trailing bytes, or a snapshot that does not re-encode exactly after public core
 replay is invalid.
 
+Open compares the configured and manifest `StoreId` with every decoded registry
+artifact, including referenced and recognized unreferenced slots, before any
+snapshot can be adopted. A canonically encoded foreign-store snapshot therefore
+refuses as `StoreMismatch` even when its manifest reference and checksum are
+otherwise valid and the recovered journal is empty.
+
 Counts, lengths, hard maxima, and the 64 MiB artifact ceiling are checked before
 allocation or traversal. Tombstones and every historical declaration count
 toward the persisted limits; nothing is evicted.
@@ -142,9 +148,13 @@ no success and terminally faults that live writer. PR02a reopen deliberately
 refuses a checkpoint/manifest cutoff mismatch; convergence is owned by PR03a.
 
 Registry lifecycle and bind requests share the runtime's one bounded control
-gate with the append-to-publication handshake and the sole blocking writer.
-There is no second queue, mutable registry handle, decoded-record authority, or
-raw manifest/path/descriptor API.
+gate with the append-to-publication handshake and the sole blocking writer. A
+fixed 16-permit nonblocking admission precedes that gate for lifecycle and bind
+requests. Each accepted permit is held through one writer response and is
+released by completion, error, or cancellation; excess requests receive typed
+`RegistryError::Capacity` without joining the mutex waiter population. There is
+no second queue, mutable registry handle, decoded-record authority, or raw
+manifest/path/descriptor API.
 
 ## Deliberate limits
 

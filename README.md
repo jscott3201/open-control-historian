@@ -30,10 +30,11 @@ preserves FIFO across protected/normal/bulk resource classes, and coalesces only
 equivalent outstanding retries. Handled receipts identify an append after its
 volatile publication decision; distinct durable receipts are released only after
 the group barrier covers that append in the journal, checkpoint, and committed
-manifest. Public lifecycle and bind requests share the same bounded control gate
-and sole writer as append publication. New bindings require the current active
-declaration, while append validates the admission's exact retained historical
-declaration. Slots and byte reservations remain held through durability. Cloneable read handles
+manifest. Public lifecycle and bind requests cross a fixed 16-request
+nonblocking admission bound before sharing the same control gate and sole writer
+as append publication. New bindings require the current active declaration,
+while append validates the admission's exact retained historical declaration.
+Slots and byte reservations remain held through durability. Cloneable read handles
 capture store-scoped immutable latest snapshots; latest restarts empty and never
 becomes recovery or declaration authority. Graceful shutdown drains, forces a
 final barrier, seals latest, and joins. Drop signals fail-stop without blocking;

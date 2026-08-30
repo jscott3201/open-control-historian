@@ -430,8 +430,14 @@ impl ManifestStore {
         current_slot: usize,
         current: ManifestRecord,
     ) -> Result<Self, ManifestStoreError> {
-        let registry = read_referenced_registry(&config.directory, current.registry)?;
-        validate_registry_inventory(&config.directory, manifest_slots, current.registry)?;
+        let registry =
+            read_referenced_registry(&config.directory, current.registry, config.store_id)?;
+        validate_registry_inventory(
+            &config.directory,
+            manifest_slots,
+            current.registry,
+            config.store_id,
+        )?;
         let active_config = ActiveJournalConfig::new(
             config.directory.clone(),
             config.store_id,
@@ -950,6 +956,7 @@ fn select_current_manifest(
 fn read_referenced_registry(
     directory: &Path,
     reference: RegistryReference,
+    store_id: StoreId,
 ) -> Result<SeriesRegistry, ManifestStoreError> {
     let index = usize::from(reference.slot);
     let name = REGISTRY_SLOT_NAMES
@@ -962,6 +969,9 @@ fn read_referenced_registry(
         return Err(ManifestStoreError::InvalidRegistry);
     }
     let decoded = decode_registry_snapshot_at_slot(&bytes, reference.slot)?;
+    if decoded.registry.store_id() != store_id {
+        return Err(ManifestStoreError::StoreMismatch);
+    }
     if decoded.reference != reference {
         return Err(ManifestStoreError::InvalidRegistry);
     }
@@ -972,6 +982,7 @@ fn validate_registry_inventory(
     directory: &Path,
     manifests: [Option<ManifestRecord>; 2],
     current: RegistryReference,
+    store_id: StoreId,
 ) -> Result<(), ManifestStoreError> {
     for (slot, name) in REGISTRY_SLOT_NAMES.iter().enumerate() {
         let Some(bytes) =
@@ -983,6 +994,9 @@ fn validate_registry_inventory(
             &bytes,
             u8::try_from(slot).map_err(|_| ManifestStoreError::InvalidRegistry)?,
         )?;
+        if decoded.registry.store_id() != store_id {
+            return Err(ManifestStoreError::StoreMismatch);
+        }
         if decoded.reference.slot != u8::try_from(slot).unwrap_or(u8::MAX) {
             return Err(ManifestStoreError::InvalidRegistry);
         }
@@ -995,7 +1009,7 @@ fn validate_registry_inventory(
         }
     }
     for manifest in manifests.into_iter().flatten() {
-        let _ = read_referenced_registry(directory, manifest.registry)?;
+        let _ = read_referenced_registry(directory, manifest.registry, store_id)?;
     }
     Ok(())
 }

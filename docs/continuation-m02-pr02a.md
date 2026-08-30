@@ -17,10 +17,13 @@ inspection evidence and are compared against restored historical authority;
 they never create it.
 
 `och-runtime` now routes register, revise, retire, current-active bind, and
-append through the same bounded writer. One async control gate is held across a
-lifecycle/bind request or the complete append-to-volatile-publication handshake;
-the existing fixed-capacity channel remains the only writer queue. No mutable
-registry, raw manifest, path, descriptor, or decoded-record authority is public.
+append through the same bounded writer. Lifecycle and bind callers first cross a
+fixed 16-request nonblocking admission bound; accepted permits are held through
+the async control gate and one writer response, then reclaimed on completion,
+error, or cancellation. The gate is held across that request or the complete
+append-to-volatile-publication handshake, and the existing fixed-capacity channel
+remains the only writer queue. No mutable registry, raw manifest, path,
+descriptor, or decoded-record authority is public.
 
 ## Compatibility and bootstrap
 
@@ -75,6 +78,8 @@ Deterministic evidence covers:
   one-byte-under-limit refusal and exact-bound success;
 - hostile magic/version/length/count/reserved/checksum/store/slot/reference and
   cutoff evidence, fixed-inventory and staging refusals, and hard limits;
+- a valid foreign-store registry with an otherwise valid manifest reference and
+  checksum refusing unchanged before registry authority is exposed;
 - V1/V2 header-only bootstrap, required nonempty proof, incomplete proof
   refusal, exact history comparison, and V1-to-V2 old-decoder rejection;
 - initial/revised/retired history replay, idempotent operations, stale/capacity
@@ -89,6 +94,9 @@ Deterministic evidence covers:
   and deterministic interrupted/final-slot reopen classification;
 - one hostile concurrent retirement/append ordering through the sole runtime
   control gate and writer, with both committed outcomes surviving restart;
+- a held control gate with mixed lifecycle/bind callers proving the exact
+  16-request admission boundary, typed overflow, FIFO revision visibility, and
+  full capacity recovery;
 - the existing exact journal/checkpoint/latest/retry regressions, including
   volatile-empty latest and no restored completed-retry cache.
 
@@ -117,12 +125,12 @@ latest rebuild, query behavior, or `_roadmap/` publication is part of PR02a.
 
 The implementation worktree passed:
 
-- `cargo +1.98.0 test -p och-store --locked`: 38 passed;
-- `cargo +1.98.0 test -p och-runtime --locked`: 48 passed;
+- `cargo +1.98.0 test -p och-store --locked`: 39 passed;
+- `cargo +1.98.0 test -p och-runtime --locked`: 49 passed;
 - `cargo +1.98.0 test -p och-core --locked`: 71 passed;
 - `cargo +1.98.0 test --workspace --doc --locked`: 3 passed;
 - `git diff --check`;
-- `./scripts/gate.sh pr`: 162 nextest tests passed with zero skipped,
+- `./scripts/gate.sh pr`: 164 nextest tests passed with zero skipped,
   3 doctests passed, the three-native-root/five-package dependency policy
   passed, rustdoc passed, 88 repository files passed hygiene checks, and license,
   source, ban, and whitespace checks passed.

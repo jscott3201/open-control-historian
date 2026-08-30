@@ -29,9 +29,10 @@ bounded filesystem-backed store, admits only complete M00-PR05
 and sends FIFO work to one dedicated blocking writer thread. Handled and durable
 receipt stages are distinct; the latter is released only after journal sync,
 checkpoint sync, and manifest publication cover the append. Public register,
-revise, retire, and active bind requests share the sole bounded writer ordering
-authority with append publication. A fixed reaper owns the eventual writer join
-after nonblocking Drop.
+revise, retire, and active bind requests first cross a fixed nonblocking
+control-admission bound, then share the sole writer ordering authority with
+append publication. A fixed reaper owns the eventual writer join after
+nonblocking Drop.
 
 `och-store` owns Journal V1 bytes, the header-v2 old-writer fence, stable
 never-renamed store lock, retained journal lock, fixed active-artifact

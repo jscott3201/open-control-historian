@@ -291,6 +291,8 @@ impl RegistryCommit {
 /// Typed registry-control refusal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistryError {
+    /// The fixed nonblocking lifecycle/bind admission bound is full.
+    Capacity,
     /// The runtime or its sole writer is closed.
     Closed,
     /// Canonical or durable store authority refused the operation.
@@ -300,6 +302,7 @@ pub enum RegistryError {
 impl fmt::Display for RegistryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Capacity => "historian registry control capacity is full",
             Self::Closed => "historian registry control is closed",
             Self::Store(_) => "historian registry operation refused",
         })

@@ -63,7 +63,8 @@ authority; Journal V1 admission frame bytes remain unchanged.
 - Append validation is historical: the admission declaration must exactly equal
   `SeriesRegistry::resolve(series, revision)`. Already-issued evidence remains
   admissible after correction or retirement.
-- Registry and append control share one bounded writer ordering authority.
+- Registry and append control share one bounded writer ordering authority;
+  lifecycle/bind admission is nonblocking and fixed at 16 retained requests.
 - No returned lifecycle commit or durable receipt precedes manifest publication.
 - Every public refusal is path-free and every required read/allocation is bounded.
 

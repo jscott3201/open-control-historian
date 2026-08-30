@@ -37,7 +37,7 @@ use store_worker::{
     AppendResult, InspectionShared, WorkerMessage, spawn_worker_and_reaper, try_send,
 };
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 
 /// One open filesystem-backed Historian runtime.
@@ -55,6 +55,7 @@ pub struct HistorianRuntime {
     initial_inspection: och_store::ManifestStoreInspection,
     recovered: Arc<[RecoveredAdmissionV1]>,
     control_gate: Arc<AsyncMutex<()>>,
+    control_admission: Arc<Semaphore>,
     shutdown_complete: bool,
 }
 
@@ -93,6 +94,7 @@ impl HistorianRuntime {
         let (store_ready_tx, store_ready_rx) = oneshot::channel();
         let (reaped_tx, reaped_rx) = oneshot::channel();
         let control_gate = Arc::new(AsyncMutex::new(()));
+        let control_admission = Arc::new(Semaphore::new(MAX_OUTSTANDING_COMMANDS));
         spawn_worker_and_reaper(
             store_options,
             store_receiver,
@@ -137,6 +139,7 @@ impl HistorianRuntime {
                     initial_inspection: ready.inspection,
                     recovered: ready.recovered.into(),
                     control_gate,
+                    control_admission,
                     shutdown_complete: false,
                 })
             }
@@ -195,12 +198,17 @@ impl HistorianRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`RegistryError::Closed`] after writer closure, or the exact
-    /// canonical/persistence refusal from the store authority.
+    /// Returns [`RegistryError::Capacity`] without waiting when the fixed
+    /// control-admission bound is full, [`RegistryError::Closed`] after writer
+    /// closure, or the exact canonical/persistence refusal from the store
+    /// authority.
     pub async fn apply_registry(
         &self,
         operation: RegistryOperation,
     ) -> Result<RegistryCommit, RegistryError> {
+        let _admission = Arc::clone(&self.control_admission)
+            .try_acquire_owned()
+            .map_err(|_| RegistryError::Capacity)?;
         let _control = self.control_gate.lock().await;
         let sender = self.store_sender.as_ref().ok_or(RegistryError::Closed)?;
         let (response_tx, response_rx) = oneshot::channel();
@@ -228,12 +236,16 @@ impl HistorianRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`RegistryError::Closed`] after writer closure, or the exact
-    /// current-active core binding refusal.
+    /// Returns [`RegistryError::Capacity`] without waiting when the fixed
+    /// control-admission bound is full, [`RegistryError::Closed`] after writer
+    /// closure, or the exact current-active core binding refusal.
     pub async fn bind_envelope(
         &self,
         envelope: och_core::CollectionEnvelope,
     ) -> Result<och_core::DeclaredCollectionEnvelope, RegistryError> {
+        let _admission = Arc::clone(&self.control_admission)
+            .try_acquire_owned()
+            .map_err(|_| RegistryError::Capacity)?;
         let _control = self.control_gate.lock().await;
         let sender = self.store_sender.as_ref().ok_or(RegistryError::Closed)?;
         let (response_tx, response_rx) = oneshot::channel();
@@ -1006,23 +1018,25 @@ mod tests {
         AdmissionPriority, BarrierDemand, ByteReservationLimits, DurableOutcome, GroupCommitPolicy,
         HandledOutcome, HistorianIngress, HistorianRuntime, IngressCommand, LatestReadError,
         LatestReadHandle, LifecycleProbe, MAX_OUTSTANDING_COMMANDS, MAX_PUBLISHED_SERIES,
-        ReceiptOutcome, RegistryOperation, RegistryOutcome, RuntimeHealth, ShutdownError,
-        StartError, StoreOptions, StoreOptionsError, SubmissionDisposition, TestBehavior,
-        TrySubmitErrorKind, WriterOptions, default_test_registry_operation, test_directory,
+        ReceiptOutcome, RegistryError, RegistryOperation, RegistryOutcome, RuntimeHealth,
+        ShutdownError, StartError, StoreOptions, StoreOptionsError, SubmissionDisposition,
+        TestBehavior, TrySubmitErrorKind, WriterOptions, default_test_registry_operation,
+        test_directory,
     };
     use och_core::{
         ArtifactId, ArtifactReference, CanonicalAdmission, CaptureLifecycle, CaptureRunEvidence,
         CollectionEnvelope, CollectionMode, ContentFormat, ContentIdentity, ContentVersion,
-        DeclarationEvidence, DeclarationReference, EvidenceId, EvidenceKind, ExactValue, Gap,
-        GapReason, NativeStatus, NoChange, NormalizedRecordEvidence, Observation, ObservationId,
-        ObservationTimes, ProducerEpoch, ProducerId, ProducerPosition, ProducerSequence, Quality,
-        QualityFlags, QualityLevel, QuantityEvidence, RawRecordEvidence, RetryKey,
-        RetryQualification, SeriesBinding, SeriesDeclarationPayload, SeriesId, SeriesMetadata,
-        SeriesRegistry, SeriesRegistryLimits, SourceBatchMetadata, SourceEndpointEvidence,
-        SourceGapEvidence, SourceGapReason, SourceInterpretation, SourceIntervalKind,
-        SourceObservationContext, SourceObservationEvidence, SourceProjection, SourceReference,
-        SourceSchemaIdentity, SourceSchemaVersion, SourceSnapshotEvidence, SourceSystemEvidence,
-        SourceTransport, StoreId, TimeInterval, Timestamp, UnitEvidence, ValueFamily,
+        DeclarationEvidence, DeclarationReference, DeclarationRevision, EvidenceId, EvidenceKind,
+        ExactValue, Gap, GapReason, NativeStatus, NoChange, NormalizedRecordEvidence, Observation,
+        ObservationId, ObservationTimes, ProducerEpoch, ProducerId, ProducerPosition,
+        ProducerSequence, Quality, QualityFlags, QualityLevel, QuantityEvidence, RawRecordEvidence,
+        RetryKey, RetryQualification, SeriesBinding, SeriesDeclarationPayload, SeriesId,
+        SeriesMetadata, SeriesRegistry, SeriesRegistryLimits, SourceBatchMetadata,
+        SourceEndpointEvidence, SourceGapEvidence, SourceGapReason, SourceInterpretation,
+        SourceIntervalKind, SourceObservationContext, SourceObservationEvidence, SourceProjection,
+        SourceReference, SourceSchemaIdentity, SourceSchemaVersion, SourceSnapshotEvidence,
+        SourceSystemEvidence, SourceTransport, StoreId, TimeInterval, Timestamp, UnitEvidence,
+        ValueFamily,
     };
     use std::fs;
     use std::future::{Future, poll_fn};
@@ -1037,6 +1051,8 @@ mod tests {
     use tokio::task::yield_now;
 
     const TEST_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    type RegistryControlFuture<'a> =
+        Pin<Box<dyn Future<Output = Result<u128, RegistryError>> + 'a>>;
 
     fn harness() -> Runtime {
         Builder::new_current_thread()
@@ -3886,6 +3902,156 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn lifecycle_and_bind_control_waiters_are_bounded_ordered_and_recover() {
+        harness().block_on(async {
+            let runtime = complete_bounded(HistorianRuntime::start(store_id(1)))
+                .await
+                .expect("bounded-control runtime");
+            let before = runtime.inspection().committed();
+            let envelope = command("bounded-control", 240, 240)
+                .admission()
+                .envelope()
+                .clone();
+            let revision = RegistryOperation::Revise {
+                series_id: series_id(1),
+                expected_revision: DeclarationRevision::FIRST,
+                payload: SeriesDeclarationPayload::new(
+                    producer_id(2),
+                    CollectionMode::Sampled,
+                    ValueFamily::Unsigned,
+                    QuantityEvidence::Unresolved(
+                        DeclarationReference::new("quantity:bounded-control".to_owned())
+                            .expect("bounded quantity reference"),
+                    ),
+                    UnitEvidence::Absent,
+                    None,
+                ),
+                evidence: DeclarationEvidence::new(timestamp(1), None),
+            };
+            let revision_replay = revision.clone();
+
+            let gate = runtime.control_gate.lock().await;
+            let mut admitted: Vec<RegistryControlFuture<'_>> =
+                Vec::with_capacity(MAX_OUTSTANDING_COMMANDS);
+            let runtime_ref = &runtime;
+            admitted.push(Box::pin(async move {
+                let commit = runtime_ref.apply_registry(revision).await?;
+                Ok(match commit.outcome() {
+                    RegistryOutcome::Declaration(declaration) => declaration.revision().get(),
+                    RegistryOutcome::Retirement(_) => {
+                        panic!("revision control must return a declaration")
+                    }
+                })
+            }));
+            for _ in 1..MAX_OUTSTANDING_COMMANDS {
+                let runtime_ref = &runtime;
+                let envelope = envelope.clone();
+                admitted.push(Box::pin(async move {
+                    runtime_ref
+                        .bind_envelope(envelope)
+                        .await
+                        .map(|binding| binding.declaration().revision().get())
+                }));
+            }
+
+            let waker = Waker::noop();
+            let mut context = Context::from_waker(waker);
+            for future in &mut admitted {
+                assert!(
+                    future.as_mut().poll(&mut context).is_pending(),
+                    "every admitted control waits behind the held ordering gate"
+                );
+            }
+            assert_eq!(runtime.control_admission.available_permits(), 0);
+
+            let mut excess_bind = Box::pin(runtime.bind_envelope(envelope.clone()));
+            assert!(matches!(
+                poll_once(excess_bind.as_mut()).await,
+                Poll::Ready(Err(RegistryError::Capacity))
+            ));
+            let mut excess_lifecycle = Box::pin(runtime.apply_registry(revision_replay.clone()));
+            assert!(matches!(
+                poll_once(excess_lifecycle.as_mut()).await,
+                Poll::Ready(Err(RegistryError::Capacity))
+            ));
+            drop(excess_bind);
+            drop(excess_lifecycle);
+            assert_eq!(runtime.inspection().committed(), before);
+            assert_eq!(runtime.control_admission.available_permits(), 0);
+
+            drop(
+                admitted
+                    .pop()
+                    .expect("one admitted bind remains cancellation-owned"),
+            );
+            assert_eq!(runtime.control_admission.available_permits(), 1);
+            let runtime_ref = &runtime;
+            let replacement_envelope = envelope.clone();
+            let mut replacement: RegistryControlFuture<'_> = Box::pin(async move {
+                runtime_ref
+                    .bind_envelope(replacement_envelope)
+                    .await
+                    .map(|binding| binding.declaration().revision().get())
+            });
+            assert!(replacement.as_mut().poll(&mut context).is_pending());
+            admitted.push(replacement);
+            assert_eq!(runtime.control_admission.available_permits(), 0);
+
+            drop(gate);
+            let mut results: Vec<Option<Result<u128, RegistryError>>> =
+                (0..MAX_OUTSTANDING_COMMANDS).map(|_| None).collect();
+            poll_fn(|context| {
+                let mut pending = false;
+                for (future, result) in admitted.iter_mut().zip(&mut results) {
+                    if result.is_none() {
+                        match future.as_mut().poll(context) {
+                            Poll::Ready(output) => *result = Some(output),
+                            Poll::Pending => pending = true,
+                        }
+                    }
+                }
+                if pending {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
+            for result in results {
+                assert_eq!(result, Some(Ok(2)));
+            }
+            drop(admitted);
+            assert_eq!(
+                runtime.inspection().committed().manifest_generation(),
+                before.manifest_generation() + 1
+            );
+            assert_eq!(
+                runtime.control_admission.available_permits(),
+                MAX_OUTSTANDING_COMMANDS
+            );
+
+            let recovered_binding = runtime
+                .bind_envelope(envelope)
+                .await
+                .expect("released bind capacity must recover");
+            assert_eq!(recovered_binding.declaration().revision().get(), 2);
+            let replay = runtime
+                .apply_registry(revision_replay)
+                .await
+                .expect("released lifecycle capacity must recover");
+            assert!(matches!(replay.outcome(), RegistryOutcome::Declaration(_)));
+            assert_eq!(
+                runtime.control_admission.available_permits(),
+                MAX_OUTSTANDING_COMMANDS
+            );
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("bounded-control shutdown");
+        });
+    }
+
+    #[test]
     fn group_timeout_never_checkpoints_an_unpublished_append() {
         harness().block_on(async {
             let directory = test_directory();
@@ -4005,7 +4171,7 @@ mod tests {
                 .into_receipt();
             let retirement = RegistryOperation::Retire {
                 series_id: series_id(1),
-                expected_revision: och_core::DeclarationRevision::FIRST,
+                expected_revision: DeclarationRevision::FIRST,
                 evidence: DeclarationEvidence::new(timestamp(5), None),
             };
             let mut registry_future = Box::pin(runtime.apply_registry(retirement));

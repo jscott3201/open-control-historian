@@ -135,6 +135,31 @@ fn rewrite_trailing_crc(bytes: &mut [u8]) {
     bytes[checksum_offset..].copy_from_slice(&checksum);
 }
 
+fn exact_file_inventory(directory: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut inventory = fs::read_dir(directory)
+        .expect("read exact fixture inventory")
+        .map(|entry| {
+            let entry = entry.expect("read fixture entry");
+            assert!(
+                entry
+                    .file_type()
+                    .expect("read fixture entry type")
+                    .is_file(),
+                "manifest fixture inventory must contain only files"
+            );
+            (
+                entry
+                    .file_name()
+                    .into_string()
+                    .expect("fixture artifact name must be UTF-8"),
+                fs::read(entry.path()).expect("read exact fixture artifact"),
+            )
+        })
+        .collect::<Vec<_>>();
+    inventory.sort_by(|first, second| first.0.cmp(&second.0));
+    inventory
+}
+
 #[test]
 fn genesis_bytes_match_the_independent_primitive_oracle() {
     let directory = TestDirectory::new("oracle");
@@ -183,6 +208,57 @@ fn genesis_bytes_match_the_independent_primitive_oracle() {
             "primitive oracle must not contain {forbidden}"
         );
     }
+}
+
+#[test]
+fn foreign_store_registry_referenced_by_valid_manifest_refuses_unchanged() {
+    let directory = TestDirectory::new("foreign-registry");
+    let store = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::CreateNew,
+        registry_options(),
+    ))
+    .expect("create local manifest store");
+    drop(store);
+
+    let foreign_directory = TestDirectory::new("foreign-registry-source");
+    let foreign_config = ManifestStoreConfig::new(
+        foreign_directory.path().to_path_buf(),
+        support::store_id(2),
+        ActiveJournalOpenMode::CreateNew,
+        journal_limits(),
+        registry_options(),
+    )
+    .expect("valid foreign manifest config");
+    let foreign = ManifestStore::open(foreign_config).expect("create foreign manifest store");
+    drop(foreign);
+
+    let foreign_registry = fs::read(foreign_directory.path().join(REGISTRY_SLOT_0_FILE_NAME))
+        .expect("read valid foreign registry artifact");
+    fs::write(
+        directory.path().join(REGISTRY_SLOT_0_FILE_NAME),
+        &foreign_registry,
+    )
+    .expect("install foreign registry artifact");
+    let manifest_path = directory.path().join(MANIFEST_SLOT_0_FILE_NAME);
+    let mut manifest = fs::read(&manifest_path).expect("read local manifest");
+    manifest[80..88].copy_from_slice(
+        &u64::try_from(foreign_registry.len())
+            .expect("bounded foreign registry length")
+            .to_be_bytes(),
+    );
+    manifest[88..92].copy_from_slice(&crc32c(&foreign_registry).to_be_bytes());
+    rewrite_trailing_crc(&mut manifest);
+    fs::write(&manifest_path, manifest).expect("write valid foreign registry reference");
+
+    let before = exact_file_inventory(directory.path());
+    let result = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::OpenExisting,
+        registry_options(),
+    ));
+    assert!(matches!(result, Err(ManifestStoreError::StoreMismatch)));
+    assert_eq!(exact_file_inventory(directory.path()), before);
 }
 
 #[test]

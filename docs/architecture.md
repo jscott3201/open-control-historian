@@ -63,7 +63,10 @@ blocking store writer now owns the one non-cloneable live `SeriesRegistry`, and
 the runtime exposes only bounded register/revise/retire operations plus
 registry-issued current-active envelope binding. Those operations and the
 append-to-publication handshake share one async control gate and the existing
-bounded writer channel, so no second ordering authority exists. Retry
+bounded writer channel, so no second ordering authority exists. Lifecycle and
+bind callers must first obtain one of 16 nonblocking control-admission permits;
+the permit is held through gate acquisition and the writer response, making
+cancellation reclaim capacity without an unbounded mutex-waiter population. Retry
 classification reads the admission's exact `RetryQualification`, while volatile
 publication reads only its validated envelope. The exact `SeriesMetadata` bind
 remains a runtime-local read optimization invariant and cannot authorize a
