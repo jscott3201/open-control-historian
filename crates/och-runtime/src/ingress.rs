@@ -4,7 +4,8 @@ use crate::latest::{
 };
 use och_core::{CanonicalAdmission, RetryClassification, RetryQualification, StoreId};
 use och_store::{
-    DurableCutoff, JournalIdentity, JournalV1Error, PreparedAdmissionV1, admission_frame_len_v1,
+    DurableCutoff, JournalIdentity, JournalV1Error, ManifestCommit, PreparedAdmissionV1,
+    admission_frame_len_v1,
 };
 use std::error::Error;
 use std::fmt;
@@ -197,6 +198,10 @@ impl HistorianIngress {
     /// Counts bytes, reserves atomically, then encodes without waiting.
     ///
     /// Equivalent outstanding retries share both receipt stages.
+    /// Registry history is owned by the blocking writer and is therefore
+    /// checked after this resource admission. An unknown or altered historical
+    /// declaration terminally fail-stops the writer and resolves the receipt as
+    /// stopped; it is never reported as handled or durable.
     ///
     /// # Errors
     ///
@@ -420,7 +425,8 @@ impl AppendIdentity {
 pub enum HandledOutcome {
     /// Append and volatile publication decision completed.
     WriterHandled(AppendIdentity),
-    /// The writer stopped before reaching this stage.
+    /// The writer stopped before reaching this stage, including on a terminal
+    /// historical-authority refusal.
     WriterStopped,
 }
 
@@ -428,7 +434,7 @@ pub enum HandledOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurableCommit {
     append: AppendIdentity,
-    cutoff: DurableCutoff,
+    committed: ManifestCommit,
 }
 
 impl DurableCommit {
@@ -441,7 +447,13 @@ impl DurableCommit {
     /// Returns the synchronized cutoff covering the append.
     #[must_use]
     pub const fn durable_cutoff(self) -> DurableCutoff {
-        self.cutoff
+        self.committed.durable_cutoff()
+    }
+
+    /// Returns the manifest generation and registry state committing this append.
+    #[must_use]
+    pub const fn manifest_commit(self) -> ManifestCommit {
+        self.committed
     }
 }
 
@@ -450,7 +462,8 @@ impl DurableCommit {
 pub enum DurableOutcome {
     /// Journal and checkpoint synchronization cover the append.
     Durable(DurableCommit),
-    /// The writer stopped without proving durability.
+    /// The writer stopped without proving durability, including on a terminal
+    /// historical-authority refusal.
     WriterStopped,
 }
 
@@ -998,7 +1011,7 @@ impl IngressShared {
         true
     }
 
-    pub(crate) fn complete_durable(&self, slot_index: usize, cutoff: DurableCutoff) -> bool {
+    pub(crate) fn complete_durable(&self, slot_index: usize, committed: ManifestCommit) -> bool {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
@@ -1016,6 +1029,7 @@ impl IngressShared {
             state.slots[slot_index] = Some(slot);
             return false;
         };
+        let cutoff = committed.durable_cutoff();
         if slot.phase != SlotPhase::AwaitingDurability
             || append.journal != cutoff.journal()
             || append.append_sequence > cutoff.append_sequence()
@@ -1030,7 +1044,7 @@ impl IngressShared {
         state.reserved_bytes = state.reserved_bytes.saturating_sub(slot.reservation);
         if !slot
             .terminal
-            .resolve_durable(DurableCommit { append, cutoff })
+            .resolve_durable(DurableCommit { append, committed })
         {
             state.slots[slot_index] = Some(slot);
             let notifications = state.stop_all();

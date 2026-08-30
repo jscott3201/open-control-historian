@@ -2,8 +2,9 @@
 
 use crate::codec::{crc32c, frame_len_from_prefix_v1};
 use crate::{
-    AppendSequenceV1, DecodeLimitsV1, DecodedAdmissionV1, JOURNAL_V1_FRAME_PREFIX_LEN,
-    JOURNAL_V1_HEADER_LEN, JournalHeaderV1, JournalV1Error, PreparedFrameV1,
+    ACTIVE_JOURNAL_HEADER_V2_VERSION, AppendSequenceV1, DecodeLimitsV1, DecodedAdmissionV1,
+    JOURNAL_V1_FRAME_PREFIX_LEN, JOURNAL_V1_HEADER_LEN, JOURNAL_V1_VERSION, JournalHeaderV1,
+    JournalHeaderV2, JournalV1Error, PreparedFrameV1,
 };
 use och_core::{RetryQualification, StoreId};
 use std::error::Error;
@@ -99,6 +100,21 @@ pub struct ActiveJournalConfig {
     store_id: StoreId,
     mode: ActiveJournalOpenMode,
     limits: ActiveJournalLimits,
+    header_requirement: HeaderRequirement,
+    recovery_policy: RecoveryPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeaderRequirement {
+    LegacyV1,
+    ManifestV2,
+    BootstrapEither,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryPolicy {
+    Converge,
+    Strict,
 }
 
 impl ActiveJournalConfig {
@@ -122,6 +138,8 @@ impl ActiveJournalConfig {
             store_id,
             mode,
             limits,
+            header_requirement: HeaderRequirement::LegacyV1,
+            recovery_policy: RecoveryPolicy::Converge,
         })
     }
 
@@ -141,6 +159,24 @@ impl ActiveJournalConfig {
     #[must_use]
     pub const fn limits(&self) -> ActiveJournalLimits {
         self.limits
+    }
+
+    pub(crate) fn manifest_create(mut self) -> Self {
+        self.header_requirement = HeaderRequirement::ManifestV2;
+        self.recovery_policy = RecoveryPolicy::Strict;
+        self
+    }
+
+    pub(crate) fn manifest_existing(mut self) -> Self {
+        self.header_requirement = HeaderRequirement::ManifestV2;
+        self.recovery_policy = RecoveryPolicy::Strict;
+        self
+    }
+
+    pub(crate) fn manifest_bootstrap(mut self) -> Self {
+        self.header_requirement = HeaderRequirement::BootstrapEither;
+        self.recovery_policy = RecoveryPolicy::Converge;
+        self
     }
 }
 
@@ -415,6 +451,7 @@ pub struct ActiveJournal {
     records: Vec<RecoveredAdmissionV1>,
     sync_count: u64,
     faulted: bool,
+    header_version: u16,
     #[cfg(test)]
     faults: Faults,
 }
@@ -436,6 +473,8 @@ impl ActiveJournal {
             store_id,
             mode,
             limits,
+            header_requirement,
+            recovery_policy,
         } = config;
         let directory = open_directory(&directory_path)?;
         let journal_path = directory_path.join(ACTIVE_JOURNAL_FILE_NAME);
@@ -447,6 +486,7 @@ impl ActiveJournal {
                 &checkpoint_path,
                 store_id,
                 limits,
+                header_requirement,
             ),
             ActiveJournalOpenMode::OpenExisting => Self::open_existing(
                 &directory,
@@ -454,6 +494,8 @@ impl ActiveJournal {
                 &checkpoint_path,
                 store_id,
                 limits,
+                header_requirement,
+                recovery_policy,
             ),
         }
     }
@@ -464,11 +506,21 @@ impl ActiveJournal {
         checkpoint_path: &Path,
         store_id: StoreId,
         limits: ActiveJournalLimits,
+        header_requirement: HeaderRequirement,
     ) -> Result<Self, ActiveJournalError> {
         let mut journal = create_artifact(journal_path)?;
         lock_journal(&journal)?;
+        let (header_version, header_bytes) = match header_requirement {
+            HeaderRequirement::LegacyV1 => {
+                (JOURNAL_V1_VERSION, JournalHeaderV1::new(store_id).encode())
+            }
+            HeaderRequirement::ManifestV2 | HeaderRequirement::BootstrapEither => (
+                ACTIVE_JOURNAL_HEADER_V2_VERSION,
+                JournalHeaderV2::new(store_id).encode(),
+            ),
+        };
         journal
-            .write_all(&JournalHeaderV1::new(store_id).encode())
+            .write_all(&header_bytes)
             .map_err(|error| io_error(StoreIoOperation::Write, error))?;
         journal
             .sync_all()
@@ -489,6 +541,7 @@ impl ActiveJournal {
             records: Vec::new(),
             sync_count: 0,
             faulted: false,
+            header_version,
             #[cfg(test)]
             faults: Faults::default(),
         })
@@ -501,6 +554,8 @@ impl ActiveJournal {
         checkpoint_path: &Path,
         store_id: StoreId,
         limits: ActiveJournalLimits,
+        header_requirement: HeaderRequirement,
+        recovery_policy: RecoveryPolicy,
     ) -> Result<Self, ActiveJournalError> {
         let mut journal = open_artifact(journal_path)?;
         lock_journal(&journal)?;
@@ -515,8 +570,25 @@ impl ActiveJournal {
         journal
             .read_exact(&mut header_bytes)
             .map_err(|error| io_error(StoreIoOperation::Read, error))?;
-        let header = JournalHeaderV1::decode(&header_bytes)?;
-        if header.store_id() != store_id {
+        let (header_version, header_store_id) = match header_requirement {
+            HeaderRequirement::LegacyV1 => {
+                let header = JournalHeaderV1::decode(&header_bytes)?;
+                (JOURNAL_V1_VERSION, header.store_id())
+            }
+            HeaderRequirement::ManifestV2 => {
+                let header = JournalHeaderV2::decode(&header_bytes)?;
+                (ACTIVE_JOURNAL_HEADER_V2_VERSION, header.store_id())
+            }
+            HeaderRequirement::BootstrapEither => match JournalHeaderV1::decode(&header_bytes) {
+                Ok(header) => (JOURNAL_V1_VERSION, header.store_id()),
+                Err(JournalV1Error::UnsupportedHeaderVersion) => {
+                    let header = JournalHeaderV2::decode(&header_bytes)?;
+                    (ACTIVE_JOURNAL_HEADER_V2_VERSION, header.store_id())
+                }
+                Err(error) => return Err(error.into()),
+            },
+        };
+        if header_store_id != store_id {
             return Err(ActiveJournalError::StoreMismatch);
         }
         let identity = JournalIdentity {
@@ -526,7 +598,8 @@ impl ActiveJournal {
         let (checkpoint, mut initialized_state) = match open_artifact(checkpoint_path) {
             Ok(checkpoint) => (checkpoint, None),
             Err(ActiveJournalError::MissingArtifact)
-                if journal_len == JOURNAL_V1_HEADER_LEN as u64 =>
+                if recovery_policy == RecoveryPolicy::Converge
+                    && journal_len == JOURNAL_V1_HEADER_LEN as u64 =>
             {
                 let checkpoint = create_artifact(checkpoint_path)?;
                 let state = initialize_checkpoint(&checkpoint, directory, identity)?;
@@ -538,7 +611,10 @@ impl ActiveJournal {
             .metadata()
             .map_err(|error| io_error(StoreIoOperation::Metadata, error))?
             .len();
-        if checkpoint_len == 0 && journal_len == JOURNAL_V1_HEADER_LEN as u64 {
+        if checkpoint_len == 0
+            && recovery_policy == RecoveryPolicy::Converge
+            && journal_len == JOURNAL_V1_HEADER_LEN as u64
+        {
             if initialized_state.is_none() {
                 initialized_state = Some(initialize_checkpoint(&checkpoint, directory, identity)?);
             }
@@ -563,6 +639,11 @@ impl ActiveJournal {
             checkpoint_state,
             journal_len,
         )?;
+        if recovery_policy == RecoveryPolicy::Strict
+            && (scan.truncate_to.is_some() || scan.valid_end != checkpoint_state.end_offset)
+        {
+            return Err(ActiveJournalError::InvalidLayout);
+        }
         if let Some(truncate_to) = scan.truncate_to {
             journal
                 .set_len(truncate_to)
@@ -611,6 +692,7 @@ impl ActiveJournal {
             records: scan.records,
             sync_count: 0,
             faulted: false,
+            header_version,
             #[cfg(test)]
             faults: Faults::default(),
         })
@@ -636,6 +718,37 @@ impl ActiveJournal {
     #[must_use]
     pub fn recovered_records(&self) -> &[RecoveredAdmissionV1] {
         &self.records
+    }
+
+    pub(crate) const fn header_version(&self) -> u16 {
+        self.header_version
+    }
+
+    pub(crate) fn upgrade_to_manifest_header(&mut self) -> Result<(), ActiveJournalError> {
+        self.ensure_usable()?;
+        if self.header_version == ACTIVE_JOURNAL_HEADER_V2_VERSION {
+            return Ok(());
+        }
+        if self.header_version != JOURNAL_V1_VERSION {
+            return Err(ActiveJournalError::InvalidLayout);
+        }
+        if let Err(error) = self.journal.seek(SeekFrom::Start(0)) {
+            self.faulted = true;
+            return Err(io_error(StoreIoOperation::Seek, error));
+        }
+        if let Err(error) = self
+            .journal
+            .write_all(&JournalHeaderV2::new(self.identity.store_id).encode())
+        {
+            self.faulted = true;
+            return Err(io_error(StoreIoOperation::Write, error));
+        }
+        if let Err(error) = self.journal.sync_all() {
+            self.faulted = true;
+            return Err(io_error(StoreIoOperation::SyncJournal, error));
+        }
+        self.header_version = ACTIVE_JOURNAL_HEADER_V2_VERSION;
+        Ok(())
     }
 
     /// Returns the next exact writer-owned append sequence.
@@ -776,7 +889,7 @@ impl ActiveJournal {
         Ok(self.durable_cutoff())
     }
 
-    fn durable_cutoff(&self) -> DurableCutoff {
+    pub(crate) fn durable_cutoff(&self) -> DurableCutoff {
         DurableCutoff {
             journal: self.identity,
             checkpoint_generation: self.checkpoint_state.slot_generation,
@@ -790,6 +903,26 @@ impl ActiveJournal {
             Err(ActiveJournalError::Faulted)
         } else {
             Ok(())
+        }
+    }
+}
+
+impl DurableCutoff {
+    pub(crate) const fn from_manifest(
+        store_id: StoreId,
+        journal_generation: u64,
+        checkpoint_generation: u64,
+        append_sequence: u64,
+        end_offset: u64,
+    ) -> Self {
+        Self {
+            journal: JournalIdentity {
+                store_id,
+                generation: journal_generation,
+            },
+            checkpoint_generation,
+            append_sequence,
+            end_offset,
         }
     }
 }

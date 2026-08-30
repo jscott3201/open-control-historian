@@ -7,19 +7,23 @@ The bytes and decoded records never grant authorization. All multibyte integers
 use network byte order (big-endian). No value is inferred, normalized, generated,
 compressed, dictionary-encoded, or hashed with a platform-dependent algorithm.
 
-## Fixed header
+## Fixed active header and manifest fence
 
 The header is exactly 28 bytes:
 
 | Offset | Length | Field | V1 value |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | ASCII `OCHJNL01` |
-| 8 | 2 | format version | unsigned `1` |
+| 8 | 2 | active-header version | unsigned `1` premanifest; unsigned `2` for manifest stores |
 | 10 | 2 | header length | unsigned `28` |
 | 12 | 16 | store identity | validated network-order UUIDv7 bytes |
 
-Decode accepts exactly 28 bytes. Magic, version, header length, identity version,
-identity variant, truncation, and trailing input fail closed.
+Decode accepts exactly 28 bytes. Magic, selected version, header length, identity
+version, identity variant, truncation, and trailing input fail closed. The V2
+header changes only the version field; all admission frames remain format version
+one. `JournalHeaderV1` rejects V2, so a premanifest writer fails closed after a
+store is upgraded. V1/V2 bootstrap and committed publication are specified in
+[Manifest V1](manifest-v1-format.md).
 
 ## Independent admission frame
 
@@ -50,13 +54,13 @@ value is `0xe3069283`.
 
 ## Active artifacts and bounds
 
-The pre-manifest active generation is exactly unsigned `1` and uses exactly two
-files in one caller-supplied existing directory:
+The active generation is exactly unsigned `1`. Its mechanical state uses exactly
+two files in one caller-supplied existing directory:
 
 - `active-journal-v1.och`: one header followed by independent frames;
 - `active-journal-v1.checkpoint`: exactly two 64-byte checkpoint slots.
 
-Create-new follows one exact order: exclusively create and lock the single
+Legacy premanifest create-new follows one exact order: exclusively create and lock the single
 read/write journal, write and synchronize its header, exclusively create the
 checkpoint, initialize its 128 bytes with generation-one genesis in slot zero and
 an all-zero alternate slot, synchronize the checkpoint, then synchronize the
@@ -104,7 +108,7 @@ The checkpoint is only store/journal binding and mechanical cutoff evidence. It
 carries no declaration registry, retry outcome, latest state, or source
 interpretation authority.
 
-Open-existing requires exact fixed artifacts and a retained writer lock. It
+Legacy premanifest open-existing requires exact fixed artifacts and a retained writer lock. It
 validates the header, checkpoint length, StoreId/generation/checksums, slot parity,
 and strict consecutive generations. Two valid consecutive slots must also advance
 both append sequence and end offset strictly. Any invalid or non-progressing
@@ -209,3 +213,8 @@ Unknown magic, version, kind, flags, tags, invalid UTF-8/identity/canonical
 primitive, impossible count/length, structural mismatch, duplicate evidence,
 truncation, checksum failure, and trailing bytes return closed sanitized
 `JournalV1Error` variants without retaining caller input.
+
+Manifest-rooted open adds stable-lock, fixed-inventory, restored-registry,
+historical-declaration, and exact manifest/checkpoint cutoff validation around
+this frozen framing. It deliberately does not change the payload grammar or turn
+decoded evidence into lifecycle authority.
