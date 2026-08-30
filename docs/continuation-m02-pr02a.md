@@ -1,5 +1,8 @@
 # M02-PR02a continuation: manifest-rooted registry authority
 
+> Historical delivery record. Its durable-format compatibility and opening
+> claims are superseded by the current-only V1 durable-format reset.
+
 ## Delivered authority transition
 
 M02-PR02a makes one checksummed bounded manifest the committed description of

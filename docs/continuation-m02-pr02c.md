@@ -1,5 +1,8 @@
 # M02-PR02c continuation: bounded raw-Journal rotation and seal authority
 
+> Historical delivery record. Its durable-format compatibility and opening
+> claims are superseded by the current-only V1 durable-format reset.
+
 ## Delivered boundary
 
 M02-PR02c replaces terminal generation-one rotation demand with one bounded,

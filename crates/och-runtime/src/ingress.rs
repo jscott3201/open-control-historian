@@ -461,7 +461,7 @@ impl DurableCommit {
         self.committed.durable_cutoff()
     }
 
-    /// Returns the manifest, registry, and optional retry state committing this append.
+    /// Returns the manifest, registry, and retry state committing this append.
     #[must_use]
     pub const fn manifest_commit(self) -> ManifestCommit {
         self.committed
@@ -1099,7 +1099,7 @@ impl IngressShared {
         if entries.is_empty()
             || retry.store_id() != self.store_id
             || retry.options() != state.retry.options()
-            || retry.reference() != committed.retry_state()
+            || retry.reference() != Some(committed.retry_state())
         {
             let notifications = state.stop_all();
             drop(state);

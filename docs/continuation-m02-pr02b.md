@@ -1,5 +1,8 @@
 # M02-PR02b continuation: manifest-rooted durable retry horizon
 
+> Historical delivery record. Its durable-format compatibility and opening
+> claims are superseded by the current-only V1 durable-format reset.
+
 ## Delivered authority transition
 
 M02-PR02b adds one bounded, dependency-free, durable retry projection without

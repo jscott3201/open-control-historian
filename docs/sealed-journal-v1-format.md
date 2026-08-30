@@ -44,7 +44,7 @@ verifies:
 
 Only that verified staging artifact is renamed to the deterministic final name;
 the directory is synchronized and the final artifact is verified again before a
-catalog or Manifest V3 can commit it. Product code never opens a published seal
+catalog or Manifest V1 can commit it. Product code never opens a published seal
 for mutation and this slice never deletes one.
 
 ## Open and scope

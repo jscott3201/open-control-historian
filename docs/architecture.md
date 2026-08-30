@@ -10,11 +10,12 @@ bounded source/capture provenance and canonical admission, M02-PR01a established
 the store-scoped runtime input, M02-PR01b0 froze Journal V1 semantic framing, and
 M02-PR01b1 connected that single path to one bounded active-journal durable
 vertical, M02-PR02a roots its range, mechanical cutoff, and complete canonical
-registry history in one bounded manifest, and M02-PR02b roots a bounded durable
-retry replay/guard projection in Manifest V2. M02-PR02c adds one bounded
-store-owned rotation/seal transition: Generation Catalog V1 and Manifest V3 bind
-immutable raw-Journal generations while the same global append sequence continues
-in deterministic successor active journals:
+registry history in one bounded manifest, M02-PR02b roots a bounded durable
+retry replay/guard projection, and M02-PR02c adds one bounded store-owned
+rotation/seal transition. The durable-format reset now places one current V1
+contract for each artifact family behind a fixed Store Format V1 marker. Manifest
+V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
+same global append sequence continues in deterministic successor active journals:
 
 ```text
 default workspace selection
@@ -101,20 +102,20 @@ before any field allocation. It produces only store-owned non-authorizing
 inspection evidence, never a registry-issued declaration or `CanonicalAdmission`.
 
 The store also owns one bounded recognized inventory in an existing directory: a
-never-renamed stable store lock, one retained read/write lock for the current
-generation, the legacy generation-one active pair or one deterministic successor
-pair, two reusable Manifest V1/V2/V3 slots, three reusable complete registry and
-retry slots, three Generation Catalog V1 slots, one fixed rotation intent, fixed
-staging names, and at most 64 immutable raw-Journal sealed artifacts. Manifest
-stores use active-header version 2 in the unchanged 28-byte layout; every
-admission frame remains Journal V1. An old header-v1 decoder rejects the fence.
-Create-new synchronizes active genesis, an empty registry snapshot, an empty
-retry snapshot, and Manifest V2 generation one before readiness. The sole
+fixed 32-byte Store Format V1 marker, never-renamed stable store lock, one retained
+read/write lock for the current generation, the generation-one active pair or one
+deterministic successor pair, two reusable 160-byte Manifest V1 slots, three
+reusable complete registry and retry slots, three Generation Catalog V1 slots,
+one fixed rotation intent, fixed staging names, and at most 64 immutable
+raw-Journal sealed artifacts. Every active and sealed journal uses the exact
+28-byte Journal Header V1 and every admission frame remains Journal V1.
+Create-new publishes the marker, active genesis, an empty registry snapshot, a
+mandatory empty Retry State V1 snapshot, and Manifest V1 generation one before readiness. The sole
 blocking writer assigns one store-global strict append sequence across all
 generations, explicitly seeks to journal end, and validates both frame and
 declaration StoreId against the header. A barrier performs journal sync, writes
-the alternate CRC-protected checkpoint slot, then synchronizes that checkpoint
-publishes/verifies the bounded Retry State V1/V2 candidate, and publishes a manifest naming
+the alternate CRC-protected checkpoint slot, then synchronizes that checkpoint,
+publishes/verifies the bounded Retry State V1 candidate, and publishes Manifest V1 naming
 the exact cutoff, registry, and retry snapshot before exposing durability. The
 checkpoint contains only store/journal identity, slot generation, append
 sequence, end offset, and checksum; it is not registry or retry authority.
@@ -124,25 +125,26 @@ durable receipt batch. Store then persists a non-authoritative intent, streams t
 exact fully durable active bytes into an immutable raw-Journal artifact, verifies
 framing/declarations/range/length/checksum, creates and synchronizes an empty
 successor at the prior global sequence floor, publishes the next bounded catalog,
-and publishes Manifest V3 last. Only then does it adopt the successor and clean
+and publishes Manifest V1 last. Only then does it adopt the successor and clean
 the redundant predecessor/intent. Catalog capacity is exactly 64 and never
 reclaims or overwrites sealed history.
 
-Open-existing acquires the stable lock before selection or mutation, validates a
-bounded non-recursive inventory, selects only strict consecutive manifest
+Open-existing first validates a bounded non-recursive inventory and the Store
+Format V1 marker without mutation. Markerless, historical, malformed, and mixed
+stores return path-free `UnsupportedStoreFormat` before stable-lock creation or
+acquisition. After the fence passes, open acquires the stable lock, repeats
+validation, and selects only strict consecutive manifest
 candidates, restores the referenced registry solely through public core
 lifecycle replay, and requires exact snapshot re-encoding. The selected manifest
 cutoff must equal the mechanical checkpoint, and every recovered declaration
-must resolve exactly from retained history. A nonempty premanifest store requires
-an explicit matching snapshot; exact header-only V1/V2 stores may bootstrap
-empty. Manifest V2/V3 restores only its referenced canonical retry snapshot. A
-legacy Manifest V1 restores empty retry tiers without scanning or backfilling
-retained Journal V1 records; its first new durable append establishes V2. Decoded
+must resolve exactly from retained history. Every current Manifest V1 has a
+mandatory Retry State V1 reference; there is no premanifest adoption, history
+backfill, format migration, or compatibility decoder. Decoded
 evidence never authorizes registry or retry state, and latest restarts empty.
 Normal open validates bounded catalog bytes and sealed length/header metadata,
 not every sealed payload byte. A narrow exact-intent path converges only to the
-prior root before Manifest V3 or the new root after it; missing or mismatched
-evidence refuses unchanged. Each V3 root binds the active generation and floor
+prior root before Manifest V1 or the new root after it; missing or mismatched
+evidence refuses unchanged. Each Manifest V1 root binds the active generation and floor
 to the checked successor and cutoff of its last sealed entry, and consecutive
 catalog roots must preserve the exact older prefix and append one entry. Active
 pairs and sealed finals must equal the selected root apart from narrowly
@@ -150,8 +152,8 @@ verified intent redundancy. A strict catalog prefix left by interruption after
 ordinary manifest adoption is verified and removed; forked or unrelated
 catalogs refuse. `och-store` still owns no final native segment
 encoding, broad recovery, reclamation, latest projection, or query behavior.
-Exact contracts are in [Manifest V1/V2/V3](manifest-v1-format.md),
-[Retry State V1/V2](retry-state-v1-format.md),
+Exact contracts are in [Store Format V1](store-format-v1.md),
+[Manifest V1](manifest-v1-format.md), [Retry State V1](retry-state-v1-format.md),
 [Generation Catalog V1](generation-catalog-v1-format.md), and
 [sealed raw Journal V1](sealed-journal-v1-format.md).
 
@@ -252,16 +254,15 @@ caller-owned volatile memory, not runtime history.
 The blocking worker preserves FIFO and groups handled appends until the first of
 configured time, record, or byte bounds, explicit/immediate demand, protected
 demand, or shutdown. Durable order is append, volatile publication, journal
-sync, alternate checkpoint slot write, checkpoint sync, exact Retry State V1/V2
-count/write/sync/readback/publication, Manifest V2/V3 publication naming the exact
+sync, alternate checkpoint slot write, checkpoint sync, exact Retry State V1
+count/write/sync/readback/publication, Manifest V1 publication naming the exact
 cutoff and current registry/retry slots, atomic ingress projection/receipt batch
 transition, then waiter wake.
 
 A durable receipt names store, exact journal generation, append sequence, frame
 end, mechanical checkpoint generation, manifest generation, registry
-generation/slot, optional retry generation/slot, sequence floor, and optional
-catalog identity. Rotation never rewrites an already returned receipt. A legacy V1 open truthfully
-reports no retry reference. A timeout never
+generation/slot, mandatory retry generation/slot, sequence floor, and optional
+catalog identity. Rotation never rewrites an already returned receipt. A timeout never
 synchronizes while the newest append still awaits the coordinator's publication
 acknowledgement; after acknowledgement an elapsed deadline may flush immediately.
 The receipt claims only the active artifacts under the documented platform

@@ -679,7 +679,7 @@ async fn run_writer(
             return WriterExit::StoreFault;
         }
     };
-    if store_ready.retry.reference() != store_ready.inspection.committed().retry_state()
+    if store_ready.retry.reference() != Some(store_ready.inspection.committed().retry_state())
         || !ingress.install_opened_retry(store_ready.retry.clone())
     {
         let _ = readiness.send(Err(StartError::WorkerExitedBeforeReadiness));
@@ -1642,7 +1642,7 @@ mod tests {
                     .current_retry()
                     .expect("installed startup retry projection")
                     .reference(),
-                runtime.inspection().committed().retry_state()
+                Some(runtime.inspection().committed().retry_state())
             );
             complete_bounded(runtime.shutdown())
                 .await

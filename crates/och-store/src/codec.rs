@@ -3,9 +3,9 @@ use crate::decoded::{
     all_evidence_ids,
 };
 use crate::{
-    ACTIVE_JOURNAL_HEADER_V2_VERSION, JOURNAL_V1_FRAME_CRC_LEN, JOURNAL_V1_FRAME_MAGIC,
-    JOURNAL_V1_FRAME_PREFIX_LEN, JOURNAL_V1_HEADER_LEN, JOURNAL_V1_HEADER_MAGIC,
-    JOURNAL_V1_VERSION, JournalV1Error, MAX_ADMISSION_PAYLOAD_V1,
+    JOURNAL_V1_FRAME_CRC_LEN, JOURNAL_V1_FRAME_MAGIC, JOURNAL_V1_FRAME_PREFIX_LEN,
+    JOURNAL_V1_HEADER_LEN, JOURNAL_V1_HEADER_MAGIC, JOURNAL_V1_VERSION, JournalV1Error,
+    MAX_ADMISSION_PAYLOAD_V1,
 };
 use och_core::{
     ArtifactId, ArtifactReference, CanonicalAdmission, CaptureLifecycle, CaptureRunEvidence,
@@ -130,7 +130,7 @@ impl JournalHeaderV1 {
     /// Encodes the exact fixed-length Journal V1 header.
     #[must_use]
     pub fn encode(self) -> [u8; JOURNAL_V1_HEADER_LEN] {
-        encode_header(self.store_id, JOURNAL_V1_VERSION)
+        encode_header(self.store_id)
     }
 
     /// Decodes exactly one fixed-length Journal V1 header.
@@ -140,60 +140,20 @@ impl JournalHeaderV1 {
     /// Rejects truncation, trailing bytes, unknown magic/version/length, or an
     /// invalid store identity.
     pub fn decode(bytes: &[u8]) -> Result<Self, JournalV1Error> {
-        decode_header(bytes, JOURNAL_V1_VERSION).map(|store_id| Self { store_id })
+        decode_header(bytes).map(|store_id| Self { store_id })
     }
 }
 
-/// Fixed manifest-required active-journal header scoped to one exact store.
-///
-/// The layout remains exactly 28 bytes. Only the header version differs from
-/// [`JournalHeaderV1`]; all admission frames retain their Journal V1 bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct JournalHeaderV2 {
-    store_id: StoreId,
-}
-
-impl JournalHeaderV2 {
-    /// Constructs the fixed manifest-owned header for `store_id`.
-    #[must_use]
-    pub const fn new(store_id: StoreId) -> Self {
-        Self { store_id }
-    }
-
-    /// Returns the exact store identity carried by the header.
-    #[must_use]
-    pub const fn store_id(self) -> StoreId {
-        self.store_id
-    }
-
-    /// Encodes the exact fixed-length manifest-required header.
-    #[must_use]
-    pub fn encode(self) -> [u8; JOURNAL_V1_HEADER_LEN] {
-        encode_header(self.store_id, ACTIVE_JOURNAL_HEADER_V2_VERSION)
-    }
-
-    /// Decodes exactly one manifest-required fixed-length header.
-    ///
-    /// # Errors
-    ///
-    /// Rejects truncation, trailing bytes, unknown magic/version/length, or an
-    /// invalid store identity. In particular, legacy header version one is not
-    /// accepted by this decoder.
-    pub fn decode(bytes: &[u8]) -> Result<Self, JournalV1Error> {
-        decode_header(bytes, ACTIVE_JOURNAL_HEADER_V2_VERSION).map(|store_id| Self { store_id })
-    }
-}
-
-fn encode_header(store_id: StoreId, version: u16) -> [u8; JOURNAL_V1_HEADER_LEN] {
+fn encode_header(store_id: StoreId) -> [u8; JOURNAL_V1_HEADER_LEN] {
     let mut bytes = [0_u8; JOURNAL_V1_HEADER_LEN];
     bytes[..8].copy_from_slice(&JOURNAL_V1_HEADER_MAGIC);
-    bytes[8..10].copy_from_slice(&version.to_be_bytes());
+    bytes[8..10].copy_from_slice(&JOURNAL_V1_VERSION.to_be_bytes());
     bytes[HEADER_LENGTH_OFFSET..12].copy_from_slice(&28_u16.to_be_bytes());
     bytes[12..].copy_from_slice(store_id.as_bytes());
     bytes
 }
 
-fn decode_header(bytes: &[u8], expected_version: u16) -> Result<StoreId, JournalV1Error> {
+fn decode_header(bytes: &[u8]) -> Result<StoreId, JournalV1Error> {
     if bytes.len() < JOURNAL_V1_HEADER_LEN {
         return Err(JournalV1Error::Truncated);
     }
@@ -203,7 +163,7 @@ fn decode_header(bytes: &[u8], expected_version: u16) -> Result<StoreId, Journal
     if bytes[..8] != JOURNAL_V1_HEADER_MAGIC {
         return Err(JournalV1Error::InvalidHeaderMagic);
     }
-    if u16::from_be_bytes([bytes[8], bytes[9]]) != expected_version {
+    if u16::from_be_bytes([bytes[8], bytes[9]]) != JOURNAL_V1_VERSION {
         return Err(JournalV1Error::UnsupportedHeaderVersion);
     }
     if u16::from_be_bytes([bytes[10], bytes[11]])

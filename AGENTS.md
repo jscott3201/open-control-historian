@@ -23,31 +23,34 @@ store-scoped runtime command boundary, and M02-PR01b0 established the reviewed
 Journal V1 semantic frame format. M02-PR01b1 established their active-journal
 durable successor, M02-PR02a makes a bounded manifest the committed description
 of its active range, mechanical cutoff, and complete canonical registry history,
-M02-PR02b adds its bounded durable retry horizon, and M02-PR02c adds bounded
-active-journal rotation, immutable raw-Journal sealing, Generation Catalog V1,
-Manifest V3, and cross-generation Retry State V2. `och-runtime` depends
+M02-PR02b adds its bounded durable retry horizon, M02-PR02c adds bounded
+active-journal rotation, immutable raw-Journal sealing, and Generation Catalog V1,
+and the durable-format reset makes each artifact family current-only V1 behind a
+fixed Store Format V1 epoch marker. `och-runtime` depends
 inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05
 `CanonicalAdmission` evidence, reserves exact encoded bytes before allocation,
 and sends FIFO work to one dedicated blocking writer thread. Handled and durable
 receipt stages are distinct; the latter is released only after journal sync,
-checkpoint sync, Retry State V1/V2 publication, and Manifest V2/V3 publication
+checkpoint sync, Retry State V1 publication, and Manifest V1 publication
 cover the append. Public register,
 revise, retire, and active bind requests first cross a fixed nonblocking
 control-admission bound, then share the sole writer ordering authority with
 append publication. A fixed reaper owns the eventual writer join after
 nonblocking Drop.
 
-`och-store` owns Journal V1 bytes, the header-v2 old-writer fence, stable
+`och-store` owns the Store Format V1 marker, Journal V1 bytes and header, stable
 never-renamed store lock, generation-scoped retained journal locks, deterministic
 active-artifact create/open, bounded scan/append/rotation, double-slot mechanical
-checkpoints, two-slot Manifest V1/V2/V3 authority, three-slot complete registry
+checkpoints, two-slot 160-byte Manifest V1 authority, three-slot complete registry
 snapshots, three-slot durable retry snapshots, three-slot Generation Catalog V1,
-at most 64 immutable raw-Journal sealed generations, strict bootstrap, narrow
+at most 64 immutable raw-Journal sealed generations, strict current genesis, narrow
 rotation convergence, and publication. It
 restores registry snapshots only by public `SeriesRegistry` replay and
 requires every decoded journal declaration to match retained historical
-authority; decoded records never authorize registry state. `och-runtime` retains
+authority; decoded records never authorize registry state. Markerless, historical,
+or mixed durable formats fail path-free before lock creation or durable mutation;
+there is no migration or compatibility decoder. `och-runtime` retains
 the fixed 16-command count window, exact bounded
 byte reservations through durability, outstanding retry coalescing, a bounded
 FIFO durable replay tier followed by an expired/conflict guard tier, a

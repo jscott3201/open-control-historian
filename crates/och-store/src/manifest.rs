@@ -2,6 +2,7 @@
 
 use crate::active::{
     ActiveJournal, ActiveJournalConfig, active_checkpoint_file_name, active_journal_file_name,
+    preflight_manifest_genesis,
 };
 use crate::codec::{
     Cursor, Encoder, crc32c, decode_declaration, decode_declaration_evidence, encode_declaration,
@@ -21,8 +22,8 @@ use crate::retry::{
 };
 use crate::{
     ACTIVE_CHECKPOINT_FILE_NAME, ACTIVE_JOURNAL_FILE_NAME, ACTIVE_JOURNAL_GENERATION,
-    ACTIVE_JOURNAL_HEADER_V2_VERSION, ActiveJournalError, ActiveJournalInspection,
-    ActiveJournalLimits, ActiveJournalOpenMode, DurableCutoff, JournalV1Error, PreparedFrameV1,
+    ActiveJournalError, ActiveJournalInspection, ActiveJournalLimits, ActiveJournalOpenMode,
+    DurableCutoff, JournalV1Error, PreparedFrameV1,
 };
 use crate::{
     MAX_PERSISTED_RETRY_ENTRIES, MAX_RETRY_STATE_BYTES, PendingRetryOutcome,
@@ -41,6 +42,17 @@ use std::path::{Path, PathBuf};
 
 /// Exact never-renamed store-level writer lock artifact.
 pub const STORE_LOCK_FILE_NAME: &str = "store-v1.lock";
+/// Exact Store Format V1 reset marker artifact.
+pub const STORE_FORMAT_FILE_NAME: &str = "store-format-v1.och";
+/// Exact Store Format V1 marker publication staging artifact.
+pub const STORE_FORMAT_STAGING_FILE_NAME: &str = "store-format-v1.staging";
+/// Exact Store Format V1 marker magic.
+pub const STORE_FORMAT_MAGIC: [u8; 8] = *b"OCHFMT01";
+/// Current and sole Store Format marker version.
+pub const STORE_FORMAT_VERSION: u16 = 1;
+/// Exact Store Format V1 marker length.
+pub const STORE_FORMAT_LEN: usize = 32;
+const STORE_FORMAT_RECORD_LEN: u16 = 32;
 /// Exact first reusable manifest slot.
 pub const MANIFEST_SLOT_0_FILE_NAME: &str = "manifest-v1-slot-0.och";
 /// Exact second reusable manifest slot.
@@ -71,11 +83,8 @@ pub const MAX_PERSISTED_REGISTRY_REVISIONS: usize = 16_384;
 pub const MAX_REGISTRY_SNAPSHOT_BYTES: usize = 64 * 1_024 * 1_024;
 
 const MANIFEST_MAGIC: [u8; 8] = *b"OCHMAN01";
-const MANIFEST_V1_VERSION: u16 = 1;
-const MANIFEST_V2_VERSION: u16 = 2;
-const MANIFEST_V3_VERSION: u16 = 3;
-const MANIFEST_LEGACY_LEN: usize = 128;
-const MANIFEST_V3_LEN: usize = 160;
+const MANIFEST_VERSION: u16 = 1;
+const MANIFEST_LEN: usize = 160;
 const REGISTRY_MAGIC: [u8; 8] = *b"OCHREG01";
 const REGISTRY_VERSION: u16 = 1;
 const REGISTRY_HEADER_LEN: usize = 64;
@@ -92,7 +101,7 @@ const RETRY_SLOT_NAMES: [&str; 3] = [
     RETRY_SLOT_1_FILE_NAME,
     RETRY_SLOT_2_FILE_NAME,
 ];
-const MAX_INVENTORY_ENTRIES: usize = 85;
+const MAX_INVENTORY_ENTRIES: usize = 87;
 
 #[cfg(test)]
 std::thread_local! {
@@ -116,11 +125,10 @@ fn take_publish_fault(code: u8) -> bool {
     })
 }
 
-/// Explicit bounded canonical registry persistence and bootstrap input.
+/// Explicit bounded canonical registry persistence input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegistryPersistenceOptions {
     limits: SeriesRegistryLimits,
-    bootstrap: Option<SeriesRegistrySnapshot>,
 }
 
 impl RegistryPersistenceOptions {
@@ -135,43 +143,13 @@ impl RegistryPersistenceOptions {
         {
             return Err(ManifestStoreError::InvalidOptions);
         }
-        Ok(Self {
-            limits,
-            bootstrap: None,
-        })
-    }
-
-    /// Supplies the explicit complete snapshot required by a nonempty
-    /// pre-manifest store.
-    ///
-    /// # Errors
-    ///
-    /// Refuses a snapshot whose limits differ from the configured limits or
-    /// exceed the hard persistence bounds.
-    pub fn with_bootstrap_snapshot(
-        mut self,
-        snapshot: SeriesRegistrySnapshot,
-    ) -> Result<Self, ManifestStoreError> {
-        if snapshot.limits() != self.limits
-            || snapshot.series().len() > MAX_PERSISTED_REGISTRY_SERIES
-            || snapshot.declaration_revision_count() > MAX_PERSISTED_REGISTRY_REVISIONS
-        {
-            return Err(ManifestStoreError::InvalidOptions);
-        }
-        self.bootstrap = Some(snapshot);
-        Ok(self)
+        Ok(Self { limits })
     }
 
     /// Returns configured canonical registry limits.
     #[must_use]
     pub const fn limits(&self) -> SeriesRegistryLimits {
         self.limits
-    }
-
-    /// Returns the optional explicit pre-manifest bootstrap snapshot.
-    #[must_use]
-    pub const fn bootstrap_snapshot(&self) -> Option<&SeriesRegistrySnapshot> {
-        self.bootstrap.as_ref()
     }
 }
 
@@ -203,10 +181,6 @@ impl ManifestStoreConfig {
             .map_err(ManifestStoreError::Active)?;
         if registry.limits.max_series() > MAX_PERSISTED_REGISTRY_SERIES
             || registry.limits.max_declaration_revisions() > MAX_PERSISTED_REGISTRY_REVISIONS
-            || registry
-                .bootstrap
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.store_id() != store_id)
         {
             return Err(ManifestStoreError::InvalidOptions);
         }
@@ -274,11 +248,13 @@ impl ManifestIoEvidence {
     }
 }
 
-/// Closed manifest, registry, bootstrap, publication, and lifecycle refusal.
+/// Closed manifest, registry, genesis, publication, and lifecycle refusal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManifestStoreError {
     /// Configuration or a hard bound is invalid.
     InvalidOptions,
+    /// Durable evidence does not belong to the current Store Format V1 epoch.
+    UnsupportedStoreFormat,
     /// Another process or handle retains the stable store lock.
     AlreadyOpen,
     /// Store inventory contains unknown, excessive, or unsafe evidence.
@@ -295,10 +271,6 @@ pub enum ManifestStoreError {
     GenerationCatalogFull,
     /// The configured store identity differs from durable evidence.
     StoreMismatch,
-    /// A nonempty pre-manifest journal lacks an explicit registry snapshot.
-    BootstrapSnapshotRequired,
-    /// Explicit bootstrap state cannot interpret every recovered declaration.
-    BootstrapSnapshotMismatch,
     /// The admission does not carry an exact retained historical declaration.
     HistoricalDeclarationMismatch,
     /// A fixed staging artifact proves an interrupted publication.
@@ -319,6 +291,7 @@ impl fmt::Display for ManifestStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidOptions => "invalid manifest store options",
+            Self::UnsupportedStoreFormat => "unsupported store format",
             Self::AlreadyOpen => "manifest store is already open",
             Self::InvalidInventory => "invalid manifest store inventory",
             Self::InvalidManifest => "invalid manifest evidence",
@@ -327,8 +300,6 @@ impl fmt::Display for ManifestStoreError {
             Self::InvalidGeneration => "invalid journal generation evidence",
             Self::GenerationCatalogFull => "sealed generation catalog is full",
             Self::StoreMismatch => "manifest store identity mismatch",
-            Self::BootstrapSnapshotRequired => "registry bootstrap snapshot required",
-            Self::BootstrapSnapshotMismatch => "registry bootstrap snapshot mismatch",
             Self::HistoricalDeclarationMismatch => "historical declaration mismatch",
             Self::InterruptedPublication => "interrupted metadata publication",
             Self::Faulted => "manifest store authority is faulted",
@@ -355,7 +326,7 @@ pub struct ManifestCommit {
     registry_generation: u64,
     registry_slot: u8,
     durable_cutoff: DurableCutoff,
-    retry_state: Option<RetryStateReference>,
+    retry_state: RetryStateReference,
     sequence_floor: u64,
     catalog: Option<GenerationCatalogReference>,
 }
@@ -385,11 +356,9 @@ impl ManifestCommit {
         self.durable_cutoff
     }
 
-    /// Returns the committed durable retry snapshot identity.
-    ///
-    /// This is absent only while opened under a legacy Manifest V1 record.
+    /// Returns the mandatory committed durable retry snapshot identity.
     #[must_use]
-    pub const fn retry_state(self) -> Option<RetryStateReference> {
+    pub const fn retry_state(self) -> RetryStateReference {
         self.retry_state
     }
 
@@ -411,7 +380,7 @@ impl ManifestCommit {
         registry_generation: u64,
         registry_slot: u8,
         durable_cutoff: DurableCutoff,
-        retry_state: Option<RetryStateReference>,
+        retry_state: RetryStateReference,
     ) -> Self {
         Self::from_generation_parts(
             manifest_generation,
@@ -429,7 +398,7 @@ impl ManifestCommit {
         registry_generation: u64,
         registry_slot: u8,
         durable_cutoff: DurableCutoff,
-        retry_state: Option<RetryStateReference>,
+        retry_state: RetryStateReference,
         sequence_floor: u64,
         catalog: Option<GenerationCatalogReference>,
     ) -> Self {
@@ -486,7 +455,7 @@ struct ManifestRecord {
     generation: u64,
     registry: RegistryReference,
     cutoff: DurableCutoff,
-    retry: Option<RetryArtifactReference>,
+    retry: RetryArtifactReference,
     sequence_floor: u64,
     catalog: Option<GenerationCatalogReference>,
 }
@@ -498,10 +467,7 @@ impl ManifestRecord {
             self.registry.generation,
             self.registry.slot,
             self.cutoff,
-            match self.retry {
-                Some(reference) => Some(reference.public),
-                None => None,
-            },
+            self.retry.public,
             self.sequence_floor,
             self.catalog,
         )
@@ -524,34 +490,39 @@ pub struct ManifestStore {
 }
 
 impl ManifestStore {
-    /// Creates, opens, or explicitly bootstraps one manifest-rooted store.
+    /// Creates or opens one current Store Format V1 manifest-rooted store.
     ///
-    /// Stable lock acquisition precedes manifest selection and active mutation.
-    /// A nonempty pre-manifest store requires an exact caller-supplied snapshot.
+    /// Read-only format preflight precedes stable lock creation or acquisition.
+    /// Only exact current genesis and rotation publication windows may converge.
     ///
     /// # Errors
     ///
-    /// Returns a bounded path-free refusal for lock, inventory, bootstrap,
-    /// format, identity, cutoff, registry, or I/O failure.
+    /// Returns a bounded path-free refusal for format, lock, inventory,
+    /// identity, cutoff, registry, or I/O failure.
     pub fn open(config: ManifestStoreConfig) -> Result<Self, ManifestStoreError> {
         let directory = open_directory(&config.directory)?;
-        let preflight = inspect_inventory(&config.directory)?;
-        if (preflight.staging || preflight.rotation_staging) && !preflight.rotation_intent {
-            return Err(ManifestStoreError::InterruptedPublication);
-        }
+        let preflight = preflight_store_format(&config)?;
         let lock_path = config.directory.join(STORE_LOCK_FILE_NAME);
-        let store_lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
+        let mut lock_options = OpenOptions::new();
+        lock_options.read(true).write(true).truncate(false);
+        if preflight == FormatPreflight::EmptyCreate {
+            lock_options.create_new(true);
+        }
+        let store_lock = lock_options
             .open(&lock_path)
             .map_err(|error| manifest_io(ManifestIoOperation::OpenArtifact, &error))?;
         lock_store(&store_lock)?;
-        if !preflight.store_lock {
+        if preflight == FormatPreflight::EmptyCreate {
             directory
                 .sync_all()
                 .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))?;
+            publish_store_format_marker(&config.directory, &directory, config.store_id)?;
+        } else if preflight == FormatPreflight::MarkerStaging {
+            converge_store_format_marker(&config.directory, &directory, config.store_id)?;
+        }
+        let repeated = preflight_store_format(&config)?;
+        if repeated != FormatPreflight::Current {
+            return Err(ManifestStoreError::UnsupportedStoreFormat);
         }
         let mut inventory = inspect_inventory(&config.directory)?;
         if (inventory.staging || inventory.rotation_staging) && !inventory.rotation_intent {
@@ -619,7 +590,7 @@ impl ManifestStore {
             )?;
             Ok(store)
         } else {
-            Self::bootstrap(config, directory, store_lock, &inventory, manifest_slots)
+            Self::initialize_genesis(config, directory, store_lock, &inventory, manifest_slots)
         }
     }
 
@@ -664,23 +635,18 @@ impl ManifestStore {
         )
         .map_err(ManifestStoreError::Active)?;
         let journal = ActiveJournal::open(active_config)?;
-        if journal.header_version() != ACTIVE_JOURNAL_HEADER_V2_VERSION
-            || journal.durable_cutoff() != current.cutoff
-        {
+        if journal.durable_cutoff() != current.cutoff {
             return Err(ManifestStoreError::InvalidManifest);
         }
         validate_recovered_declarations(&registry, journal.recovered_records())
             .map_err(|_| ManifestStoreError::InvalidRegistry)?;
-        let retry = match current.retry {
-            Some(_) => read_referenced_retry(
-                &config.directory,
-                current,
-                config.store_id,
-                config.retry,
-                &catalog,
-            )?,
-            None => RetryStateSnapshot::empty(config.store_id, config.retry),
-        };
+        let retry = read_referenced_retry(
+            &config.directory,
+            current,
+            config.store_id,
+            config.retry,
+            &catalog,
+        )?;
         validate_retry_inventory(
             &config.directory,
             manifest_slots,
@@ -703,49 +669,40 @@ impl ManifestStore {
         })
     }
 
-    fn bootstrap(
+    fn initialize_genesis(
         config: ManifestStoreConfig,
         directory: File,
         store_lock: File,
         inventory: &Inventory,
         mut manifest_slots: [Option<ManifestRecord>; 2],
     ) -> Result<Self, ManifestStoreError> {
-        validate_bootstrap_generation_inventory(inventory, config.mode)?;
+        validate_genesis_inventory(inventory)?;
+        let (mode, strict_create) = if inventory.active_journals.is_empty() {
+            (ActiveJournalOpenMode::CreateNew, true)
+        } else {
+            (ActiveJournalOpenMode::OpenExisting, false)
+        };
         let active_config = ActiveJournalConfig::new(
             config.directory.clone(),
             config.store_id,
-            config.mode,
+            mode,
             config.journal_limits,
         )
         .map_err(ManifestStoreError::Active)?;
-        let active_config = match config.mode {
-            ActiveJournalOpenMode::CreateNew => active_config.manifest_create(),
-            ActiveJournalOpenMode::OpenExisting => active_config.manifest_bootstrap(),
-        };
-        let mut journal = ActiveJournal::open(active_config)?;
-        let nonempty = !journal.recovered_records().is_empty();
-        let registry = if nonempty {
-            let snapshot = config
-                .registry
-                .bootstrap
-                .as_ref()
-                .ok_or(ManifestStoreError::BootstrapSnapshotRequired)?;
-            let registry = restore_snapshot(snapshot)?;
-            validate_recovered_declarations(&registry, journal.recovered_records())
-                .map_err(|_| ManifestStoreError::BootstrapSnapshotMismatch)?;
-            registry
+        let active_config = if strict_create {
+            active_config.manifest_create()
         } else {
-            if config
-                .registry
-                .bootstrap
-                .as_ref()
-                .is_some_and(|snapshot| !snapshot.series().is_empty())
-            {
-                return Err(ManifestStoreError::BootstrapSnapshotMismatch);
-            }
-            SeriesRegistry::new(config.store_id, config.registry.limits)
+            preflight_manifest_genesis(&config.directory, config.store_id)
+                .map_err(map_manifest_genesis_preflight)?;
+            active_config.manifest_genesis()
         };
-        journal.upgrade_to_manifest_header()?;
+        let journal = ActiveJournal::open(active_config)?;
+        if !journal.recovered_records().is_empty()
+            || journal.durable_cutoff() != genesis_placeholder(config.store_id)
+        {
+            return Err(ManifestStoreError::UnsupportedStoreFormat);
+        }
+        let registry = SeriesRegistry::new(config.store_id, config.registry.limits);
         let mut store = Self {
             directory_path: config.directory,
             directory,
@@ -765,7 +722,11 @@ impl ManifestStore {
                     checksum: 0,
                 },
                 cutoff: genesis_placeholder(config.store_id),
-                retry: None,
+                retry: RetryArtifactReference {
+                    public: RetryStateReference::new(0, 0),
+                    length: 0,
+                    checksum: 0,
+                },
                 sequence_floor: 0,
                 catalog: None,
             },
@@ -793,7 +754,7 @@ impl ManifestStore {
             generation: 1,
             registry: registry_reference,
             cutoff: store.journal.durable_cutoff(),
-            retry: Some(retry_reference),
+            retry: retry_reference,
             sequence_floor: 0,
             catalog: None,
         };
@@ -911,7 +872,7 @@ impl ManifestStore {
     }
 
     /// Seals the exact fully durable nonempty active range and commits an empty
-    /// successor generation through Manifest V3.
+    /// successor generation through the current Manifest V1 root.
     ///
     /// # Errors
     ///
@@ -1083,13 +1044,13 @@ impl ManifestStore {
             .generation
             .checked_add(1)
             .ok_or(ManifestStoreError::GenerationExhausted)?;
-        let retry_generation = self.current.retry.map_or(Ok(1), |reference| {
-            reference
-                .public
-                .generation()
-                .checked_add(1)
-                .ok_or(ManifestStoreError::GenerationExhausted)
-        })?;
+        let retry_generation = self
+            .current
+            .retry
+            .public
+            .generation()
+            .checked_add(1)
+            .ok_or(ManifestStoreError::GenerationExhausted)?;
         let retry_slot = self.select_retry_candidate_slot()?;
         let retry_public = RetryStateReference::new(retry_slot, retry_generation);
         let anticipated = ManifestCommit::from_generation_parts(
@@ -1097,7 +1058,7 @@ impl ManifestStore {
             self.current.registry.generation,
             self.current.registry.slot,
             cutoff,
-            Some(retry_public),
+            retry_public,
             self.current.sequence_floor,
             self.current.catalog,
         );
@@ -1110,7 +1071,7 @@ impl ManifestStore {
             generation,
             registry: self.current.registry,
             cutoff,
-            retry: Some(retry),
+            retry,
             sequence_floor: self.current.sequence_floor,
             catalog: self.current.catalog,
         };
@@ -1303,7 +1264,7 @@ impl ManifestStore {
     fn select_retry_candidate_slot(&self) -> Result<u8, ManifestStoreError> {
         let referenced = self
             .manifest_slots
-            .map(|slot| slot.and_then(|record| record.retry.map(|retry| retry.public.slot())));
+            .map(|slot| slot.map(|record| record.retry.public.slot()));
         (0_u8..3)
             .find(|candidate| !referenced.iter().flatten().any(|slot| slot == candidate))
             .ok_or(ManifestStoreError::InvalidRetry)
@@ -1425,7 +1386,7 @@ impl ManifestStore {
             MANIFEST_STAGING_FILE_NAME,
             MANIFEST_SLOT_NAMES[target],
             &bytes,
-            MANIFEST_V3_LEN,
+            MANIFEST_LEN,
             |candidate| {
                 if decode_manifest(candidate, self.current.cutoff.journal().store_id())? != record {
                     return Err(ManifestStoreError::InvalidManifest);
@@ -1449,13 +1410,24 @@ impl ManifestStore {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormatPreflight {
+    EmptyCreate,
+    MarkerStaging,
+    Current,
+}
+
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
 struct Inventory {
+    entries: usize,
+    store_format: bool,
+    store_format_staging: bool,
     staging: bool,
     rotation_staging: bool,
     registry_slots: usize,
     retry_slots: usize,
+    manifest_slots: usize,
     catalog_slots: usize,
     rotation_intent: bool,
     store_lock: bool,
@@ -1464,12 +1436,207 @@ struct Inventory {
     sealed_generations: Vec<u64>,
 }
 
+fn preflight_store_format(
+    config: &ManifestStoreConfig,
+) -> Result<FormatPreflight, ManifestStoreError> {
+    let inventory = match inspect_inventory(&config.directory) {
+        Ok(inventory) => inventory,
+        Err(ManifestStoreError::Io(error)) => return Err(ManifestStoreError::Io(error)),
+        Err(_) => return Err(ManifestStoreError::UnsupportedStoreFormat),
+    };
+    if inventory.entries == 0 {
+        return if config.mode == ActiveJournalOpenMode::CreateNew {
+            Ok(FormatPreflight::EmptyCreate)
+        } else {
+            Err(ManifestStoreError::UnsupportedStoreFormat)
+        };
+    }
+    if !inventory.store_lock
+        || inventory.store_format == inventory.store_format_staging
+        || (!inventory.store_format && inventory.entries != 2)
+    {
+        return Err(ManifestStoreError::UnsupportedStoreFormat);
+    }
+    let marker_name = if inventory.store_format {
+        STORE_FORMAT_FILE_NAME
+    } else {
+        STORE_FORMAT_STAGING_FILE_NAME
+    };
+    let marker = read_required_bounded(&config.directory.join(marker_name), STORE_FORMAT_LEN)
+        .map_err(|_| ManifestStoreError::UnsupportedStoreFormat)?;
+    decode_store_format_marker(&marker, config.store_id)?;
+    if inventory.store_format_staging {
+        return Ok(FormatPreflight::MarkerStaging);
+    }
+    preflight_current_artifact_versions(config, &inventory)?;
+    if config.mode == ActiveJournalOpenMode::CreateNew && inventory.manifest_slots != 0 {
+        return Err(ManifestStoreError::InvalidInventory);
+    }
+    Ok(FormatPreflight::Current)
+}
+
+fn preflight_current_artifact_versions(
+    config: &ManifestStoreConfig,
+    inventory: &Inventory,
+) -> Result<(), ManifestStoreError> {
+    let mut manifests = [None, None];
+    for (slot, name) in MANIFEST_SLOT_NAMES.iter().enumerate() {
+        let Some(bytes) = read_optional_bounded(&config.directory.join(name), MANIFEST_LEN)? else {
+            continue;
+        };
+        if bytes.len() != MANIFEST_LEN
+            || bytes[..8] != MANIFEST_MAGIC
+            || u16::from_be_bytes(bytes[8..10].try_into().unwrap_or_default()) != MANIFEST_VERSION
+            || u16::from_be_bytes(bytes[10..12].try_into().unwrap_or_default())
+                != u16::try_from(MANIFEST_LEN).unwrap_or_default()
+        {
+            return Err(ManifestStoreError::UnsupportedStoreFormat);
+        }
+        manifests[slot] = Some(decode_manifest(&bytes, config.store_id)?);
+    }
+    let _ = select_current_manifest(manifests)?;
+
+    for generation in &inventory.active_journals {
+        let path = config.directory.join(active_journal_file_name(*generation));
+        let mut file =
+            File::open(path).map_err(|error| manifest_io(ManifestIoOperation::Read, &error))?;
+        if file
+            .metadata()
+            .map_err(|error| manifest_io(ManifestIoOperation::Metadata, &error))?
+            .len()
+            < crate::JOURNAL_V1_HEADER_LEN as u64
+        {
+            return Err(ManifestStoreError::UnsupportedStoreFormat);
+        }
+        let mut header = [0_u8; crate::JOURNAL_V1_HEADER_LEN];
+        file.read_exact(&mut header)
+            .map_err(|error| manifest_io(ManifestIoOperation::Read, &error))?;
+        if header[..8] != crate::JOURNAL_V1_HEADER_MAGIC
+            || u16::from_be_bytes(header[8..10].try_into().unwrap_or_default())
+                != crate::JOURNAL_V1_VERSION
+            || !matches!(
+                crate::JournalHeaderV1::decode(&header),
+                Ok(decoded) if decoded.store_id() == config.store_id
+            )
+        {
+            return Err(ManifestStoreError::UnsupportedStoreFormat);
+        }
+    }
+
+    for (slot, name) in RETRY_SLOT_NAMES.iter().enumerate() {
+        let Some(bytes) =
+            read_optional_bounded(&config.directory.join(name), MAX_RETRY_STATE_BYTES)?
+        else {
+            continue;
+        };
+        if bytes.len() < crate::retry::RETRY_HEADER_LEN + 4
+            || bytes[..8] != crate::retry::RETRY_MAGIC
+            || u16::from_be_bytes(bytes[8..10].try_into().unwrap_or_default())
+                != crate::retry::RETRY_VERSION
+        {
+            return Err(ManifestStoreError::UnsupportedStoreFormat);
+        }
+        match decode_retry_state_at_slot(
+            &bytes,
+            u8::try_from(slot).map_err(|_| ManifestStoreError::UnsupportedStoreFormat)?,
+            config.store_id,
+            config.retry,
+        ) {
+            Ok(_) => {}
+            Err(RetryStateCodecError::OptionsMismatch) => {
+                return Err(ManifestStoreError::InvalidRetry);
+            }
+            Err(RetryStateCodecError::StoreMismatch) => {
+                return Err(ManifestStoreError::StoreMismatch);
+            }
+            Err(RetryStateCodecError::Invalid) => {
+                return Err(ManifestStoreError::UnsupportedStoreFormat);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_store_format_marker(store_id: StoreId) -> [u8; STORE_FORMAT_LEN] {
+    let mut bytes = [0_u8; STORE_FORMAT_LEN];
+    bytes[..8].copy_from_slice(&STORE_FORMAT_MAGIC);
+    bytes[8..10].copy_from_slice(&STORE_FORMAT_VERSION.to_be_bytes());
+    bytes[10..12].copy_from_slice(&STORE_FORMAT_RECORD_LEN.to_be_bytes());
+    bytes[12..28].copy_from_slice(store_id.as_bytes());
+    let checksum = crc32c(&bytes[..28]);
+    bytes[28..32].copy_from_slice(&checksum.to_be_bytes());
+    bytes
+}
+
+fn decode_store_format_marker(
+    bytes: &[u8],
+    expected_store: StoreId,
+) -> Result<(), ManifestStoreError> {
+    if bytes.len() != STORE_FORMAT_LEN
+        || bytes[..8] != STORE_FORMAT_MAGIC
+        || u16::from_be_bytes(bytes[8..10].try_into().unwrap_or_default()) != STORE_FORMAT_VERSION
+        || u16::from_be_bytes(bytes[10..12].try_into().unwrap_or_default())
+            != STORE_FORMAT_RECORD_LEN
+        || crc32c(&bytes[..28]) != u32::from_be_bytes(bytes[28..32].try_into().unwrap_or_default())
+        || !matches!(
+            StoreId::from_bytes(bytes[12..28].try_into().unwrap_or_default()),
+            Ok(store_id) if store_id == expected_store
+        )
+    {
+        return Err(ManifestStoreError::UnsupportedStoreFormat);
+    }
+    Ok(())
+}
+
+fn publish_store_format_marker(
+    directory_path: &Path,
+    directory: &File,
+    store_id: StoreId,
+) -> Result<(), ManifestStoreError> {
+    let bytes = encode_store_format_marker(store_id);
+    publish_reusable_slot(
+        directory_path,
+        directory,
+        STORE_FORMAT_STAGING_FILE_NAME,
+        STORE_FORMAT_FILE_NAME,
+        &bytes,
+        STORE_FORMAT_LEN,
+        |candidate| decode_store_format_marker(candidate, store_id),
+    )
+}
+
+fn converge_store_format_marker(
+    directory_path: &Path,
+    directory: &File,
+    store_id: StoreId,
+) -> Result<(), ManifestStoreError> {
+    let staging = directory_path.join(STORE_FORMAT_STAGING_FILE_NAME);
+    let final_path = directory_path.join(STORE_FORMAT_FILE_NAME);
+    if final_path
+        .try_exists()
+        .map_err(|error| manifest_io(ManifestIoOperation::Metadata, &error))?
+    {
+        return Err(ManifestStoreError::UnsupportedStoreFormat);
+    }
+    let bytes = read_required_bounded(&staging, STORE_FORMAT_LEN)
+        .map_err(|_| ManifestStoreError::UnsupportedStoreFormat)?;
+    decode_store_format_marker(&bytes, store_id)?;
+    std::fs::rename(staging, final_path)
+        .map_err(|error| manifest_io(ManifestIoOperation::Publish, &error))?;
+    directory
+        .sync_all()
+        .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))
+}
+
 fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> {
     let mut count = 0_usize;
     let mut staging = false;
+    let mut store_format = false;
+    let mut store_format_staging = false;
     let mut rotation_staging = false;
     let mut registry_slots = 0_usize;
     let mut retry_slots = 0_usize;
+    let mut manifest_slots = 0_usize;
     let mut catalog_slots = 0_usize;
     let mut active_journals = Vec::new();
     let mut active_checkpoints = Vec::new();
@@ -1498,7 +1665,11 @@ fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> 
         let Some(name) = name.to_str() else {
             return Err(ManifestStoreError::InvalidInventory);
         };
-        if name == STORE_LOCK_FILE_NAME {
+        if name == STORE_FORMAT_FILE_NAME {
+            store_format = true;
+        } else if name == STORE_FORMAT_STAGING_FILE_NAME {
+            store_format_staging = true;
+        } else if name == STORE_LOCK_FILE_NAME {
             store_lock = true;
         } else if name == MANIFEST_STAGING_FILE_NAME
             || name == REGISTRY_STAGING_FILE_NAME
@@ -1530,7 +1701,9 @@ fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> 
             active_journals.push(ACTIVE_JOURNAL_GENERATION);
         } else if name == ACTIVE_CHECKPOINT_FILE_NAME {
             active_checkpoints.push(ACTIVE_JOURNAL_GENERATION);
-        } else if !MANIFEST_SLOT_NAMES.contains(&name) {
+        } else if MANIFEST_SLOT_NAMES.contains(&name) {
+            manifest_slots += 1;
+        } else {
             return Err(ManifestStoreError::InvalidInventory);
         }
     }
@@ -1538,10 +1711,14 @@ fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> 
     active_checkpoints.sort_unstable();
     sealed_generations.sort_unstable();
     Ok(Inventory {
+        entries: count,
+        store_format,
+        store_format_staging,
         staging,
         rotation_staging,
         registry_slots,
         retry_slots,
+        manifest_slots,
         catalog_slots,
         rotation_intent,
         store_lock,
@@ -1551,23 +1728,19 @@ fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> 
     })
 }
 
-fn validate_bootstrap_generation_inventory(
-    inventory: &Inventory,
-    mode: ActiveJournalOpenMode,
-) -> Result<(), ManifestStoreError> {
-    let active_is_valid = match mode {
-        ActiveJournalOpenMode::CreateNew => {
-            inventory.active_journals.is_empty() && inventory.active_checkpoints.is_empty()
-        }
-        ActiveJournalOpenMode::OpenExisting => {
-            inventory.active_journals == [ACTIVE_JOURNAL_GENERATION]
-                && (inventory.active_checkpoints.is_empty()
-                    || inventory.active_checkpoints == [ACTIVE_JOURNAL_GENERATION])
-        }
-    };
-    if !active_is_valid || !inventory.sealed_generations.is_empty() || inventory.catalog_slots != 0
+fn validate_genesis_inventory(inventory: &Inventory) -> Result<(), ManifestStoreError> {
+    let active_is_valid = (inventory.active_journals.is_empty()
+        && inventory.active_checkpoints.is_empty())
+        || (inventory.active_journals == [ACTIVE_JOURNAL_GENERATION]
+            && (inventory.active_checkpoints.is_empty()
+                || inventory.active_checkpoints == [ACTIVE_JOURNAL_GENERATION]));
+    if !active_is_valid
+        || !inventory.sealed_generations.is_empty()
+        || inventory.catalog_slots != 0
+        || inventory.rotation_intent
+        || inventory.rotation_staging
     {
-        return Err(ManifestStoreError::InvalidInventory);
+        return Err(ManifestStoreError::UnsupportedStoreFormat);
     }
     Ok(())
 }
@@ -1668,7 +1841,7 @@ fn read_manifest_slots(
 ) -> Result<[Option<ManifestRecord>; 2], ManifestStoreError> {
     let mut slots = [None, None];
     for (index, name) in MANIFEST_SLOT_NAMES.iter().enumerate() {
-        let Some(bytes) = read_optional_bounded(&directory.join(name), MANIFEST_V3_LEN)? else {
+        let Some(bytes) = read_optional_bounded(&directory.join(name), MANIFEST_LEN)? else {
             continue;
         };
         slots[index] = Some(decode_manifest(&bytes, store_id)?);
@@ -1729,20 +1902,14 @@ fn catalog_reference_progresses(
 }
 
 fn retry_reference_progresses(
-    older: Option<RetryArtifactReference>,
-    newer: Option<RetryArtifactReference>,
+    older: RetryArtifactReference,
+    newer: RetryArtifactReference,
 ) -> bool {
-    match (older, newer) {
-        (None, None) => true,
-        (None, Some(newer)) => newer.public.generation() == 1,
-        (Some(_), None) => false,
-        (Some(older), Some(newer)) if newer.public.generation() == older.public.generation() => {
-            newer == older
-        }
-        (Some(older), Some(newer)) => {
-            older.public.generation().checked_add(1) == Some(newer.public.generation())
-                && newer.public.slot() != older.public.slot()
-        }
+    if newer.public.generation() == older.public.generation() {
+        newer == older
+    } else {
+        older.public.generation().checked_add(1) == Some(newer.public.generation())
+            && newer.public.slot() != older.public.slot()
     }
 }
 
@@ -1832,7 +1999,7 @@ fn read_interrupted_genesis_registry(
             || decoded.reference.generation != 1
             || decoded.registry.snapshot() != *expected
         {
-            return Err(ManifestStoreError::BootstrapSnapshotMismatch);
+            return Err(ManifestStoreError::InvalidRegistry);
         }
         found = Some(decoded.reference);
     }
@@ -2092,7 +2259,7 @@ fn validate_sealed_inventory_metadata(
         let mut header = [0_u8; crate::JOURNAL_V1_HEADER_LEN];
         file.read_exact(&mut header)
             .map_err(|error| manifest_io(ManifestIoOperation::Read, &error))?;
-        let decoded = crate::JournalHeaderV2::decode(&header)
+        let decoded = crate::JournalHeaderV1::decode(&header)
             .map_err(|_| ManifestStoreError::InvalidGeneration)?;
         if decoded.store_id() != catalog.store_id() {
             return Err(ManifestStoreError::StoreMismatch);
@@ -2277,7 +2444,7 @@ fn rollback_uncommitted_rotation(
         .try_exists()
         .map_err(|error| manifest_io(ManifestIoOperation::Metadata, &error))?
     {
-        let bytes = read_required_bounded(&manifest_staging, MANIFEST_V3_LEN)?;
+        let bytes = read_required_bounded(&manifest_staging, MANIFEST_LEN)?;
         let decoded = decode_manifest(&bytes, config.store_id)?;
         if successor_cutoff.is_none_or(|cutoff| decoded.cutoff != cutoff)
             || current.generation.checked_add(1) != Some(decoded.generation)
@@ -2346,9 +2513,7 @@ fn read_referenced_retry(
     options: RetryPersistenceOptions,
     catalog: &GenerationCatalogSnapshot,
 ) -> Result<RetryStateSnapshot, ManifestStoreError> {
-    let reference = owning_manifest
-        .retry
-        .ok_or(ManifestStoreError::InvalidRetry)?;
+    let reference = owning_manifest.retry;
     let name = RETRY_SLOT_NAMES
         .get(usize::from(reference.public.slot()))
         .ok_or(ManifestStoreError::InvalidRetry)?;
@@ -2380,7 +2545,7 @@ fn validate_retry_inventory(
     let oldest_referenced_generation = manifests
         .iter()
         .flatten()
-        .filter_map(|manifest| manifest.retry)
+        .map(|manifest| manifest.retry)
         .map(|reference| reference.public.generation())
         .min();
     for (slot, name) in RETRY_SLOT_NAMES.iter().enumerate() {
@@ -2394,7 +2559,7 @@ fn validate_retry_inventory(
         let referenced = manifests
             .iter()
             .flatten()
-            .any(|manifest| manifest.retry == Some(reference));
+            .any(|manifest| manifest.retry == reference);
         if !(referenced
             || allow_rotation_redundancy
                 && oldest_referenced_generation
@@ -2404,14 +2569,11 @@ fn validate_retry_inventory(
         }
     }
     for manifest in manifests.into_iter().flatten() {
-        if manifest.retry.is_some() {
-            let manifest_catalog = match manifest.catalog {
-                Some(reference) => read_referenced_catalog(directory, reference, store_id)?,
-                None => GenerationCatalogSnapshot::empty(store_id),
-            };
-            let _ =
-                read_referenced_retry(directory, manifest, store_id, options, &manifest_catalog)?;
-        }
+        let manifest_catalog = match manifest.catalog {
+            Some(reference) => read_referenced_catalog(directory, reference, store_id)?,
+            None => GenerationCatalogSnapshot::empty(store_id),
+        };
+        let _ = read_referenced_retry(directory, manifest, store_id, options, &manifest_catalog)?;
     }
     Ok(())
 }
@@ -2453,11 +2615,11 @@ fn remove_unreferenced_retry_slots(
     let mut removed = false;
     for (slot, name) in RETRY_SLOT_NAMES.iter().enumerate() {
         let slot = u8::try_from(slot).map_err(|_| ManifestStoreError::InvalidRetry)?;
-        if manifests.iter().flatten().any(|manifest| {
-            manifest
-                .retry
-                .is_some_and(|reference| reference.public.slot() == slot)
-        }) {
+        if manifests
+            .iter()
+            .flatten()
+            .any(|manifest| manifest.retry.public.slot() == slot)
+        {
             continue;
         }
         match std::fs::remove_file(directory_path.join(name)) {
@@ -2679,7 +2841,7 @@ fn validate_sealed_journal(
     file.read_exact(&mut header)
         .map_err(|error| manifest_io(ManifestIoOperation::Read, &error))?;
     checksum.update(&header);
-    let header = crate::JournalHeaderV2::decode(&header)
+    let header = crate::JournalHeaderV1::decode(&header)
         .map_err(|_| ManifestStoreError::InvalidGeneration)?;
     if header.store_id() != store_id {
         return Err(ManifestStoreError::StoreMismatch);
@@ -2876,6 +3038,11 @@ fn injected_publication_fault(
     point: PublicationPoint,
 ) -> Result<(), ManifestStoreError> {
     let code = match (staging_name, point) {
+        (STORE_FORMAT_STAGING_FILE_NAME, PublicationPoint::Write) => 40,
+        (STORE_FORMAT_STAGING_FILE_NAME, PublicationPoint::SyncArtifact) => 41,
+        (STORE_FORMAT_STAGING_FILE_NAME, PublicationPoint::Readback) => 42,
+        (STORE_FORMAT_STAGING_FILE_NAME, PublicationPoint::Publish) => 43,
+        (STORE_FORMAT_STAGING_FILE_NAME, PublicationPoint::SyncDirectory) => 44,
         (REGISTRY_STAGING_FILE_NAME, PublicationPoint::Write) => 1,
         (REGISTRY_STAGING_FILE_NAME, PublicationPoint::SyncArtifact) => 2,
         (REGISTRY_STAGING_FILE_NAME, PublicationPoint::Readback) => 9,
@@ -2965,22 +3132,10 @@ fn read_required_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, Manifes
 }
 
 fn encode_manifest(record: ManifestRecord) -> Vec<u8> {
-    let version = if record.catalog.is_some() {
-        MANIFEST_V3_VERSION
-    } else if record.retry.is_some() {
-        MANIFEST_V2_VERSION
-    } else {
-        MANIFEST_V1_VERSION
-    };
-    let length = if version == MANIFEST_V3_VERSION {
-        MANIFEST_V3_LEN
-    } else {
-        MANIFEST_LEGACY_LEN
-    };
-    let mut bytes = vec![0_u8; length];
+    let mut bytes = vec![0_u8; MANIFEST_LEN];
     bytes[..8].copy_from_slice(&MANIFEST_MAGIC);
-    bytes[8..10].copy_from_slice(&version.to_be_bytes());
-    let length_u16 = u16::try_from(length).expect("fixed manifest length fits u16");
+    bytes[8..10].copy_from_slice(&MANIFEST_VERSION.to_be_bytes());
+    let length_u16 = u16::try_from(MANIFEST_LEN).expect("fixed manifest length fits u16");
     bytes[10..12].copy_from_slice(&length_u16.to_be_bytes());
     bytes[12..28].copy_from_slice(record.cutoff.journal().store_id().as_bytes());
     bytes[28..36].copy_from_slice(&record.generation.to_be_bytes());
@@ -2992,99 +3147,63 @@ fn encode_manifest(record: ManifestRecord) -> Vec<u8> {
     bytes[72..80].copy_from_slice(&record.registry.generation.to_be_bytes());
     bytes[80..88].copy_from_slice(&record.registry.length.to_be_bytes());
     bytes[88..92].copy_from_slice(&record.registry.checksum.to_be_bytes());
-    if let Some(retry) = record.retry {
-        bytes[92] = retry.public.slot();
-        bytes[96..104].copy_from_slice(&retry.public.generation().to_be_bytes());
-        bytes[104..112].copy_from_slice(&retry.length.to_be_bytes());
-        bytes[112..116].copy_from_slice(&retry.checksum.to_be_bytes());
-    }
+    bytes[92] = record.retry.public.slot();
+    bytes[96..104].copy_from_slice(&record.retry.public.generation().to_be_bytes());
+    bytes[104..112].copy_from_slice(&record.retry.length.to_be_bytes());
+    bytes[112..116].copy_from_slice(&record.retry.checksum.to_be_bytes());
+    bytes[124..132].copy_from_slice(&record.sequence_floor.to_be_bytes());
     if let Some(catalog) = record.catalog {
-        bytes[124..132].copy_from_slice(&record.sequence_floor.to_be_bytes());
         bytes[132] = catalog.slot();
         bytes[136..144].copy_from_slice(&catalog.generation().to_be_bytes());
         bytes[144..152].copy_from_slice(&catalog.length().to_be_bytes());
         bytes[152..156].copy_from_slice(&catalog.checksum().to_be_bytes());
-        let checksum = crc32c(&bytes[..156]);
-        bytes[156..160].copy_from_slice(&checksum.to_be_bytes());
-    } else {
-        let checksum = crc32c(&bytes[..124]);
-        bytes[124..128].copy_from_slice(&checksum.to_be_bytes());
     }
+    let checksum = crc32c(&bytes[..156]);
+    bytes[156..160].copy_from_slice(&checksum.to_be_bytes());
     bytes
 }
 
 #[allow(clippy::too_many_lines)]
 fn decode_manifest(bytes: &[u8], store_id: StoreId) -> Result<ManifestRecord, ManifestStoreError> {
-    if bytes.len() < MANIFEST_LEGACY_LEN
+    if bytes.len() != MANIFEST_LEN
         || bytes[..8] != MANIFEST_MAGIC
-        || bytes[69..72].iter().any(|byte| *byte != 0)
-    {
-        return Err(ManifestStoreError::InvalidManifest);
-    }
-    let version = u16::from_be_bytes(bytes[8..10].try_into().unwrap_or_default());
-    let expected_length = if version == MANIFEST_V3_VERSION {
-        MANIFEST_V3_LEN
-    } else if version == MANIFEST_V1_VERSION || version == MANIFEST_V2_VERSION {
-        MANIFEST_LEGACY_LEN
-    } else {
-        return Err(ManifestStoreError::InvalidManifest);
-    };
-    if bytes.len() != expected_length
+        || u16::from_be_bytes(bytes[8..10].try_into().unwrap_or_default()) != MANIFEST_VERSION
         || u16::from_be_bytes(bytes[10..12].try_into().unwrap_or_default())
-            != u16::try_from(expected_length).unwrap_or_default()
-        || (version == MANIFEST_V3_VERSION
-            && crc32c(&bytes[..156])
-                != u32::from_be_bytes(bytes[156..160].try_into().unwrap_or_default()))
-        || (version != MANIFEST_V3_VERSION
-            && crc32c(&bytes[..124])
-                != u32::from_be_bytes(bytes[124..128].try_into().unwrap_or_default()))
+            != u16::try_from(MANIFEST_LEN).unwrap_or_default()
+        || bytes[69..72].iter().any(|byte| *byte != 0)
+        || bytes[93..96].iter().any(|byte| *byte != 0)
+        || bytes[116..124].iter().any(|byte| *byte != 0)
+        || bytes[133..136].iter().any(|byte| *byte != 0)
+        || crc32c(&bytes[..156])
+            != u32::from_be_bytes(bytes[156..160].try_into().unwrap_or_default())
     {
         return Err(ManifestStoreError::InvalidManifest);
     }
-    let retry = match version {
-        MANIFEST_V1_VERSION => {
-            if bytes[92..124].iter().any(|byte| *byte != 0) {
-                return Err(ManifestStoreError::InvalidManifest);
-            }
-            None
-        }
-        MANIFEST_V2_VERSION | MANIFEST_V3_VERSION => {
-            if bytes[93..96].iter().any(|byte| *byte != 0)
-                || bytes[116..124].iter().any(|byte| *byte != 0)
-            {
-                return Err(ManifestStoreError::InvalidManifest);
-            }
-            let reference = RetryArtifactReference {
-                public: RetryStateReference::new(
-                    bytes[92],
-                    u64::from_be_bytes(bytes[96..104].try_into().unwrap_or_default()),
-                ),
-                length: u64::from_be_bytes(bytes[104..112].try_into().unwrap_or_default()),
-                checksum: u32::from_be_bytes(bytes[112..116].try_into().unwrap_or_default()),
-            };
-            if reference.public.slot() >= 3
-                || reference.public.generation() == 0
-                || reference.length == 0
-                || usize::try_from(reference.length)
-                    .map_or(true, |length| length > MAX_RETRY_STATE_BYTES)
-            {
-                return Err(ManifestStoreError::InvalidManifest);
-            }
-            Some(reference)
-        }
-        _ => return Err(ManifestStoreError::InvalidManifest),
+    let retry = RetryArtifactReference {
+        public: RetryStateReference::new(
+            bytes[92],
+            u64::from_be_bytes(bytes[96..104].try_into().unwrap_or_default()),
+        ),
+        length: u64::from_be_bytes(bytes[104..112].try_into().unwrap_or_default()),
+        checksum: u32::from_be_bytes(bytes[112..116].try_into().unwrap_or_default()),
     };
-    let (sequence_floor, catalog) = if version == MANIFEST_V3_VERSION {
-        if bytes[133..136].iter().any(|byte| *byte != 0) {
-            return Err(ManifestStoreError::InvalidManifest);
-        }
+    if retry.public.slot() >= 3
+        || retry.public.generation() == 0
+        || retry.length == 0
+        || usize::try_from(retry.length).map_or(true, |length| length > MAX_RETRY_STATE_BYTES)
+    {
+        return Err(ManifestStoreError::InvalidManifest);
+    }
+    let sequence_floor = u64::from_be_bytes(bytes[124..132].try_into().unwrap_or_default());
+    let catalog = if bytes[132..156].iter().all(|byte| *byte == 0) {
+        None
+    } else {
         let reference = GenerationCatalogReference::new(
             bytes[132],
             u64::from_be_bytes(bytes[136..144].try_into().unwrap_or_default()),
             u64::from_be_bytes(bytes[144..152].try_into().unwrap_or_default()),
             u32::from_be_bytes(bytes[152..156].try_into().unwrap_or_default()),
         );
-        let floor = u64::from_be_bytes(bytes[124..132].try_into().unwrap_or_default());
         if reference.slot() >= 3
             || reference.generation() == 0
             || reference.length() == 0
@@ -3093,9 +3212,7 @@ fn decode_manifest(bytes: &[u8], store_id: StoreId) -> Result<ManifestRecord, Ma
         {
             return Err(ManifestStoreError::InvalidManifest);
         }
-        (floor, Some(reference))
-    } else {
-        (0, None)
+        Some(reference)
     };
     let decoded_store = StoreId::from_bytes(bytes[12..28].try_into().unwrap_or_default())
         .map_err(|_| ManifestStoreError::InvalidManifest)?;
@@ -3115,9 +3232,10 @@ fn decode_manifest(bytes: &[u8], store_id: StoreId) -> Result<ManifestRecord, Ma
     };
     if generation == 0
         || journal_generation == 0
-        || (version != MANIFEST_V3_VERSION && journal_generation != ACTIVE_JOURNAL_GENERATION)
-        || (version == MANIFEST_V3_VERSION
-            && (journal_generation <= ACTIVE_JOURNAL_GENERATION || sequence_floor == 0))
+        || (journal_generation == ACTIVE_JOURNAL_GENERATION
+            && (sequence_floor != 0 || catalog.is_some()))
+        || (journal_generation > ACTIVE_JOURNAL_GENERATION
+            && (sequence_floor == 0 || catalog.is_none()))
         || checkpoint_generation == 0
         || registry.slot >= 3
         || registry.generation == 0
@@ -3125,7 +3243,7 @@ fn decode_manifest(bytes: &[u8], store_id: StoreId) -> Result<ManifestRecord, Ma
         || registry.length == 0
         || usize::try_from(registry.length)
             .map_or(true, |length| length > MAX_REGISTRY_SNAPSHOT_BYTES)
-        || retry.is_some_and(|reference| reference.public.generation() > generation)
+        || retry.public.generation() > generation
         || append_sequence < sequence_floor
         || (append_sequence == sequence_floor)
             != (end_offset == crate::JOURNAL_V1_HEADER_LEN as u64)
@@ -3491,6 +3609,14 @@ fn invalid_registry_journal(_: JournalV1Error) -> ManifestStoreError {
     ManifestStoreError::InvalidRegistry
 }
 
+fn map_manifest_genesis_preflight(error: ActiveJournalError) -> ManifestStoreError {
+    if matches!(error, ActiveJournalError::Io(_)) {
+        ManifestStoreError::Active(error)
+    } else {
+        ManifestStoreError::UnsupportedStoreFormat
+    }
+}
+
 fn manifest_io(operation: ManifestIoOperation, error: &std::io::Error) -> ManifestStoreError {
     ManifestStoreError::Io(ManifestIoEvidence {
         operation,
@@ -3595,6 +3721,44 @@ mod tests {
     }
 
     #[test]
+    fn store_format_v1_marker_refuses_hostile_magic_version_length_scope_and_checksum() {
+        let store_id = test_support::store_id(1);
+        let canonical = encode_store_format_marker(store_id);
+        assert_eq!(canonical.len(), STORE_FORMAT_LEN);
+        decode_store_format_marker(&canonical, store_id).expect("canonical marker");
+
+        let mut candidates = Vec::new();
+        let mut wrong_magic = canonical.to_vec();
+        wrong_magic[0] ^= 1;
+        candidates.push(wrong_magic);
+        let mut wrong_version = canonical.to_vec();
+        wrong_version[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        let checksum = crc32c(&wrong_version[..28]);
+        wrong_version[28..].copy_from_slice(&checksum.to_be_bytes());
+        candidates.push(wrong_version);
+        let mut wrong_length = canonical.to_vec();
+        wrong_length[10..12].copy_from_slice(&31_u16.to_be_bytes());
+        let checksum = crc32c(&wrong_length[..28]);
+        wrong_length[28..].copy_from_slice(&checksum.to_be_bytes());
+        candidates.push(wrong_length);
+        candidates.push(encode_store_format_marker(test_support::store_id(2)).to_vec());
+        let mut wrong_checksum = canonical.to_vec();
+        wrong_checksum[31] ^= 1;
+        candidates.push(wrong_checksum);
+        candidates.push(canonical[..31].to_vec());
+        let mut trailing = canonical.to_vec();
+        trailing.push(0);
+        candidates.push(trailing);
+
+        for candidate in candidates {
+            assert_eq!(
+                decode_store_format_marker(&candidate, store_id),
+                Err(ManifestStoreError::UnsupportedStoreFormat)
+            );
+        }
+    }
+
+    #[test]
     fn historical_declaration_preflight_and_append_share_exact_refusal() {
         let directory = test_directory(23);
         let mut store = ManifestStore::open(test_config(
@@ -3622,6 +3786,85 @@ mod tests {
 
         drop(store);
         fs::remove_dir_all(directory).expect("remove historical-preflight fixture");
+    }
+
+    #[test]
+    fn current_marker_and_genesis_publication_faults_converge_or_refuse_unchanged() {
+        for code in 40_u8..=44 {
+            let directory = test_directory(code);
+            set_publish_fault(code);
+            assert!(
+                ManifestStore::open(test_config(
+                    directory.clone(),
+                    ActiveJournalOpenMode::CreateNew,
+                ))
+                .is_err()
+            );
+            let before = directory_bytes(&directory);
+            let reopened = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::OpenExisting,
+            ));
+            if code == 40 {
+                assert!(matches!(
+                    reopened,
+                    Err(ManifestStoreError::UnsupportedStoreFormat)
+                ));
+                assert_eq!(directory_bytes(&directory), before);
+            } else {
+                let reopened = reopened.expect("exact marker publication converges");
+                assert_eq!(reopened.inspection().committed().manifest_generation(), 1);
+                assert_eq!(
+                    reopened.inspection().committed().retry_state().generation(),
+                    1
+                );
+            }
+            fs::remove_dir_all(directory).expect("remove marker fault fixture");
+        }
+
+        for (code, published) in [
+            (1_u8, false),
+            (2, false),
+            (9, false),
+            (3, false),
+            (4, true),
+            (11, false),
+            (12, false),
+            (13, false),
+            (14, false),
+            (15, true),
+            (5, false),
+            (6, false),
+            (10, false),
+            (7, false),
+            (8, true),
+        ] {
+            let directory = test_directory(code);
+            set_publish_fault(code);
+            assert!(
+                ManifestStore::open(test_config(
+                    directory.clone(),
+                    ActiveJournalOpenMode::CreateNew,
+                ))
+                .is_err()
+            );
+            let before = directory_bytes(&directory);
+            let reopened = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::OpenExisting,
+            ));
+            if published {
+                let reopened = reopened.expect("published genesis phase converges");
+                assert_eq!(reopened.inspection().committed().manifest_generation(), 1);
+            } else {
+                assert!(matches!(
+                    reopened,
+                    Err(ManifestStoreError::InterruptedPublication)
+                ));
+                assert_eq!(directory_bytes(&directory), before);
+            }
+            fs::remove_dir_all(directory).expect("remove genesis fault fixture");
+        }
     }
 
     fn rewrite_catalog_entry_registry_generation(
@@ -3658,8 +3901,8 @@ mod tests {
                     == current.manifest_generation())
                 .then_some((*name, bytes))
             })
-            .expect("find current Manifest V3");
-        assert_eq!(manifest_bytes.len(), MANIFEST_V3_LEN);
+            .expect("find current Manifest V1");
+        assert_eq!(manifest_bytes.len(), MANIFEST_LEN);
         manifest_bytes[152..156].copy_from_slice(&catalog_checksum.to_be_bytes());
         let manifest_checksum = crc32c(&manifest_bytes[..156]);
         manifest_bytes[156..160].copy_from_slice(&manifest_checksum.to_be_bytes());
@@ -3704,7 +3947,7 @@ mod tests {
     }
 
     #[test]
-    fn first_rotation_commits_v3_and_reopens_empty_successor_without_rewriting_retry() {
+    fn first_rotation_commits_current_v1_and_reopens_empty_successor_without_rewriting_retry() {
         let directory = test_directory(17);
         let mut store = ManifestStore::open(test_config(
             directory.clone(),
@@ -3986,11 +4229,11 @@ mod tests {
                 1,
                 crate::JOURNAL_V1_HEADER_LEN as u64,
             ),
-            retry: Some(RetryArtifactReference {
+            retry: RetryArtifactReference {
                 public: RetryStateReference::new(0, 1),
                 length: 68,
                 checksum: 7,
-            }),
+            },
             sequence_floor: 1,
             catalog: first.reference(),
         };
@@ -4140,7 +4383,9 @@ mod tests {
             };
             assert!(matches!(
                 error,
-                ManifestStoreError::InvalidInventory | ManifestStoreError::InvalidGeneration
+                ManifestStoreError::InvalidInventory
+                    | ManifestStoreError::InvalidGeneration
+                    | ManifestStoreError::UnsupportedStoreFormat
             ));
             assert_eq!(fs::read(&extra).expect("extra artifact retained"), [code]);
             fs::remove_dir_all(directory).expect("remove exact-inventory fixture");
@@ -4519,7 +4764,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn rotation_fault_matrix_preserves_exact_prior_or_committed_v3_root() {
+    fn rotation_fault_matrix_preserves_exact_prior_or_committed_current_v1_root() {
         let precommit = [
             20_u8, 21, 22, 23, 24, 25, 26, 27, 28, 29, 35, 36, 30, 31, 32, 33, 34, 5, 6, 10, 7,
         ];
@@ -4627,7 +4872,7 @@ mod tests {
                 directory.clone(),
                 ActiveJournalOpenMode::OpenExisting,
             ))
-            .expect("postcommit evidence converges only to Manifest V3");
+            .expect("postcommit evidence converges only to current Manifest V1");
             let inspection = reopened.inspection();
             assert_eq!(inspection.generations().active_generation(), 2);
             assert_eq!(inspection.generations().sealed_count(), 1);
@@ -4639,173 +4884,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn manifest_parser_refuses_hostile_version_bounds_reserved_scope_and_checksum() {
-        let store_id = test_support::store_id(1);
-        let record = ManifestRecord {
-            generation: 1,
-            registry: RegistryReference {
-                slot: 0,
-                generation: 1,
-                length: 68,
-                checksum: 7,
-            },
-            cutoff: genesis_placeholder(store_id),
-            retry: None,
-            sequence_floor: 0,
-            catalog: None,
-        };
-        let canonical = encode_manifest(record);
-        assert_eq!(decode_manifest(&canonical, store_id), Ok(record));
-
-        for offset in [9_usize, 69, 92, 127] {
-            let mut hostile = canonical.clone();
-            hostile[offset] ^= 0xff;
-            if offset != 127 {
-                let checksum = crc32c(&hostile[..124]);
-                hostile[124..].copy_from_slice(&checksum.to_be_bytes());
-            }
-            assert!(matches!(
-                decode_manifest(&hostile, store_id),
-                Err(ManifestStoreError::InvalidManifest)
-            ));
-        }
-        for (range, value) in [
-            (28..36, 0_u64),
-            (72..80, 0_u64),
-            (80..88, (MAX_REGISTRY_SNAPSHOT_BYTES as u64) + 1),
-        ] {
-            let mut hostile = canonical.clone();
-            hostile[range].copy_from_slice(&value.to_be_bytes());
-            let checksum = crc32c(&hostile[..124]);
-            hostile[124..].copy_from_slice(&checksum.to_be_bytes());
-            assert!(matches!(
-                decode_manifest(&hostile, store_id),
-                Err(ManifestStoreError::InvalidManifest)
-            ));
-        }
-        let mut slot = canonical.clone();
-        slot[68] = 3;
-        let checksum = crc32c(&slot[..124]);
-        slot[124..].copy_from_slice(&checksum.to_be_bytes());
-        assert!(matches!(
-            decode_manifest(&slot, store_id),
-            Err(ManifestStoreError::InvalidManifest)
-        ));
-        assert!(matches!(
-            decode_manifest(&canonical, test_support::store_id(2)),
-            Err(ManifestStoreError::StoreMismatch)
-        ));
-
-        let v2_record = ManifestRecord {
-            retry: Some(RetryArtifactReference {
-                public: RetryStateReference::new(0, 1),
-                length: 68,
-                checksum: 9,
-            }),
-            ..record
-        };
-        let v2 = encode_manifest(v2_record);
-        assert_eq!(decode_manifest(&v2, store_id), Ok(v2_record));
-        for offset in [93_usize, 116] {
-            let mut hostile = v2.clone();
-            hostile[offset] = 1;
-            let checksum = crc32c(&hostile[..124]);
-            hostile[124..].copy_from_slice(&checksum.to_be_bytes());
-            assert_eq!(
-                decode_manifest(&hostile, store_id),
-                Err(ManifestStoreError::InvalidManifest)
-            );
-        }
-        for (range, value) in [
-            (96..104, 0_u64),
-            (104..112, (MAX_RETRY_STATE_BYTES as u64) + 1),
-        ] {
-            let mut hostile = v2.clone();
-            hostile[range].copy_from_slice(&value.to_be_bytes());
-            let checksum = crc32c(&hostile[..124]);
-            hostile[124..].copy_from_slice(&checksum.to_be_bytes());
-            assert_eq!(
-                decode_manifest(&hostile, store_id),
-                Err(ManifestStoreError::InvalidManifest)
-            );
-        }
-        let mut retry_slot = v2;
-        retry_slot[92] = 3;
-        let checksum = crc32c(&retry_slot[..124]);
-        retry_slot[124..].copy_from_slice(&checksum.to_be_bytes());
-        assert_eq!(
-            decode_manifest(&retry_slot, store_id),
-            Err(ManifestStoreError::InvalidManifest)
-        );
-
-        let v1_generation_two = ManifestRecord {
-            generation: 2,
-            ..record
-        };
-        assert_eq!(
-            select_current_manifest([Some(v2_record), Some(v1_generation_two)]),
-            Err(ManifestStoreError::InvalidManifest)
-        );
-        let skipped_retry_generation = ManifestRecord {
-            generation: 2,
-            retry: Some(RetryArtifactReference {
-                public: RetryStateReference::new(1, 2),
-                length: 68,
-                checksum: 10,
-            }),
-            ..record
-        };
-        assert_eq!(
-            select_current_manifest([Some(record), Some(skipped_retry_generation)]),
-            Err(ManifestStoreError::InvalidManifest)
-        );
-        let altered_same_generation = ManifestRecord {
-            generation: 2,
-            retry: Some(RetryArtifactReference {
-                public: RetryStateReference::new(1, 1),
-                length: 68,
-                checksum: 10,
-            }),
-            ..record
-        };
-        assert_eq!(
-            select_current_manifest([Some(v2_record), Some(altered_same_generation)]),
-            Err(ManifestStoreError::InvalidManifest)
-        );
-        let preserved_retry = ManifestRecord {
-            generation: 2,
-            ..v2_record
-        };
-        assert_eq!(
-            select_current_manifest([Some(v2_record), Some(preserved_retry)]),
-            Ok(Some((1, preserved_retry)))
-        );
-        assert_eq!(
-            select_current_manifest([Some(v2_record), Some(skipped_retry_generation)]),
-            Ok(Some((1, skipped_retry_generation)))
-        );
-        let maximum = ManifestRecord {
-            generation: u64::MAX,
-            registry: RegistryReference {
-                generation: u64::MAX,
-                ..v2_record.registry
-            },
-            retry: Some(RetryArtifactReference {
-                public: RetryStateReference::new(0, u64::MAX),
-                ..v2_record.retry.expect("retry reference")
-            }),
-            ..v2_record
-        };
-        assert_eq!(
-            select_current_manifest([Some(maximum), Some(maximum)]),
-            Err(ManifestStoreError::InvalidManifest),
-            "equal maximum manifest candidates are never consecutive"
-        );
-    }
-
-    #[test]
-    fn manifest_v3_is_exactly_160_bytes_and_refuses_hostile_generation_catalog_fields() {
+    fn current_manifest_v1_is_exactly_160_bytes_and_refuses_hostile_fields() {
         let store_id = test_support::store_id(1);
         let record = ManifestRecord {
             generation: 4,
@@ -4822,16 +4901,16 @@ mod tests {
                 1,
                 crate::JOURNAL_V1_HEADER_LEN as u64,
             ),
-            retry: Some(RetryArtifactReference {
+            retry: RetryArtifactReference {
                 public: RetryStateReference::new(1, 3),
                 length: 200,
                 checksum: 9,
-            }),
+            },
             sequence_floor: 1,
             catalog: Some(GenerationCatalogReference::new(0, 1, 132, 11)),
         };
         let canonical = encode_manifest(record);
-        assert_eq!(canonical.len(), MANIFEST_V3_LEN);
+        assert_eq!(canonical.len(), MANIFEST_LEN);
         assert_eq!(decode_manifest(&canonical, store_id), Ok(record));
         assert!(decode_manifest(&canonical[..159], store_id).is_err());
         let mut trailing = canonical.clone();
@@ -4857,7 +4936,7 @@ mod tests {
             hostile[156..160].copy_from_slice(&checksum.to_be_bytes());
             assert!(
                 decode_manifest(&hostile, store_id).is_err(),
-                "hostile Manifest V3 field at {offset} must refuse"
+                "hostile current Manifest V1 field at {offset} must refuse"
             );
         }
         let mut checksum = canonical;
