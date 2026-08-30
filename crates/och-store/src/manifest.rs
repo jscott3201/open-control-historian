@@ -5657,6 +5657,70 @@ mod tests {
     }
 
     #[test]
+    fn manifest_root_requires_existing_checkpoint_before_registry_validation() {
+        let directory = test_directory(67);
+        let store = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create committed manifest-root fixture");
+        let committed = store.inspection().committed();
+        assert_eq!(
+            fs::metadata(directory.join(ACTIVE_JOURNAL_FILE_NAME))
+                .expect("header-only journal metadata")
+                .len(),
+            crate::JOURNAL_V1_HEADER_LEN as u64
+        );
+        drop(store);
+
+        let checkpoint_path = directory.join(ACTIVE_CHECKPOINT_FILE_NAME);
+        let canonical_checkpoint =
+            fs::read(&checkpoint_path).expect("read committed checkpoint authority");
+        assert_eq!(canonical_checkpoint.len(), 128);
+        let zero_checkpoint = vec![0_u8; canonical_checkpoint.len()];
+        fs::write(&checkpoint_path, &zero_checkpoint).expect("install absent checkpoint slots");
+
+        let registry_path =
+            directory.join(REGISTRY_SLOT_NAMES[usize::from(committed.registry_slot())]);
+        let mut invalid_registry = fs::read(&registry_path).expect("read committed registry");
+        let registry_checksum_byte = invalid_registry
+            .last_mut()
+            .expect("registry snapshot includes checksum");
+        *registry_checksum_byte ^= 1;
+        fs::write(&registry_path, invalid_registry).expect("install invalid registry authority");
+
+        let before_checkpoint_refusal = directory_bytes(&directory);
+        let Err(error) = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        )) else {
+            panic!("manifest-root open must require checkpoint authority");
+        };
+        assert_eq!(
+            error,
+            ManifestStoreError::Active(ActiveJournalError::InvalidLayout)
+        );
+        assert_eq!(
+            fs::read(&checkpoint_path).expect("read refused zero checkpoint"),
+            zero_checkpoint
+        );
+        assert_eq!(directory_bytes(&directory), before_checkpoint_refusal);
+
+        fs::write(&checkpoint_path, canonical_checkpoint)
+            .expect("restore checkpoint to prove later registry refusal");
+        let before_registry_refusal = directory_bytes(&directory);
+        let Err(error) = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        )) else {
+            panic!("invalid registry authority must refuse");
+        };
+        assert_eq!(error, ManifestStoreError::InvalidRegistry);
+        assert_eq!(directory_bytes(&directory), before_registry_refusal);
+        fs::remove_dir_all(directory).expect("remove manifest-root checkpoint fixture");
+    }
+
+    #[test]
     fn terminal_suffix_recovery_is_manifest_bound_durable_and_idempotent() {
         let directory = test_directory(60);
         let store = ManifestStore::open(test_config(

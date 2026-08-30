@@ -741,7 +741,9 @@ impl ActiveJournal {
         {
             return Err(ActiveJournalError::InvalidLayout.into());
         }
-        if checkpoint_state.is_none() && journal_len != JOURNAL_V1_HEADER_LEN as u64 {
+        if checkpoint_state.is_none()
+            && (expected_root.is_some() || journal_len != JOURNAL_V1_HEADER_LEN as u64)
+        {
             return Err(ActiveJournalError::InvalidLayout.into());
         }
         let mut checkpoint_state = match checkpoint_state {
