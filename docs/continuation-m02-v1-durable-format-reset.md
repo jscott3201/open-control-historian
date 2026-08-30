@@ -39,10 +39,11 @@ handled/durable receipt split, no-false-durable-success failure law, volatile
 latest publication, empty latest restart, graceful shutdown, and fail-stop Drop
 remain unchanged.
 
-## Deferred successors
+## Successor handoff
 
-Recovery from the superseded recovery proposal will be redesigned against this
-current-only epoch. Migration, destructive repair, broad recovery, disk pressure,
+M02-PR03a now supplies the separately reviewed current-only conservative recovery
+successor described in [its continuation](continuation-m02-pr03a.md). Migration,
+destructive repair, broad recovery, disk pressure,
 read-only degradation, final native segments, query, latest reconstruction,
 retention/reclamation, adapters/providers, and broader platform guarantees remain
 absent.

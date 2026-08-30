@@ -38,7 +38,9 @@ overwrites a nonempty unsupported directory.
 The marker is necessary but not sufficient. Before lock acquisition, production
 also checks every present manifest is the fixed 160-byte Manifest V1, every active
 journal carries Journal Header V1, and every retry artifact is the always-extended
-Retry State V1 layout. A forged valid marker paired with historical, malformed,
+Retry State V1 layout. Present Recovery State artifacts are also bounded to exact
+128-byte V1 records and the configured `StoreId`; preflight recognizes their
+format but does not authorize them. A forged valid marker paired with historical, malformed,
 or mixed artifacts is unsupported.
 
 When no manifest exists but the generation-one active journal does, a separate
@@ -51,7 +53,9 @@ only the absent and zero-length checkpoint cases may then be initialized.
 
 After preflight, the stable lock is acquired and inventory and marker validation
 are repeated. Only current genesis publication, current reusable-slot cleanup,
-and the narrow existing rotation transaction may mutate. A rejected directory is
+the narrow existing rotation transaction, and the manifest-rooted terminal-suffix
+recovery transaction may mutate. The recognized inventory maximum is 91: the
+prior 87 plus three Recovery State finals and one staging name. A rejected directory is
 left byte-for-byte and name-for-name unchanged. Error displays contain operation
 classes and standard I/O kinds where applicable, never paths or artifact content.
 
@@ -63,6 +67,12 @@ final marker exists with the stable lock and no conflicting evidence, reopen can
 finish publication and current genesis. Later genesis staging files are never
 guessed: unpublished staging refuses unchanged, while already renamed canonical
 registry, retry, or manifest finals can be validated and completed.
+
+Recovery staging/finals are not authority without a committed Manifest V1
+reference. Under both retained locks, one complete exact next intent may converge;
+partial, malformed, duplicate, future, mismatched, or ambiguous intent refuses
+unchanged. Cleanup removes only canonically decoded, StoreId-matched, strictly
+older unreferenced reports after all authority is proven.
 
 This is a process/filesystem ordering contract based on the repository's standard
 file I/O and directory synchronization discipline. It is not a universal

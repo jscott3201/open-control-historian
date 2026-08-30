@@ -14,12 +14,13 @@ use och_store::{
     ActiveJournalLimits, ActiveJournalOpenMode, AppendSequenceV1, JOURNAL_V1_HEADER_LEN,
     JournalHeaderV1, MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME,
     MANIFEST_STAGING_FILE_NAME, MAX_ADMISSION_PAYLOAD_V1, ManifestStore, ManifestStoreConfig,
-    ManifestStoreError, PendingRetryOutcome, PreparedAdmissionV1, REGISTRY_SLOT_0_FILE_NAME,
-    REGISTRY_STAGING_FILE_NAME, RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME,
-    RETRY_SLOT_2_FILE_NAME, RegistryPersistenceOptions, RetryPersistenceOptions,
-    STORE_FORMAT_FILE_NAME, STORE_LOCK_FILE_NAME,
+    ManifestStoreError, PendingRetryOutcome, PreparedAdmissionV1, RECOVERY_SLOT_0_FILE_NAME,
+    REGISTRY_SLOT_0_FILE_NAME, REGISTRY_STAGING_FILE_NAME, RETRY_SLOT_0_FILE_NAME,
+    RETRY_SLOT_1_FILE_NAME, RETRY_SLOT_2_FILE_NAME, RegistryPersistenceOptions,
+    RetryPersistenceOptions, STORE_FORMAT_FILE_NAME, STORE_LOCK_FILE_NAME,
 };
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -254,6 +255,174 @@ fn genesis_bytes_match_the_independent_primitive_oracle() {
         assert!(
             !ORACLE_SOURCE.contains(forbidden),
             "primitive oracle must not contain {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn recovery_state_and_present_manifest_reference_match_primitive_oracles() {
+    let directory = TestDirectory::new("recovery-oracle");
+    let store = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::CreateNew,
+        registry_options(),
+    ))
+    .expect("create recovery oracle store");
+    let source = store.inspection().committed();
+    drop(store);
+    let source_manifest =
+        fs::read(directory.path().join(MANIFEST_SLOT_0_FILE_NAME)).expect("read source manifest");
+    let source_checksum = u32::from_be_bytes(
+        source_manifest[156..160]
+            .try_into()
+            .expect("source manifest checksum"),
+    );
+    let original_length = JOURNAL_V1_HEADER_LEN as u64 + 11;
+    let mut journal = fs::OpenOptions::new()
+        .append(true)
+        .open(directory.path().join(ACTIVE_JOURNAL_FILE_NAME))
+        .expect("open oracle journal suffix");
+    journal
+        .write_all(b"OCHF\0\x01\x01\0\0\0\0")
+        .expect("write oracle journal suffix");
+    journal.sync_all().expect("sync oracle journal suffix");
+    drop(journal);
+
+    let recovered = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::OpenExisting,
+        registry_options(),
+    ))
+    .expect("recover oracle suffix");
+    let committed = recovered.inspection().committed();
+    let report = recovered
+        .inspection()
+        .latest_recovery()
+        .expect("oracle recovery report");
+    drop(recovered);
+
+    let report_bytes =
+        fs::read(directory.path().join(RECOVERY_SLOT_0_FILE_NAME)).expect("read Recovery State V1");
+    let expected_report = manifest_oracle::recovery_state_v1(
+        support::uuid_bytes(1),
+        report.report_generation(),
+        source.manifest_generation(),
+        source_checksum,
+        report.active_generation(),
+        report.active_sequence_floor(),
+        report.checkpoint_generation(),
+        report.append_sequence(),
+        report.committed_end_offset(),
+        original_length,
+        1,
+    );
+    assert_eq!(report_bytes, expected_report);
+
+    let registry =
+        fs::read(directory.path().join(REGISTRY_SLOT_0_FILE_NAME)).expect("read recovery registry");
+    let retry =
+        fs::read(directory.path().join(RETRY_SLOT_0_FILE_NAME)).expect("read recovery retry");
+    let manifest =
+        fs::read(directory.path().join(MANIFEST_SLOT_1_FILE_NAME)).expect("read recovery manifest");
+    assert_eq!(
+        manifest,
+        manifest_oracle::current_manifest_v1_with_recovery(
+            support::uuid_bytes(1),
+            committed.manifest_generation(),
+            committed.durable_cutoff().journal().generation(),
+            committed.durable_cutoff().checkpoint_generation(),
+            committed.durable_cutoff().append_sequence(),
+            committed.durable_cutoff().end_offset(),
+            committed.registry_slot(),
+            committed.registry_generation(),
+            &registry,
+            committed.retry_state().slot(),
+            committed.retry_state().generation(),
+            &retry,
+            committed.sequence_floor(),
+            None,
+            Some(manifest_oracle::RecoveryReference {
+                slot: 0,
+                checksum: manifest_oracle::checksum(&expected_report),
+            }),
+        )
+    );
+}
+
+#[test]
+fn recovery_subtype_tags_match_primitive_only_oracles() {
+    let candidate = frame(support::no_change_admission(), 1);
+    let mut invalid_prefix = [0_u8; och_store::JOURNAL_V1_FRAME_PREFIX_LEN];
+    invalid_prefix[..4].copy_from_slice(b"OCHF");
+    invalid_prefix[4..6].copy_from_slice(&1_u16.to_be_bytes());
+    invalid_prefix[6] = 1;
+    invalid_prefix[8..16].copy_from_slice(&1_u64.to_be_bytes());
+    invalid_prefix[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut invalid_complete = candidate.bytes().to_vec();
+    let final_byte = invalid_complete.len() - 1;
+    invalid_complete[final_byte] ^= 1;
+    for (name, suffix, tag) in [
+        ("invalid-prefix-oracle", invalid_prefix.to_vec(), 2_u8),
+        (
+            "truncated-frame-oracle",
+            candidate.bytes()[..25].to_vec(),
+            3,
+        ),
+        ("invalid-frame-oracle", invalid_complete, 4),
+    ] {
+        let directory = TestDirectory::new(name);
+        let store = ManifestStore::open(manifest_config(
+            &directory,
+            ActiveJournalOpenMode::CreateNew,
+            registry_options(),
+        ))
+        .expect("create subtype oracle store");
+        let source = store.inspection().committed();
+        drop(store);
+        let source_manifest = fs::read(directory.path().join(MANIFEST_SLOT_0_FILE_NAME))
+            .expect("read subtype source manifest");
+        let source_checksum = u32::from_be_bytes(
+            source_manifest[156..160]
+                .try_into()
+                .expect("subtype source checksum"),
+        );
+        let mut journal = fs::OpenOptions::new()
+            .append(true)
+            .open(directory.path().join(ACTIVE_JOURNAL_FILE_NAME))
+            .expect("open subtype suffix");
+        journal.write_all(&suffix).expect("write subtype suffix");
+        journal.sync_all().expect("sync subtype suffix");
+        drop(journal);
+
+        let recovered = ManifestStore::open(manifest_config(
+            &directory,
+            ActiveJournalOpenMode::OpenExisting,
+            registry_options(),
+        ))
+        .expect("recover subtype oracle suffix");
+        let report = recovered
+            .inspection()
+            .latest_recovery()
+            .expect("subtype report");
+        drop(recovered);
+        let bytes = fs::read(directory.path().join(RECOVERY_SLOT_0_FILE_NAME))
+            .expect("read subtype report");
+        assert_eq!(
+            bytes,
+            manifest_oracle::recovery_state_v1(
+                support::uuid_bytes(1),
+                report.report_generation(),
+                source.manifest_generation(),
+                source_checksum,
+                report.active_generation(),
+                report.active_sequence_floor(),
+                report.checkpoint_generation(),
+                report.append_sequence(),
+                report.committed_end_offset(),
+                JOURNAL_V1_HEADER_LEN as u64 + suffix.len() as u64,
+                tag,
+            ),
+            "closed subtype tag {tag} must match the primitive oracle"
         );
     }
 }

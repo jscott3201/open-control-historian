@@ -133,16 +133,20 @@ header-only genesis restriction.
 The scan is limited by configured payload, journal-byte, and record bounds before
 allocation. Every frame StoreId and governing declaration StoreId must equal the
 header. Invalid bytes inside the checkpoint cutoff refuse without mutation. A
-valid suffix beyond an unambiguous cutoff is journal-synchronized and checkpointed
-before readiness. An invalid unacknowledged suffix may be truncated only when it
-is provably terminal; a complete malformed frame followed by any bytes or later
-candidate makes recovery ambiguous and refuses without changing the file. Every
-allowed truncation is synchronized before readiness. The scan never fabricates
+manifest-rooted open never adopts or discards a complete valid frame beyond its
+selected cutoff. After every other current-V1 authority family is proven, its
+private dry scan may report only a terminal short prefix whose available fixed
+bytes match the exact next frame, exact malformed prefix, truncated declared
+frame, or invalid complete frame ending exactly at EOF. A
+valid frame, valid-plus-torn bytes, malformed prefix with later bytes, interior
+corruption, identity/sequence mismatch, or any ambiguity refuses unchanged.
+Allowed truncation is exact to the selected cutoff and synchronized without
+advancing or rewriting the checkpoint. The scan never fabricates
 `CanonicalAdmission`, registry history, latest state, or a completed retry cache.
 If an append I/O failure may have changed journal bytes, that open
 `ActiveJournal` is terminally faulted: it refuses later sequence assignment,
-append, and synchronization. Only drop plus this validated reopen path may
-truncate a proven torn terminal suffix and establish a new writer authority.
+append, and synchronization. Only drop plus this validated reopen path may enter
+the manifest-rooted recovery transaction and establish a new writer authority.
 
 ## Successor and sealed raw Journal V1
 
