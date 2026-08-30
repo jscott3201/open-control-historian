@@ -27,7 +27,9 @@ M02-PR02b adds its bounded durable retry horizon, M02-PR02c adds bounded
 active-journal rotation, immutable raw-Journal sealing, and Generation Catalog V1,
 the durable-format reset makes each artifact family current-only V1 behind a
 fixed Store Format V1 epoch marker, and M02-PR03a adds one manifest-rooted
-current-V1 conservative recovery transaction. `och-runtime` depends
+current-V1 conservative recovery transaction. M02-PR03b1 adds deterministic
+store logical preflight, typed observed storage pressure, and sticky volatile
+reopen custody to direct active journals and composed manifest stores. `och-runtime` depends
 inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05
 `CanonicalAdmission` evidence, reserves exact encoded bytes before allocation,
@@ -48,6 +50,9 @@ snapshots, three-slot durable retry snapshots, three-slot Generation Catalog V1,
 three-slot Recovery State V1 event evidence, at most 64 immutable raw-Journal
 sealed generations, strict current genesis, narrow rotation and terminal-suffix
 recovery convergence, and publication. It
+classifies only standard-library `StorageFull` and `QuotaExceeded` kinds at
+store-owned mutation boundaries as pressure; the first such failure makes that
+live handle require validated reopen while inspection remains available.
 restores registry snapshots only by public `SeriesRegistry` replay and
 requires every decoded journal declaration to match retained historical
 authority; decoded records never authorize registry state. Markerless, historical,
@@ -71,7 +76,7 @@ validated; valid post-root frames and ambiguity refuse unchanged. The latest
 committed report is durable event history and never registry, retry, latest,
 receipt, or declaration authority. Final native segments, retention/reclamation,
 unbounded or time-based retry, query, adapters, manifest-backed latest projection,
-disk-pressure/degraded operation, stale-restore custody, and broad repair remain absent.
+runtime degraded/latest/receipt pressure policy, stale-restore custody, and broad repair remain absent.
 Published observations never imply current or held values.
 
 The ignored `_roadmap/` directory is local and unpublished.

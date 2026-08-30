@@ -111,8 +111,9 @@ may runtime durable receipts complete. Rotation then publishes the intent, raw
 Journal V1 seal, empty successor, Generation Catalog V1, and alternate Manifest
 V1 last before adopting the successor and narrowly cleaning redundant artifacts.
 
-A failure after journal synchronization returns no false durable success and
-terminally faults that live writer. Latest remains volatile and restarts empty.
+A failure after journal synchronization returns no false durable success. Typed
+storage pressure puts the live writer in sticky reopen custody; other mutation
+failures retain terminal fault behavior. Latest remains volatile and restarts empty.
 
 Recovery first validates both manifests and every registry, retry, catalog/seal,
 active/checkpoint, declaration, inventory, and referenced report relationship.
@@ -123,4 +124,5 @@ resumed only when exact expected bytes prove the next transaction; malformed,
 duplicate, future, or mismatched evidence refuses unchanged. A second clean open
 does not advance either generation. Broad repair, migration, destructive reset,
 native segments, reclamation, retention, stale-restore custody, and disk-pressure
-policy remain outside this contract.
+runtime policy remain outside this contract. Store-only typed pressure evidence
+and volatile reopen custody do not alter Manifest V1 bytes or authority.

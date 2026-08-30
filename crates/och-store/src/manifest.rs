@@ -17,6 +17,7 @@ use crate::generation::{
     parse_active_checkpoint_generation_name, parse_active_journal_generation_name,
     parse_sealed_generation_name, sealed_journal_file_name,
 };
+use crate::pressure::is_storage_pressure;
 use crate::recovery::{
     RECOVERY_SLOT_NAMES, RecoveryArtifact, RecoveryCodecError, RecoveryReference,
     decode_recovery_state, encode_recovery_state,
@@ -27,7 +28,7 @@ use crate::retry::{
 use crate::{
     ACTIVE_CHECKPOINT_FILE_NAME, ACTIVE_JOURNAL_FILE_NAME, ACTIVE_JOURNAL_GENERATION,
     ActiveJournalError, ActiveJournalInspection, ActiveJournalLimits, ActiveJournalOpenMode,
-    DurableCutoff, JournalV1Error, PreparedFrameV1,
+    DurableCutoff, JournalV1Error, PreparedFrameV1, StoreWriteState,
 };
 use crate::{
     MAX_PERSISTED_RETRY_ENTRIES, MAX_RETRY_STATE_BYTES, PendingRetryOutcome,
@@ -111,21 +112,39 @@ const MAX_INVENTORY_ENTRIES: usize = 91;
 #[cfg(test)]
 std::thread_local! {
     static PUBLISH_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static PUBLISH_FAULT_KIND: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 fn set_publish_fault(code: u8) {
     PUBLISH_FAULT.with(|fault| fault.set(code));
+    PUBLISH_FAULT_KIND.with(|kind| kind.set(0));
 }
 
 #[cfg(test)]
-fn take_publish_fault(code: u8) -> bool {
+fn set_pressure_fault(code: u8, kind: ErrorKind) {
+    let encoded = match kind {
+        ErrorKind::StorageFull => 1,
+        ErrorKind::QuotaExceeded => 2,
+        _ => 0,
+    };
+    PUBLISH_FAULT.with(|fault| fault.set(code));
+    PUBLISH_FAULT_KIND.with(|stored| stored.set(encoded));
+}
+
+#[cfg(test)]
+fn take_publish_fault(code: u8) -> Option<(ErrorKind, Option<i32>)> {
     PUBLISH_FAULT.with(|fault| {
         if fault.get() == code {
             fault.set(0);
-            true
+            let encoded = PUBLISH_FAULT_KIND.with(|kind| kind.replace(0));
+            Some(match encoded {
+                1 => (ErrorKind::StorageFull, Some(28)),
+                2 => (ErrorKind::QuotaExceeded, Some(122)),
+                _ => (ErrorKind::Other, None),
+            })
         } else {
-            false
+            None
         }
     })
 }
@@ -207,8 +226,10 @@ pub enum ManifestIoOperation {
     OpenDirectory,
     /// Read the bounded non-recursive store inventory.
     ReadInventory,
-    /// Create or open a fixed artifact.
+    /// Open an existing fixed artifact.
     OpenArtifact,
+    /// Create a new fixed artifact.
+    CreateArtifact,
     /// Acquire the stable store-level lock.
     LockStore,
     /// Read bounded artifact bytes.
@@ -219,6 +240,8 @@ pub enum ManifestIoOperation {
     SyncArtifact,
     /// Atomically publish a reusable slot.
     Publish,
+    /// Remove a proven redundant artifact.
+    Remove,
     /// Synchronize directory entries.
     SyncDirectory,
     /// Read artifact metadata.
@@ -280,8 +303,10 @@ pub enum ManifestStoreError {
     HistoricalDeclarationMismatch,
     /// A fixed staging artifact proves an interrupted publication.
     InterruptedPublication,
-    /// A prior publication failure terminally faulted this authority.
+    /// A prior non-pressure mutation failure terminally faulted this authority.
     Faulted,
+    /// A prior mutating boundary observed storage pressure; validated reopen is required.
+    ReopenRequired,
     /// Manifest or registry generation cannot advance.
     GenerationExhausted,
     /// Canonical lifecycle semantics refused the requested operation.
@@ -290,6 +315,8 @@ pub enum ManifestStoreError {
     Active(ActiveJournalError),
     /// Generic path-free filesystem evidence.
     Io(ManifestIoEvidence),
+    /// A store-owned mutating boundary observed normalized storage pressure.
+    StoragePressure(ManifestIoEvidence),
 }
 
 impl fmt::Display for ManifestStoreError {
@@ -308,10 +335,12 @@ impl fmt::Display for ManifestStoreError {
             Self::HistoricalDeclarationMismatch => "historical declaration mismatch",
             Self::InterruptedPublication => "interrupted metadata publication",
             Self::Faulted => "manifest store authority is faulted",
+            Self::ReopenRequired => "manifest store requires validated reopen",
             Self::GenerationExhausted => "manifest store generation exhausted",
             Self::Model(_) => "canonical registry operation refused",
             Self::Active(_) => "active journal operation refused",
             Self::Io(_) => "manifest store I/O failed",
+            Self::StoragePressure(_) => "manifest store storage pressure",
         })
     }
 }
@@ -338,6 +367,10 @@ pub enum ManifestOpenClassification {
     Capacity,
     /// The live authority was already terminally faulted.
     Faulted,
+    /// A live handle observed storage pressure and must be reopened.
+    ReopenRequired,
+    /// A store-owned mutating boundary observed normalized storage pressure.
+    StoragePressure,
     /// Canonical model semantics refused the request.
     Model,
     /// A path-free filesystem operation failed.
@@ -364,6 +397,12 @@ impl ManifestStoreError {
             }
             Self::Faulted | Self::Active(ActiveJournalError::Faulted) => {
                 ManifestOpenClassification::Faulted
+            }
+            Self::ReopenRequired | Self::Active(ActiveJournalError::ReopenRequired) => {
+                ManifestOpenClassification::ReopenRequired
+            }
+            Self::StoragePressure(_) | Self::Active(ActiveJournalError::StoragePressure(_)) => {
+                ManifestOpenClassification::StoragePressure
             }
             Self::Model(_) => ManifestOpenClassification::Model,
             Self::Io(_) | Self::Active(ActiveJournalError::Io(_)) => ManifestOpenClassification::Io,
@@ -486,6 +525,7 @@ pub struct ManifestStoreInspection {
     committed: ManifestCommit,
     generations: GenerationInventory,
     recovery: Option<RecoveryReport>,
+    write_state: StoreWriteState,
 }
 
 impl ManifestStoreInspection {
@@ -515,6 +555,12 @@ impl ManifestStoreInspection {
     pub const fn latest_recovery(self) -> Option<RecoveryReport> {
         self.recovery
     }
+
+    /// Returns volatile write custody for this composed live handle.
+    #[must_use]
+    pub const fn write_state(self) -> StoreWriteState {
+        self.write_state
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,6 +580,48 @@ struct ManifestRecord {
     recovery: Option<RecoveryReference>,
     sequence_floor: u64,
     catalog: Option<GenerationCatalogReference>,
+}
+
+struct PreparedManifestPublication {
+    record: ManifestRecord,
+    target: usize,
+    bytes: Vec<u8>,
+}
+
+struct PreparedRetryPublication {
+    reference: RetryArtifactReference,
+    bytes: Vec<u8>,
+}
+
+struct PreparedRegistryPublication {
+    reference: RegistryReference,
+    bytes: Vec<u8>,
+}
+
+struct PreparedCatalogPublication {
+    snapshot: GenerationCatalogSnapshot,
+    bytes: Vec<u8>,
+}
+
+struct PreparedRecoveryPublication {
+    artifact: RecoveryArtifact,
+    bytes: [u8; RECOVERY_STATE_LEN],
+}
+
+struct RotationPlan {
+    intent: RotationIntent,
+    source_generation: u64,
+    sealed: SealedGeneration,
+    successor_config: ActiveJournalConfig,
+    catalog: PreparedCatalogPublication,
+    manifest: PreparedManifestPublication,
+}
+
+struct PendingCommitPlan {
+    cutoff: DurableCutoff,
+    retry: RetryStateSnapshot,
+    retry_publication: PreparedRetryPublication,
+    manifest: PreparedManifestPublication,
 }
 
 impl ManifestRecord {
@@ -563,7 +651,7 @@ pub struct ManifestStore {
     manifest_slots: [Option<ManifestRecord>; 2],
     current_slot: usize,
     current: ManifestRecord,
-    faulted: bool,
+    write_state: StoreWriteState,
 }
 
 impl ManifestStore {
@@ -580,15 +668,21 @@ impl ManifestStore {
     pub fn open(config: ManifestStoreConfig) -> Result<Self, ManifestStoreError> {
         let directory = open_directory(&config.directory)?;
         let preflight = preflight_store_format(&config)?;
+        preflight_genesis_records(&config)?;
         let lock_path = config.directory.join(STORE_LOCK_FILE_NAME);
         let mut lock_options = OpenOptions::new();
         lock_options.read(true).write(true).truncate(false);
         if preflight == FormatPreflight::EmptyCreate {
             lock_options.create_new(true);
         }
+        let lock_operation = if preflight == FormatPreflight::EmptyCreate {
+            ManifestIoOperation::CreateArtifact
+        } else {
+            ManifestIoOperation::OpenArtifact
+        };
         let store_lock = lock_options
             .open(&lock_path)
-            .map_err(|error| manifest_io(ManifestIoOperation::OpenArtifact, &error))?;
+            .map_err(|error| manifest_io(lock_operation, &error))?;
         lock_store(&store_lock)?;
         if preflight == FormatPreflight::EmptyCreate {
             directory
@@ -774,7 +868,7 @@ impl ManifestStore {
             manifest_slots,
             current_slot,
             current,
-            faulted: false,
+            write_state: StoreWriteState::Writable,
         };
         store.converge_recovery(&recovery_inventory, recovery_plan)?;
         if store.current.recovery.is_some() {
@@ -838,6 +932,7 @@ impl ManifestStore {
         } else {
             candidate.map(|artifact| (artifact, false))
         };
+        let mut prepared_report = None;
 
         if let Some((intent, from_staging)) = artifact {
             if intent.reference.slot != target_slot
@@ -861,15 +956,7 @@ impl ManifestStore {
                 None if from_staging => return Err(ManifestStoreError::InterruptedPublication),
                 None => {}
             }
-            if from_staging {
-                converge_recovery_staging(
-                    &self.directory_path,
-                    &self.directory,
-                    intent,
-                    self.current.cutoff.journal().store_id(),
-                )?;
-            }
-            artifact = Some((intent, false));
+            artifact = Some((intent, from_staging));
         }
 
         if artifact.is_none() {
@@ -896,21 +983,14 @@ impl ManifestStore {
                 plan.classification(),
             )
             .map_err(map_recovery_codec)?;
-            artifact = Some((self.publish_recovery_report(target_slot, report)?, false));
+            let prepared = Self::prepare_recovery_report(target_slot, report)?;
+            artifact = Some((prepared.artifact, false));
+            prepared_report = Some(prepared);
         }
 
-        let (artifact, _) = artifact.ok_or(ManifestStoreError::InvalidManifest)?;
+        let (artifact, from_staging) = artifact.ok_or(ManifestStoreError::InvalidManifest)?;
         if recovery_plan.is_some() && inventory.manifest_staging.is_some() {
             return Err(ManifestStoreError::InvalidManifest);
-        }
-        self.directory
-            .sync_all()
-            .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))?;
-        if let Some(plan) = recovery_plan {
-            self.journal.apply_recovery(plan)?;
-        } else {
-            self.journal
-                .synchronize_recovery_cutoff(self.current.cutoff)?;
         }
         let next_generation = self
             .current
@@ -926,10 +1006,32 @@ impl ManifestStore {
             sequence_floor: self.current.sequence_floor,
             catalog: self.current.catalog,
         };
-        let slot = if let Some(staging) = inventory.manifest_staging {
-            if staging != next {
-                return Err(ManifestStoreError::InvalidManifest);
-            }
+        let prepared_manifest = self.prepare_manifest(next)?;
+        if let Some(staging) = inventory.manifest_staging
+            && staging != next
+        {
+            return Err(ManifestStoreError::InvalidManifest);
+        }
+        if from_staging {
+            converge_recovery_staging(
+                &self.directory_path,
+                &self.directory,
+                artifact,
+                self.current.cutoff.journal().store_id(),
+            )?;
+        } else if let Some(prepared) = &prepared_report {
+            self.publish_prepared_recovery_report(prepared)?;
+        }
+        self.directory
+            .sync_all()
+            .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))?;
+        if let Some(plan) = recovery_plan {
+            self.journal.apply_recovery(plan)?;
+        } else {
+            self.journal
+                .synchronize_recovery_cutoff(self.current.cutoff)?;
+        }
+        let slot = if inventory.manifest_staging.is_some() {
             converge_manifest_staging(
                 &self.directory_path,
                 &self.directory,
@@ -937,7 +1039,7 @@ impl ManifestStore {
                 next,
             )?
         } else {
-            self.publish_manifest(next)?
+            self.publish_prepared_manifest(&prepared_manifest)?
         };
         let mut slots = self.manifest_slots;
         slots[slot] = Some(next);
@@ -956,11 +1058,10 @@ impl ManifestStore {
         Ok(())
     }
 
-    fn publish_recovery_report(
-        &self,
+    fn prepare_recovery_report(
         slot: u8,
         report: RecoveryReport,
-    ) -> Result<RecoveryArtifact, ManifestStoreError> {
+    ) -> Result<PreparedRecoveryPublication, ManifestStoreError> {
         if slot >= 3 {
             return Err(ManifestStoreError::InvalidManifest);
         }
@@ -972,12 +1073,22 @@ impl ManifestStore {
             },
             report,
         };
+        Ok(PreparedRecoveryPublication { artifact, bytes })
+    }
+
+    fn publish_prepared_recovery_report(
+        &self,
+        prepared: &PreparedRecoveryPublication,
+    ) -> Result<(), ManifestStoreError> {
+        let artifact = prepared.artifact;
+        let report = artifact.report;
+        let slot = artifact.reference.slot;
         publish_reusable_slot(
             &self.directory_path,
             &self.directory,
             RECOVERY_STAGING_FILE_NAME,
             RECOVERY_SLOT_NAMES[usize::from(slot)],
-            &bytes,
+            &prepared.bytes,
             RECOVERY_STATE_LEN,
             |candidate| {
                 let decoded = decode_recovery_state(candidate, report.store_id())
@@ -988,7 +1099,7 @@ impl ManifestStore {
                 Ok(())
             },
         )?;
-        Ok(artifact)
+        Ok(())
     }
 
     fn initialize_genesis(
@@ -1054,7 +1165,7 @@ impl ManifestStore {
                 sequence_floor: 0,
                 catalog: None,
             },
-            faulted: false,
+            write_state: StoreWriteState::Writable,
         };
         let registry_reference = if inventory.registry_slots == 0 {
             store.publish_registry_snapshot(1, &store.registry.snapshot())?
@@ -1109,6 +1220,7 @@ impl ManifestStore {
                 &self.catalog,
             ),
             recovery: self.recovery_report,
+            write_state: self.write_state,
         }
     }
 
@@ -1169,9 +1281,10 @@ impl ManifestStore {
     /// Unknown or altered historical declarations refuse before journal bytes.
     pub fn append(&mut self, frame: &PreparedFrameV1) -> Result<u64, ManifestStoreError> {
         self.preflight_historical_declaration(frame.admission().declaration())?;
-        self.journal
-            .append(frame)
-            .map_err(ManifestStoreError::Active)
+        match self.journal.append(frame) {
+            Ok(end) => Ok(end),
+            Err(error) => Err(self.record_active_error(error)),
+        }
     }
 
     /// Reports whether a safely durable nonempty active generation must rotate
@@ -1204,9 +1317,23 @@ impl ManifestStore {
     ///
     /// Refuses without a new manifest when durability, bounds, catalog capacity,
     /// immutable readback, or any precommit publication step cannot be proved.
-    /// A postcommit cleanup refusal terminally faults this live handle.
+    /// A postcommit pressure refusal requires reopen; other failures fault it.
     pub fn rotate(&mut self) -> Result<ManifestCommit, ManifestStoreError> {
         self.ensure_usable()?;
+        let plan = self.prepare_rotation()?;
+        if let Err(error) =
+            publish_rotation_intent(&self.directory_path, &self.directory, plan.intent)
+        {
+            return Err(self.record_terminal_error(error));
+        }
+        let result = self.complete_rotation(plan);
+        match result {
+            Ok(commit) => Ok(commit),
+            Err(error) => Err(self.record_terminal_error(error)),
+        }
+    }
+
+    fn prepare_rotation(&self) -> Result<RotationPlan, ManifestStoreError> {
         let inspection = self.journal.inspection();
         let source_cutoff = inspection.durable_cutoff();
         if inspection.active_records() == 0
@@ -1246,33 +1373,21 @@ impl ManifestStore {
             catalog_generation,
             source_checkpoint_generation: source_cutoff.checkpoint_generation(),
         };
-        if let Err(error) = publish_rotation_intent(&self.directory_path, &self.directory, intent) {
-            self.faulted = true;
-            return Err(error);
-        }
-        let result =
-            self.complete_rotation(intent, source_cutoff, catalog_slot, manifest_generation);
-        if result.is_err() {
-            self.faulted = true;
-        }
-        result
-    }
-
-    fn complete_rotation(
-        &mut self,
-        intent: RotationIntent,
-        source_cutoff: DurableCutoff,
-        catalog_slot: u8,
-        manifest_generation: u64,
-    ) -> Result<ManifestCommit, ManifestStoreError> {
-        let sealed = publish_sealed_generation(
+        let sealed = prepare_sealed_generation(
             &self.directory_path,
-            &self.directory,
             intent,
             self.current.sequence_floor,
             self.journal.limits(),
             &self.registry,
         )?;
+        let provisional_reference =
+            GenerationCatalogReference::new(catalog_slot, intent.catalog_generation, 1, 1);
+        let provisional = self
+            .catalog
+            .advance(provisional_reference, sealed)
+            .map_err(map_generation_codec)?;
+        let catalog =
+            self.prepare_catalog_snapshot(catalog_slot, intent.catalog_generation, &provisional)?;
         let successor_config = ActiveJournalConfig::new(
             self.directory_path.clone(),
             source_cutoff.journal().store_id(),
@@ -1283,40 +1398,67 @@ impl ManifestStore {
         .manifest_create()
         .manifest_generation(intent.successor_generation, source_cutoff.append_sequence())
         .map_err(ManifestStoreError::Active)?;
-        injected_rotation_fault(35, ManifestIoOperation::OpenArtifact)?;
-        let successor =
-            ActiveJournal::open(successor_config).map_err(ManifestStoreError::Active)?;
-        injected_rotation_fault(36, ManifestIoOperation::SyncArtifact)?;
-        let provisional_reference =
-            GenerationCatalogReference::new(catalog_slot, intent.catalog_generation, 1, 1);
-        let provisional = self
-            .catalog
-            .advance(provisional_reference, sealed)
-            .map_err(map_generation_codec)?;
-        let catalog =
-            self.publish_catalog_snapshot(catalog_slot, intent.catalog_generation, &provisional)?;
+        let successor_cutoff = DurableCutoff::from_manifest(
+            source_cutoff.journal().store_id(),
+            intent.successor_generation,
+            1,
+            source_cutoff.append_sequence(),
+            crate::JOURNAL_V1_HEADER_LEN as u64,
+        );
         let next = ManifestRecord {
             generation: manifest_generation,
             registry: self.current.registry,
-            cutoff: successor.durable_cutoff(),
+            cutoff: successor_cutoff,
             retry: self.current.retry,
             recovery: self.current.recovery,
             sequence_floor: source_cutoff.append_sequence(),
-            catalog: catalog.reference(),
+            catalog: catalog.snapshot.reference(),
         };
-        let slot = self.publish_manifest(next)?;
+        let manifest = self.prepare_manifest(next)?;
+        Ok(RotationPlan {
+            intent,
+            source_generation: source_cutoff.journal().generation(),
+            sealed,
+            successor_config,
+            catalog,
+            manifest,
+        })
+    }
+
+    fn complete_rotation(
+        &mut self,
+        plan: RotationPlan,
+    ) -> Result<ManifestCommit, ManifestStoreError> {
+        publish_sealed_generation(
+            &self.directory_path,
+            &self.directory,
+            plan.intent,
+            plan.sealed,
+        )?;
+        injected_rotation_fault(35, ManifestIoOperation::CreateArtifact)?;
+        let successor =
+            ActiveJournal::open(plan.successor_config).map_err(ManifestStoreError::Active)?;
+        injected_rotation_fault(36, ManifestIoOperation::SyncArtifact)?;
+        if successor.durable_cutoff() != plan.manifest.record.cutoff {
+            return Err(ManifestStoreError::InvalidGeneration);
+        }
+        self.publish_prepared_catalog_snapshot(&plan.catalog)?;
+        let slot = self.publish_prepared_manifest(&plan.manifest)?;
         injected_rotation_fault(38, ManifestIoOperation::Publish)?;
 
-        let source_generation = source_cutoff.journal().generation();
         let mut slots = self.manifest_slots;
-        slots[slot] = Some(next);
+        slots[slot] = Some(plan.manifest.record);
         self.journal = successor;
-        self.catalog = catalog;
+        self.catalog = plan.catalog.snapshot;
         self.manifest_slots = slots;
         self.current_slot = slot;
-        self.current = next;
-        injected_rotation_fault(39, ManifestIoOperation::Publish)?;
-        cleanup_committed_rotation(&self.directory_path, &self.directory, source_generation)?;
+        self.current = plan.manifest.record;
+        injected_rotation_fault(39, ManifestIoOperation::Remove)?;
+        cleanup_committed_rotation(
+            &self.directory_path,
+            &self.directory,
+            plan.source_generation,
+        )?;
         remove_unreferenced_catalog_slots(
             &self.directory_path,
             &self.directory,
@@ -1341,8 +1483,8 @@ impl ManifestStore {
     ///
     /// # Errors
     ///
-    /// A publication failure returns no committed proof and terminally faults
-    /// this open authority.
+    /// A publication failure returns no new committed proof. Pressure requires
+    /// reopen; other mutation failures terminally fault this open authority.
     pub fn sync_pending(
         &mut self,
         pending: &[PendingRetryOutcome],
@@ -1351,26 +1493,38 @@ impl ManifestStore {
         if pending.len() > MAX_PERSISTED_RETRY_ENTRIES {
             return Err(ManifestStoreError::InvalidRetry);
         }
-        let cutoff = self.journal.sync_pending()?;
-        if cutoff == self.current.cutoff {
+        let anticipated_cutoff = self
+            .journal
+            .pending_durable_cutoff()
+            .map_err(ManifestStoreError::Active)?;
+        if anticipated_cutoff == self.current.cutoff {
             if !pending.is_empty() {
-                self.faulted = true;
                 return Err(ManifestStoreError::InvalidRetry);
             }
             return Ok((self.commit(), self.retry.clone()));
         }
-        let result = self.commit_synced_pending(cutoff, pending);
-        if result.is_err() {
-            self.faulted = true;
+        // Prepare every bounded retry and manifest relationship and exact byte
+        // before the journal/checkpoint durability transaction starts.
+        let plan = self.prepare_synced_pending(anticipated_cutoff, pending)?;
+        let cutoff = match self.journal.sync_pending() {
+            Ok(cutoff) => cutoff,
+            Err(error) => return Err(self.record_active_error(error)),
+        };
+        if cutoff != plan.cutoff {
+            return Err(self.record_terminal_error(ManifestStoreError::InvalidRetry));
         }
-        result
+        let result = self.commit_synced_pending(plan);
+        match result {
+            Ok(commit) => Ok(commit),
+            Err(error) => Err(self.record_terminal_error(error)),
+        }
     }
 
-    fn commit_synced_pending(
-        &mut self,
+    fn prepare_synced_pending(
+        &self,
         cutoff: DurableCutoff,
         pending: &[PendingRetryOutcome],
-    ) -> Result<(ManifestCommit, RetryStateSnapshot), ManifestStoreError> {
+    ) -> Result<PendingCommitPlan, ManifestStoreError> {
         validate_pending_retry(self.current.cutoff, cutoff, pending)?;
         let generation = self
             .current
@@ -1399,18 +1553,32 @@ impl ManifestStore {
             .retry
             .advance(retry_public, pending, anticipated)
             .map_err(|_| ManifestStoreError::InvalidRetry)?;
-        let retry = self.publish_retry_snapshot(retry_public, &candidate)?;
+        let retry_publication = self.prepare_retry_snapshot(retry_public, &candidate)?;
         let next = ManifestRecord {
             generation,
             registry: self.current.registry,
             cutoff,
-            retry,
+            retry: retry_publication.reference,
             recovery: self.current.recovery,
             sequence_floor: self.current.sequence_floor,
             catalog: self.current.catalog,
         };
-        let committed = self.publish_and_adopt_manifest(next)?;
-        self.retry = candidate;
+        let manifest = self.prepare_manifest(next)?;
+        Ok(PendingCommitPlan {
+            cutoff,
+            retry: candidate,
+            retry_publication,
+            manifest,
+        })
+    }
+
+    fn commit_synced_pending(
+        &mut self,
+        plan: PendingCommitPlan,
+    ) -> Result<(ManifestCommit, RetryStateSnapshot), ManifestStoreError> {
+        self.publish_prepared_retry_snapshot(&plan.retry, &plan.retry_publication)?;
+        let committed = self.publish_and_adopt_prepared_manifest(&plan.manifest)?;
+        self.retry = plan.retry;
         Ok((committed, self.retry.clone()))
     }
 
@@ -1418,8 +1586,8 @@ impl ManifestStore {
     ///
     /// # Errors
     ///
-    /// Core refusal is non-mutating. Publication failure terminally faults the
-    /// open authority and reports no commit.
+    /// Core refusal is non-mutating. Publication pressure requires reopen; other
+    /// mutation failures fault the open authority and report no commit.
     pub fn register(
         &mut self,
         series_id: SeriesId,
@@ -1434,8 +1602,8 @@ impl ManifestStore {
     ///
     /// # Errors
     ///
-    /// Core refusal is non-mutating. Publication failure terminally faults the
-    /// open authority and reports no commit.
+    /// Core refusal is non-mutating. Publication pressure requires reopen; other
+    /// mutation failures fault the open authority and report no commit.
     pub fn revise(
         &mut self,
         series_id: SeriesId,
@@ -1452,8 +1620,8 @@ impl ManifestStore {
     ///
     /// # Errors
     ///
-    /// Core refusal is non-mutating. Publication failure terminally faults the
-    /// open authority and reports no commit.
+    /// Core refusal is non-mutating. Publication pressure requires reopen; other
+    /// mutation failures fault the open authority and report no commit.
     pub fn retire(
         &mut self,
         series_id: SeriesId,
@@ -1497,62 +1665,53 @@ impl ManifestStore {
             .generation
             .checked_add(1)
             .ok_or(ManifestStoreError::GenerationExhausted)?;
-        let registry_reference = match self.publish_registry_snapshot(registry_generation, &after) {
-            Ok(reference) => reference,
-            Err(error) => {
-                self.faulted = true;
-                return Err(error);
-            }
-        };
         let manifest_generation = self
             .current
             .generation
             .checked_add(1)
             .ok_or(ManifestStoreError::GenerationExhausted)?;
+        let registry_publication = self.prepare_registry_snapshot(registry_generation, &after)?;
         let record = ManifestRecord {
             generation: manifest_generation,
-            registry: registry_reference,
+            registry: registry_publication.reference,
             cutoff: self.journal.durable_cutoff(),
             retry: self.current.retry,
             recovery: self.current.recovery,
             sequence_floor: self.current.sequence_floor,
             catalog: self.current.catalog,
         };
-        let commit = match self.publish_and_adopt_manifest(record) {
+        let manifest = self.prepare_manifest(record)?;
+        if let Err(error) = self.publish_prepared_registry_snapshot(&after, &registry_publication) {
+            return Err(self.record_terminal_error(error));
+        }
+        let commit = match self.publish_and_adopt_prepared_manifest(&manifest) {
             Ok(commit) => commit,
-            Err(error) => {
-                self.faulted = true;
-                return Err(error);
-            }
+            Err(error) => return Err(self.record_terminal_error(error)),
         };
         self.registry = candidate;
         Ok((output, commit))
     }
 
-    fn publish_and_adopt_manifest(
+    fn publish_and_adopt_prepared_manifest(
         &mut self,
-        record: ManifestRecord,
+        prepared: &PreparedManifestPublication,
     ) -> Result<ManifestCommit, ManifestStoreError> {
-        let slot = match self.publish_manifest(record) {
+        let record = prepared.record;
+        let slot = match self.publish_prepared_manifest(prepared) {
             Ok(slot) => slot,
-            Err(error) => {
-                self.faulted = true;
-                return Err(error);
-            }
+            Err(error) => return Err(self.record_terminal_error(error)),
         };
         let mut manifest_slots = self.manifest_slots;
         manifest_slots[slot] = Some(record);
         if let Err(error) =
             remove_unreferenced_catalog_slots(&self.directory_path, &self.directory, manifest_slots)
         {
-            self.faulted = true;
-            return Err(error);
+            return Err(self.record_terminal_error(error));
         }
         if let Err(error) =
             remove_unreferenced_retry_slots(&self.directory_path, &self.directory, manifest_slots)
         {
-            self.faulted = true;
-            return Err(error);
+            return Err(self.record_terminal_error(error));
         }
         if let Err(error) = remove_unreferenced_recovery_slots(
             &self.directory_path,
@@ -1560,8 +1719,7 @@ impl ManifestStore {
             manifest_slots,
             self.current.cutoff.journal().store_id(),
         ) {
-            self.faulted = true;
-            return Err(error);
+            return Err(self.record_terminal_error(error));
         }
         self.manifest_slots = manifest_slots;
         self.current_slot = slot;
@@ -1574,6 +1732,16 @@ impl ManifestStore {
         generation: u64,
         snapshot: &SeriesRegistrySnapshot,
     ) -> Result<RegistryReference, ManifestStoreError> {
+        let prepared = self.prepare_registry_snapshot(generation, snapshot)?;
+        self.publish_prepared_registry_snapshot(snapshot, &prepared)?;
+        Ok(prepared.reference)
+    }
+
+    fn prepare_registry_snapshot(
+        &self,
+        generation: u64,
+        snapshot: &SeriesRegistrySnapshot,
+    ) -> Result<PreparedRegistryPublication, ManifestStoreError> {
         let referenced = self
             .manifest_slots
             .map(|slot| slot.map(|record| record.registry.slot));
@@ -1587,22 +1755,33 @@ impl ManifestStore {
             length: u64::try_from(bytes.len()).map_err(|_| ManifestStoreError::InvalidRegistry)?,
             checksum: crc32c(&bytes),
         };
+        Ok(PreparedRegistryPublication { reference, bytes })
+    }
+
+    fn publish_prepared_registry_snapshot(
+        &self,
+        snapshot: &SeriesRegistrySnapshot,
+        prepared: &PreparedRegistryPublication,
+    ) -> Result<(), ManifestStoreError> {
+        let slot = prepared.reference.slot;
         publish_reusable_slot(
             &self.directory_path,
             &self.directory,
             REGISTRY_STAGING_FILE_NAME,
             REGISTRY_SLOT_NAMES[usize::from(slot)],
-            &bytes,
+            &prepared.bytes,
             MAX_REGISTRY_SNAPSHOT_BYTES,
             |candidate| {
                 let decoded = decode_registry_snapshot_at_slot(candidate, slot)?;
-                if decoded.reference != reference || decoded.registry.snapshot() != *snapshot {
+                if decoded.reference != prepared.reference
+                    || decoded.registry.snapshot() != *snapshot
+                {
                     return Err(ManifestStoreError::InvalidRegistry);
                 }
                 Ok(())
             },
         )?;
-        Ok(reference)
+        Ok(())
     }
 
     fn select_retry_candidate_slot(&self) -> Result<u8, ManifestStoreError> {
@@ -1619,6 +1798,16 @@ impl ManifestStore {
         public: RetryStateReference,
         snapshot: &RetryStateSnapshot,
     ) -> Result<RetryArtifactReference, ManifestStoreError> {
+        let prepared = self.prepare_retry_snapshot(public, snapshot)?;
+        self.publish_prepared_retry_snapshot(snapshot, &prepared)?;
+        Ok(prepared.reference)
+    }
+
+    fn prepare_retry_snapshot(
+        &self,
+        public: RetryStateReference,
+        snapshot: &RetryStateSnapshot,
+    ) -> Result<PreparedRetryPublication, ManifestStoreError> {
         if snapshot.reference() != Some(public) || public.slot() >= 3 {
             return Err(ManifestStoreError::InvalidRetry);
         }
@@ -1632,12 +1821,21 @@ impl ManifestStore {
             length: u64::try_from(bytes.len()).map_err(|_| ManifestStoreError::InvalidRetry)?,
             checksum: crc32c(&bytes),
         };
+        Ok(PreparedRetryPublication { reference, bytes })
+    }
+
+    fn publish_prepared_retry_snapshot(
+        &self,
+        snapshot: &RetryStateSnapshot,
+        prepared: &PreparedRetryPublication,
+    ) -> Result<(), ManifestStoreError> {
+        let public = prepared.reference.public;
         publish_reusable_slot(
             &self.directory_path,
             &self.directory,
             RETRY_STAGING_FILE_NAME,
             RETRY_SLOT_NAMES[usize::from(public.slot())],
-            &bytes,
+            &prepared.bytes,
             MAX_RETRY_STATE_BYTES,
             |candidate| {
                 let (decoded_reference, decoded) = decode_retry_state_at_slot(
@@ -1647,13 +1845,13 @@ impl ManifestStore {
                     snapshot.options(),
                 )
                 .map_err(map_retry_codec)?;
-                if decoded_reference != reference || decoded != *snapshot {
+                if decoded_reference != prepared.reference || decoded != *snapshot {
                     return Err(ManifestStoreError::InvalidRetry);
                 }
                 Ok(())
             },
         )?;
-        Ok(reference)
+        Ok(())
     }
 
     fn select_catalog_candidate_slot(&self) -> Result<u8, ManifestStoreError> {
@@ -1665,12 +1863,12 @@ impl ManifestStore {
             .ok_or(ManifestStoreError::InvalidGeneration)
     }
 
-    fn publish_catalog_snapshot(
+    fn prepare_catalog_snapshot(
         &self,
         slot: u8,
         generation: u64,
         provisional: &GenerationCatalogSnapshot,
-    ) -> Result<GenerationCatalogSnapshot, ManifestStoreError> {
+    ) -> Result<PreparedCatalogPublication, ManifestStoreError> {
         if slot >= 3
             || self.select_catalog_candidate_slot()? != slot
             || provisional.reference().is_none_or(|reference| {
@@ -1695,26 +1893,46 @@ impl ManifestStore {
         if bytes != provisional_bytes {
             return Err(ManifestStoreError::InvalidGeneration);
         }
+        Ok(PreparedCatalogPublication { snapshot, bytes })
+    }
+
+    fn publish_prepared_catalog_snapshot(
+        &self,
+        prepared: &PreparedCatalogPublication,
+    ) -> Result<(), ManifestStoreError> {
+        let reference = prepared
+            .snapshot
+            .reference()
+            .ok_or(ManifestStoreError::InvalidGeneration)?;
+        let slot = reference.slot();
         publish_reusable_slot(
             &self.directory_path,
             &self.directory,
             GENERATION_CATALOG_STAGING_FILE_NAME,
             CATALOG_SLOT_NAMES[usize::from(slot)],
-            &bytes,
+            &prepared.bytes,
             MAX_GENERATION_CATALOG_BYTES,
             |candidate| {
-                let decoded = decode_catalog(candidate, slot, snapshot.store_id())
+                let decoded = decode_catalog(candidate, slot, prepared.snapshot.store_id())
                     .map_err(map_generation_codec)?;
-                if decoded != snapshot {
+                if decoded != prepared.snapshot {
                     return Err(ManifestStoreError::InvalidGeneration);
                 }
                 Ok(())
             },
         )?;
-        Ok(snapshot)
+        Ok(())
     }
 
     fn publish_manifest(&self, record: ManifestRecord) -> Result<usize, ManifestStoreError> {
+        let prepared = self.prepare_manifest(record)?;
+        self.publish_prepared_manifest(&prepared)
+    }
+
+    fn prepare_manifest(
+        &self,
+        record: ManifestRecord,
+    ) -> Result<PreparedManifestPublication, ManifestStoreError> {
         let target = if record.generation == 1 {
             self.manifest_slots
                 .iter()
@@ -1724,21 +1942,37 @@ impl ManifestStore {
             1 - self.current_slot
         };
         let bytes = encode_manifest(record);
+        if bytes.len() != MANIFEST_LEN {
+            return Err(ManifestStoreError::InvalidManifest);
+        }
+        Ok(PreparedManifestPublication {
+            record,
+            target,
+            bytes,
+        })
+    }
+
+    fn publish_prepared_manifest(
+        &self,
+        prepared: &PreparedManifestPublication,
+    ) -> Result<usize, ManifestStoreError> {
         publish_reusable_slot(
             &self.directory_path,
             &self.directory,
             MANIFEST_STAGING_FILE_NAME,
-            MANIFEST_SLOT_NAMES[target],
-            &bytes,
+            MANIFEST_SLOT_NAMES[prepared.target],
+            &prepared.bytes,
             MANIFEST_LEN,
             |candidate| {
-                if decode_manifest(candidate, self.current.cutoff.journal().store_id())? != record {
+                if decode_manifest(candidate, self.current.cutoff.journal().store_id())?
+                    != prepared.record
+                {
                     return Err(ManifestStoreError::InvalidManifest);
                 }
                 Ok(())
             },
         )?;
-        Ok(target)
+        Ok(prepared.target)
     }
 
     fn commit(&self) -> ManifestCommit {
@@ -1746,11 +1980,40 @@ impl ManifestStore {
     }
 
     fn ensure_usable(&self) -> Result<(), ManifestStoreError> {
-        if self.faulted {
-            Err(ManifestStoreError::Faulted)
-        } else {
-            Ok(())
+        match self.write_state {
+            StoreWriteState::Writable => Ok(()),
+            StoreWriteState::ReopenRequired => Err(ManifestStoreError::ReopenRequired),
+            StoreWriteState::Faulted => Err(ManifestStoreError::Faulted),
         }
+    }
+
+    fn record_active_error(&mut self, error: ActiveJournalError) -> ManifestStoreError {
+        match self.journal.inspection().write_state() {
+            StoreWriteState::Writable => {}
+            StoreWriteState::ReopenRequired => {
+                self.write_state = StoreWriteState::ReopenRequired;
+            }
+            StoreWriteState::Faulted => {
+                self.write_state = StoreWriteState::Faulted;
+            }
+        }
+        ManifestStoreError::Active(error)
+    }
+
+    fn record_terminal_error(&mut self, error: ManifestStoreError) -> ManifestStoreError {
+        self.write_state = if matches!(
+            error,
+            ManifestStoreError::StoragePressure(_)
+                | ManifestStoreError::ReopenRequired
+                | ManifestStoreError::Active(
+                    ActiveJournalError::StoragePressure(_) | ActiveJournalError::ReopenRequired
+                )
+        ) {
+            StoreWriteState::ReopenRequired
+        } else {
+            StoreWriteState::Faulted
+        };
+        error
     }
 }
 
@@ -1820,6 +2083,40 @@ fn preflight_store_format(
         return Err(ManifestStoreError::InvalidInventory);
     }
     Ok(FormatPreflight::Current)
+}
+
+fn preflight_genesis_records(config: &ManifestStoreConfig) -> Result<(), ManifestStoreError> {
+    let registry = SeriesRegistry::new(config.store_id, config.registry.limits).snapshot();
+    let registry_bytes = encode_registry_snapshot(1, &registry)?;
+    let registry = RegistryReference {
+        slot: 0,
+        generation: 1,
+        length: u64::try_from(registry_bytes.len())
+            .map_err(|_| ManifestStoreError::InvalidRegistry)?,
+        checksum: crc32c(&registry_bytes),
+    };
+    let retry_public = RetryStateReference::new(0, 1);
+    let retry_snapshot =
+        RetryStateSnapshot::empty_persisted(config.store_id, config.retry, retry_public);
+    let retry_bytes = encode_retry_state(&retry_snapshot).map_err(map_retry_codec)?;
+    let retry = RetryArtifactReference {
+        public: retry_public,
+        length: u64::try_from(retry_bytes.len()).map_err(|_| ManifestStoreError::InvalidRetry)?,
+        checksum: crc32c(&retry_bytes),
+    };
+    let manifest = ManifestRecord {
+        generation: 1,
+        registry,
+        cutoff: genesis_placeholder(config.store_id),
+        retry,
+        recovery: None,
+        sequence_floor: 0,
+        catalog: None,
+    };
+    if encode_manifest(manifest).len() != MANIFEST_LEN {
+        return Err(ManifestStoreError::InvalidManifest);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3036,7 +3333,7 @@ fn rollback_uncommitted_rotation(
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(manifest_io(ManifestIoOperation::Publish, &error)),
+            Err(error) => return Err(manifest_io(ManifestIoOperation::Remove, &error)),
         }
     }
     directory
@@ -3191,7 +3488,7 @@ fn remove_unreferenced_retry_slots(
         match std::fs::remove_file(directory_path.join(name)) {
             Ok(()) => removed = true,
             Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(manifest_io(ManifestIoOperation::Publish, &error)),
+            Err(error) => return Err(manifest_io(ManifestIoOperation::Remove, &error)),
         }
     }
     if removed {
@@ -3290,7 +3587,7 @@ fn publish_rotation_intent(
             if error.kind() == ErrorKind::AlreadyExists {
                 ManifestStoreError::InterruptedPublication
             } else {
-                manifest_io(ManifestIoOperation::OpenArtifact, &error)
+                manifest_io(ManifestIoOperation::CreateArtifact, &error)
             }
         })?;
     file.write_all(&bytes)
@@ -3310,14 +3607,41 @@ fn publish_rotation_intent(
     injected_rotation_fault(23, ManifestIoOperation::SyncDirectory)
 }
 
-fn publish_sealed_generation(
+fn prepare_sealed_generation(
     directory_path: &Path,
-    directory: &File,
     intent: RotationIntent,
     sequence_floor: u64,
     limits: ActiveJournalLimits,
     registry: &SeriesRegistry,
 ) -> Result<SealedGeneration, ManifestStoreError> {
+    let source_path = directory_path.join(active_journal_file_name(intent.source_generation));
+    let target_path = directory_path.join(sealed_journal_file_name(intent.source_generation));
+    if target_path
+        .try_exists()
+        .map_err(|error| manifest_io(ManifestIoOperation::Metadata, &error))?
+    {
+        return Err(ManifestStoreError::InvalidGeneration);
+    }
+    let checksum = checksum_file_bounded(&source_path, intent.source_end_offset)?;
+    let sealed = SealedGeneration::new(
+        intent.source_generation,
+        sequence_floor,
+        intent.sequence_cutoff,
+        intent.source_end_offset,
+        intent.registry_generation,
+        intent.source_end_offset,
+        checksum,
+    );
+    validate_sealed_journal(&source_path, sealed, intent.store_id, limits, registry)?;
+    Ok(sealed)
+}
+
+fn publish_sealed_generation(
+    directory_path: &Path,
+    directory: &File,
+    intent: RotationIntent,
+    expected: SealedGeneration,
+) -> Result<(), ManifestStoreError> {
     let source_path = directory_path.join(active_journal_file_name(intent.source_generation));
     let staging_path = directory_path.join(SEALED_JOURNAL_STAGING_FILE_NAME);
     let target_path = directory_path.join(sealed_journal_file_name(intent.source_generation));
@@ -3346,7 +3670,7 @@ fn publish_sealed_generation(
             if error.kind() == ErrorKind::AlreadyExists {
                 ManifestStoreError::InterruptedPublication
             } else {
-                manifest_io(ManifestIoOperation::OpenArtifact, &error)
+                manifest_io(ManifestIoOperation::CreateArtifact, &error)
             }
         })?;
     let mut remaining = intent.source_end_offset;
@@ -3369,16 +3693,12 @@ fn publish_sealed_generation(
         .sync_all()
         .map_err(|error| manifest_io(ManifestIoOperation::SyncArtifact, &error))?;
     injected_rotation_fault(25, ManifestIoOperation::SyncArtifact)?;
-    let entry = SealedGeneration::new(
-        intent.source_generation,
-        sequence_floor,
-        intent.sequence_cutoff,
-        intent.source_end_offset,
-        intent.registry_generation,
-        intent.source_end_offset,
-        checksum.finish(),
-    );
-    validate_sealed_journal(&staging_path, entry, intent.store_id, limits, registry)?;
+    if checksum.finish() != expected.artifact_checksum()
+        || checksum_file_bounded(&staging_path, expected.artifact_length())?
+            != expected.artifact_checksum()
+    {
+        return Err(ManifestStoreError::InvalidGeneration);
+    }
     injected_rotation_fault(26, ManifestIoOperation::Read)?;
     std::fs::rename(&staging_path, &target_path)
         .map_err(|error| manifest_io(ManifestIoOperation::Publish, &error))?;
@@ -3387,9 +3707,13 @@ fn publish_sealed_generation(
         .sync_all()
         .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))?;
     injected_rotation_fault(28, ManifestIoOperation::SyncDirectory)?;
-    validate_sealed_journal(&target_path, entry, intent.store_id, limits, registry)?;
+    if checksum_file_bounded(&target_path, expected.artifact_length())?
+        != expected.artifact_checksum()
+    {
+        return Err(ManifestStoreError::InvalidGeneration);
+    }
     injected_rotation_fault(29, ManifestIoOperation::Read)?;
-    Ok(entry)
+    Ok(())
 }
 
 fn validate_sealed_journal(
@@ -3503,7 +3827,7 @@ fn cleanup_committed_rotation(
         match std::fs::remove_file(directory_path.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(manifest_io(ManifestIoOperation::Publish, &error)),
+            Err(error) => return Err(manifest_io(ManifestIoOperation::Remove, &error)),
         }
     }
     directory
@@ -3663,12 +3987,15 @@ fn remove_unreferenced_recovery_slots(
             return Err(ManifestStoreError::InvalidManifest);
         }
         #[cfg(test)]
-        if take_publish_fault(53) {
-            let error = std::io::Error::other("injected recovery cleanup failure");
-            return Err(manifest_io(ManifestIoOperation::Publish, &error));
+        if let Some((kind, raw_os_error)) = take_publish_fault(53) {
+            return Err(classify_manifest_io(
+                ManifestIoOperation::Remove,
+                kind,
+                raw_os_error,
+            ));
         }
         std::fs::remove_file(directory_path.join(name))
-            .map_err(|error| manifest_io(ManifestIoOperation::Publish, &error))?;
+            .map_err(|error| manifest_io(ManifestIoOperation::Remove, &error))?;
         removed = true;
     }
     if removed {
@@ -3698,7 +4025,7 @@ fn remove_unreferenced_catalog_slots(
         match std::fs::remove_file(directory_path.join(name)) {
             Ok(()) => removed = true,
             Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(manifest_io(ManifestIoOperation::Publish, &error)),
+            Err(error) => return Err(manifest_io(ManifestIoOperation::Remove, &error)),
         }
     }
     if removed {
@@ -3732,7 +4059,7 @@ fn publish_reusable_slot(
             if error.kind() == ErrorKind::AlreadyExists {
                 ManifestStoreError::InterruptedPublication
             } else {
-                manifest_io(ManifestIoOperation::OpenArtifact, &error)
+                manifest_io(ManifestIoOperation::CreateArtifact, &error)
             }
         })?;
     injected_publication_fault(staging_name, PublicationPoint::Write)?;
@@ -3814,7 +4141,7 @@ fn injected_publication_fault(
     if code == 0 {
         return Ok(());
     }
-    if take_publish_fault(code) {
+    if let Some((kind, raw_os_error)) = take_publish_fault(code) {
         let operation = match point {
             PublicationPoint::Write => ManifestIoOperation::Write,
             PublicationPoint::SyncArtifact => ManifestIoOperation::SyncArtifact,
@@ -3822,8 +4149,7 @@ fn injected_publication_fault(
             PublicationPoint::Publish => ManifestIoOperation::Publish,
             PublicationPoint::SyncDirectory => ManifestIoOperation::SyncDirectory,
         };
-        let error = std::io::Error::other("injected manifest publication failure");
-        return Err(manifest_io(operation, &error));
+        return Err(classify_manifest_io(operation, kind, raw_os_error));
     }
     Ok(())
 }
@@ -3842,9 +4168,8 @@ fn injected_rotation_fault(
     code: u8,
     operation: ManifestIoOperation,
 ) -> Result<(), ManifestStoreError> {
-    if take_publish_fault(code) {
-        let error = std::io::Error::other("injected rotation publication failure");
-        return Err(manifest_io(operation, &error));
+    if let Some((kind, raw_os_error)) = take_publish_fault(code) {
+        return Err(classify_manifest_io(operation, kind, raw_os_error));
     }
     Ok(())
 }
@@ -4371,7 +4696,10 @@ fn invalid_registry_journal(_: JournalV1Error) -> ManifestStoreError {
 }
 
 fn map_manifest_genesis_preflight(error: ActiveJournalError) -> ManifestStoreError {
-    if matches!(error, ActiveJournalError::Io(_)) {
+    if matches!(
+        error,
+        ActiveJournalError::Io(_) | ActiveJournalError::StoragePressure(_)
+    ) {
         ManifestStoreError::Active(error)
     } else {
         ManifestStoreError::UnsupportedStoreFormat
@@ -4379,11 +4707,38 @@ fn map_manifest_genesis_preflight(error: ActiveJournalError) -> ManifestStoreErr
 }
 
 fn manifest_io(operation: ManifestIoOperation, error: &std::io::Error) -> ManifestStoreError {
-    ManifestStoreError::Io(ManifestIoEvidence {
+    classify_manifest_io(operation, error.kind(), error.raw_os_error())
+}
+
+const fn classify_manifest_io(
+    operation: ManifestIoOperation,
+    kind: ErrorKind,
+    raw_os_error: Option<i32>,
+) -> ManifestStoreError {
+    let evidence = ManifestIoEvidence {
         operation,
-        kind: error.kind(),
-        raw_os_error: error.raw_os_error(),
-    })
+        kind,
+        raw_os_error,
+    };
+    if operation.is_mutating() && is_storage_pressure(kind) {
+        ManifestStoreError::StoragePressure(evidence)
+    } else {
+        ManifestStoreError::Io(evidence)
+    }
+}
+
+impl ManifestIoOperation {
+    const fn is_mutating(self) -> bool {
+        matches!(
+            self,
+            Self::CreateArtifact
+                | Self::Write
+                | Self::SyncArtifact
+                | Self::Publish
+                | Self::Remove
+                | Self::SyncDirectory
+        )
+    }
 }
 
 fn genesis_placeholder(store_id: StoreId) -> DurableCutoff {
@@ -4630,7 +4985,10 @@ mod tests {
             } else {
                 assert!(matches!(
                     reopened,
-                    Err(ManifestStoreError::InterruptedPublication)
+                    Err(ManifestStoreError::InterruptedPublication
+                        | ManifestStoreError::InvalidManifest
+                        | ManifestStoreError::InvalidRetry
+                        | ManifestStoreError::Active(ActiveJournalError::InvalidLayout))
                 ));
                 assert_eq!(directory_bytes(&directory), before);
             }
@@ -5342,7 +5700,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_transition_refusal_after_journal_sync_terminally_faults_store() {
+    fn retry_transition_refusal_is_preflighted_before_sync_without_poisoning() {
         let directory = test_directory(16);
         let mut store = ManifestStore::open(test_config(
             directory.clone(),
@@ -5387,12 +5745,19 @@ mod tests {
                 second_end,
             )]),
             Err(ManifestStoreError::InvalidRetry),
-            "a retained key cannot be advanced as fresh after journal sync"
+            "a retained key cannot be advanced as fresh before journal sync"
         );
+        assert!(store.bind(second.admission().envelope().clone()).is_ok());
+        assert_eq!(store.inspection().write_state(), StoreWriteState::Writable);
         assert_eq!(
-            store.bind(second.admission().envelope().clone()),
-            Err(ManifestStoreError::Faulted)
+            store
+                .inspection()
+                .active()
+                .durable_cutoff()
+                .append_sequence(),
+            first_sequence.get()
         );
+        drop(store);
         fs::remove_dir_all(directory).expect("remove transition-refusal fixture");
     }
 
@@ -5452,7 +5817,10 @@ mod tests {
             } else {
                 assert!(matches!(
                     reopened,
-                    Err(ManifestStoreError::InterruptedPublication)
+                    Err(ManifestStoreError::InterruptedPublication
+                        | ManifestStoreError::InvalidManifest
+                        | ManifestStoreError::InvalidRetry
+                        | ManifestStoreError::Active(ActiveJournalError::InvalidLayout))
                 ));
             }
             fs::remove_dir_all(directory).expect("remove manifest fault directory");
@@ -6121,6 +6489,611 @@ mod tests {
             ManifestStoreError::UnsupportedStoreFormat.open_classification(),
             ManifestOpenClassification::UnsupportedFormat
         );
+        let pressure =
+            classify_manifest_io(ManifestIoOperation::Write, ErrorKind::StorageFull, Some(28));
+        assert_eq!(
+            pressure.open_classification(),
+            ManifestOpenClassification::StoragePressure
+        );
+        assert!(matches!(pressure, ManifestStoreError::StoragePressure(_)));
+        assert_eq!(
+            ManifestStoreError::ReopenRequired.open_classification(),
+            ManifestOpenClassification::ReopenRequired
+        );
+    }
+
+    #[test]
+    fn manifest_pressure_classification_uses_kind_and_mutating_boundary_only() {
+        for kind in [ErrorKind::StorageFull, ErrorKind::QuotaExceeded] {
+            let ManifestStoreError::StoragePressure(evidence) =
+                classify_manifest_io(ManifestIoOperation::Write, kind, Some(777))
+            else {
+                panic!("normalized pressure must be typed at a mutating boundary");
+            };
+            assert_eq!(evidence.kind(), kind);
+            assert_eq!(evidence.raw_os_error(), Some(777));
+        }
+        for kind in [
+            ErrorKind::FileTooLarge,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+        ] {
+            let ManifestStoreError::Io(evidence) =
+                classify_manifest_io(ManifestIoOperation::Write, kind, Some(28))
+            else {
+                panic!("raw code and non-pressure kinds must remain generic I/O");
+            };
+            assert_eq!(evidence.kind(), kind);
+            assert_eq!(evidence.raw_os_error(), Some(28));
+        }
+        for operation in [
+            ManifestIoOperation::OpenArtifact,
+            ManifestIoOperation::Read,
+            ManifestIoOperation::Metadata,
+            ManifestIoOperation::LockStore,
+        ] {
+            assert!(matches!(
+                classify_manifest_io(operation, ErrorKind::StorageFull, Some(28)),
+                ManifestStoreError::Io(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn active_pressure_is_preserved_by_manifest_and_hostile_repeats_do_not_mutate() {
+        let directory = test_directory(68);
+        let mut store = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create active-pressure store");
+        register_rotation_fixture(&mut store);
+        let admission = test_support::no_change_admission();
+        let sequence = store.next_append_sequence().expect("pressure sequence");
+        let frame = PreparedAdmissionV1::new(admission.clone())
+            .expect("pressure admission")
+            .into_frame(sequence)
+            .expect("pressure frame");
+        let committed = store.inspection().committed();
+        store
+            .journal
+            .inject_append_pressure(11, ErrorKind::StorageFull);
+        let error = store.append(&frame).expect_err("active pressure refuses");
+        let ManifestStoreError::Active(ActiveJournalError::StoragePressure(evidence)) = error
+        else {
+            panic!("manifest wrapping must retain active pressure evidence");
+        };
+        assert_eq!(evidence.operation(), crate::StoreIoOperation::Write);
+        assert_eq!(evidence.kind(), ErrorKind::StorageFull);
+        let pressured = store.inspection();
+        assert_eq!(pressured.write_state(), StoreWriteState::ReopenRequired);
+        assert_eq!(
+            pressured.active().write_state(),
+            StoreWriteState::ReopenRequired
+        );
+        assert_eq!(pressured.committed(), committed);
+        let after_pressure = directory_bytes(&directory);
+        for _ in 0..16 {
+            assert_eq!(
+                store.next_append_sequence(),
+                Err(ManifestStoreError::ReopenRequired)
+            );
+            assert_eq!(
+                store.preflight_historical_declaration(frame.admission().declaration()),
+                Err(ManifestStoreError::ReopenRequired)
+            );
+            assert_eq!(
+                store.append(&frame),
+                Err(ManifestStoreError::ReopenRequired)
+            );
+            assert_eq!(
+                store.sync_pending(&[]),
+                Err(ManifestStoreError::ReopenRequired)
+            );
+            assert_eq!(store.rotate(), Err(ManifestStoreError::ReopenRequired));
+            assert_eq!(
+                store.bind(admission.envelope().clone()),
+                Err(ManifestStoreError::ReopenRequired)
+            );
+        }
+        assert_eq!(store.inspection(), pressured);
+        assert_eq!(directory_bytes(&directory), after_pressure);
+        drop(store);
+
+        let reopened = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("current conservative recovery handles terminal pressure suffix");
+        assert_eq!(
+            reopened.inspection().write_state(),
+            StoreWriteState::Writable
+        );
+        assert!(reopened.inspection().latest_recovery().is_some());
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("remove active-pressure fixture");
+    }
+
+    #[test]
+    fn active_checkpoint_pressure_does_not_advance_manifest_or_mechanical_cutoff() {
+        let directory = test_directory(73);
+        let mut store = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create active-sync-pressure store");
+        register_rotation_fixture(&mut store);
+        let admission = test_support::no_change_admission_with_retry_key("active-sync-pressure");
+        let sequence = store
+            .next_append_sequence()
+            .expect("active pressure sequence");
+        let frame = PreparedAdmissionV1::new(admission)
+            .expect("active pressure admission")
+            .into_frame(sequence)
+            .expect("active pressure frame");
+        let end = store.append(&frame).expect("append before active pressure");
+        let pending = [PendingRetryOutcome::new(
+            frame.admission().retry().clone(),
+            sequence.get(),
+            end,
+        )];
+        let before = store.inspection();
+        store
+            .journal
+            .inject_sync_pressure(1, ErrorKind::QuotaExceeded);
+        let error = store
+            .sync_pending(&pending)
+            .expect_err("checkpoint pressure refuses");
+        assert!(matches!(
+            error,
+            ManifestStoreError::Active(ActiveJournalError::StoragePressure(evidence))
+                if evidence.operation() == crate::StoreIoOperation::Write
+                    && evidence.kind() == ErrorKind::QuotaExceeded
+        ));
+        let pressured = store.inspection();
+        assert_eq!(pressured.write_state(), StoreWriteState::ReopenRequired);
+        assert_eq!(pressured.committed(), before.committed());
+        assert_eq!(
+            pressured.active().durable_cutoff(),
+            before.active().durable_cutoff()
+        );
+        assert_eq!(
+            pressured.active().sync_count(),
+            before.active().sync_count()
+        );
+        let after_pressure = directory_bytes(&directory);
+        for _ in 0..16 {
+            assert_eq!(
+                store.sync_pending(&pending),
+                Err(ManifestStoreError::ReopenRequired)
+            );
+        }
+        assert_eq!(directory_bytes(&directory), after_pressure);
+        drop(store);
+        let before_reopen = directory_bytes(&directory);
+        assert!(
+            ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::OpenExisting,
+            ))
+            .is_err()
+        );
+        assert_eq!(directory_bytes(&directory), before_reopen);
+        fs::remove_dir_all(directory).expect("remove active-sync-pressure fixture");
+    }
+
+    #[test]
+    fn store_publication_pressure_is_sticky_before_and_after_slot_publication() {
+        for (code, operation) in [
+            (1_u8, ManifestIoOperation::Write),
+            (2, ManifestIoOperation::SyncArtifact),
+            (3, ManifestIoOperation::Publish),
+            (4, ManifestIoOperation::SyncDirectory),
+        ] {
+            let directory = test_directory(69);
+            let mut store = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::CreateNew,
+            ))
+            .expect("create registry-pressure store");
+            let admission = test_support::no_change_admission();
+            let declaration = admission.declaration();
+            set_pressure_fault(code, ErrorKind::QuotaExceeded);
+            let error = store
+                .register(
+                    declaration.series_id(),
+                    declaration.binding().clone(),
+                    declaration.payload().clone(),
+                    declaration.evidence().clone(),
+                )
+                .expect_err("registry pressure refuses");
+            let ManifestStoreError::StoragePressure(evidence) = error else {
+                panic!("first store publication pressure must retain evidence");
+            };
+            assert_eq!(evidence.operation(), operation);
+            assert_eq!(evidence.kind(), ErrorKind::QuotaExceeded);
+            assert_eq!(
+                store.inspection().write_state(),
+                StoreWriteState::ReopenRequired
+            );
+            assert!(store.registry_snapshot().series().is_empty());
+            let after_pressure = directory_bytes(&directory);
+            for _ in 0..16 {
+                assert_eq!(
+                    store.register(
+                        declaration.series_id(),
+                        declaration.binding().clone(),
+                        declaration.payload().clone(),
+                        declaration.evidence().clone(),
+                    ),
+                    Err(ManifestStoreError::ReopenRequired)
+                );
+                assert_eq!(
+                    store.bind(admission.envelope().clone()),
+                    Err(ManifestStoreError::ReopenRequired)
+                );
+                assert_eq!(
+                    store.sync_pending(&[]),
+                    Err(ManifestStoreError::ReopenRequired)
+                );
+            }
+            assert_eq!(directory_bytes(&directory), after_pressure);
+            drop(store);
+            let before_reopen = directory_bytes(&directory);
+            let reopened = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::OpenExisting,
+            ));
+            if let Ok(reopened) = reopened {
+                assert!(reopened.registry_snapshot().series().is_empty());
+            } else {
+                assert_eq!(directory_bytes(&directory), before_reopen);
+            }
+            fs::remove_dir_all(directory).expect("remove registry-pressure fixture");
+        }
+    }
+
+    #[test]
+    fn lifecycle_and_rotation_cleanup_pressure_preserve_committed_authority() {
+        let lifecycle = test_directory(74);
+        let mut store = ManifestStore::open(test_config(
+            lifecycle.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create lifecycle-pressure store");
+        let admission = test_support::no_change_admission();
+        let declaration = admission.declaration();
+        let (registered, committed) = store
+            .register(
+                declaration.series_id(),
+                declaration.binding().clone(),
+                declaration.payload().clone(),
+                declaration.evidence().clone(),
+            )
+            .expect("register lifecycle fixture");
+        let registry = store.registry_snapshot();
+        set_pressure_fault(1, ErrorKind::StorageFull);
+        let error = store
+            .retire(
+                registered.series_id(),
+                registered.revision(),
+                registered.evidence().clone(),
+            )
+            .expect_err("retirement publication pressure refuses");
+        assert!(matches!(
+            error,
+            ManifestStoreError::StoragePressure(evidence)
+                if evidence.operation() == ManifestIoOperation::Write
+                    && evidence.kind() == ErrorKind::StorageFull
+        ));
+        assert_eq!(store.registry_snapshot(), registry);
+        assert_eq!(store.inspection().committed(), committed);
+        assert_eq!(
+            store.revise(
+                registered.series_id(),
+                registered.revision(),
+                registered.payload().clone(),
+                registered.evidence().clone(),
+            ),
+            Err(ManifestStoreError::ReopenRequired)
+        );
+        assert_eq!(
+            store.register(
+                registered.series_id(),
+                registered.binding().clone(),
+                registered.payload().clone(),
+                registered.evidence().clone(),
+            ),
+            Err(ManifestStoreError::ReopenRequired)
+        );
+        assert_eq!(
+            store.bind(admission.envelope().clone()),
+            Err(ManifestStoreError::ReopenRequired)
+        );
+        drop(store);
+        fs::remove_dir_all(lifecycle).expect("remove lifecycle-pressure fixture");
+
+        let rotation = test_directory(75);
+        let mut store = ManifestStore::open(test_config(
+            rotation.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create rotation-cleanup-pressure store");
+        register_rotation_fixture(&mut store);
+        let (prior, _) = append_durable(&mut store, "rotation-cleanup-pressure");
+        set_pressure_fault(39, ErrorKind::QuotaExceeded);
+        let error = store
+            .rotate()
+            .expect_err("rotation cleanup pressure refuses");
+        assert!(matches!(
+            error,
+            ManifestStoreError::StoragePressure(evidence)
+                if evidence.operation() == ManifestIoOperation::Remove
+                    && evidence.kind() == ErrorKind::QuotaExceeded
+        ));
+        let pressured = store.inspection();
+        assert_eq!(pressured.write_state(), StoreWriteState::ReopenRequired);
+        assert_eq!(
+            pressured.committed().manifest_generation(),
+            prior.manifest_generation() + 1
+        );
+        assert_eq!(pressured.generations().active_generation(), 2);
+        let after_pressure = directory_bytes(&rotation);
+        for _ in 0..16 {
+            assert_eq!(store.rotate(), Err(ManifestStoreError::ReopenRequired));
+        }
+        assert_eq!(directory_bytes(&rotation), after_pressure);
+        drop(store);
+        let reopened = ManifestStore::open(test_config(
+            rotation.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("reopen converges committed rotation cleanup");
+        assert_eq!(reopened.inspection().committed(), pressured.committed());
+        assert_eq!(
+            reopened.inspection().write_state(),
+            StoreWriteState::Writable
+        );
+        drop(reopened);
+        fs::remove_dir_all(rotation).expect("remove rotation-cleanup-pressure fixture");
+    }
+
+    #[test]
+    fn manifest_root_publication_pressure_never_reports_false_commit() {
+        for (code, operation, published) in [
+            (5_u8, ManifestIoOperation::Write, false),
+            (6, ManifestIoOperation::SyncArtifact, false),
+            (7, ManifestIoOperation::Publish, false),
+            (8, ManifestIoOperation::SyncDirectory, true),
+        ] {
+            let directory = test_directory(77);
+            let mut store = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::CreateNew,
+            ))
+            .expect("create manifest-root-pressure store");
+            register_rotation_fixture(&mut store);
+            let admission =
+                test_support::no_change_admission_with_retry_key("manifest-root-pressure");
+            let sequence = store
+                .next_append_sequence()
+                .expect("manifest pressure sequence");
+            let frame = PreparedAdmissionV1::new(admission)
+                .expect("manifest pressure admission")
+                .into_frame(sequence)
+                .expect("manifest pressure frame");
+            let end = store.append(&frame).expect("manifest pressure append");
+            let pending = [PendingRetryOutcome::new(
+                frame.admission().retry().clone(),
+                sequence.get(),
+                end,
+            )];
+            let prior = store.inspection().committed();
+            set_pressure_fault(code, ErrorKind::StorageFull);
+            let error = store
+                .sync_pending(&pending)
+                .expect_err("manifest publication pressure refuses");
+            assert!(matches!(
+                error,
+                ManifestStoreError::StoragePressure(evidence)
+                    if evidence.operation() == operation
+                        && evidence.kind() == ErrorKind::StorageFull
+            ));
+            assert_eq!(
+                store.inspection().write_state(),
+                StoreWriteState::ReopenRequired
+            );
+            assert_eq!(store.inspection().committed(), prior);
+            let after_pressure = directory_bytes(&directory);
+            for _ in 0..16 {
+                assert_eq!(
+                    store.sync_pending(&pending),
+                    Err(ManifestStoreError::ReopenRequired)
+                );
+            }
+            assert_eq!(directory_bytes(&directory), after_pressure);
+            drop(store);
+
+            let reopened = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::OpenExisting,
+            ));
+            if published {
+                let reopened = reopened.expect("published manifest is selected only by reopen");
+                assert_eq!(
+                    reopened.inspection().committed().manifest_generation(),
+                    prior.manifest_generation() + 1
+                );
+                drop(reopened);
+            } else {
+                assert!(matches!(
+                    reopened,
+                    Err(ManifestStoreError::InterruptedPublication
+                        | ManifestStoreError::InvalidManifest
+                        | ManifestStoreError::InvalidRetry
+                        | ManifestStoreError::Active(ActiveJournalError::InvalidLayout))
+                ));
+                assert_eq!(directory_bytes(&directory), after_pressure);
+            }
+            fs::remove_dir_all(directory).expect("remove manifest-root-pressure fixture");
+        }
+    }
+
+    #[test]
+    fn logical_retry_preflight_refuses_before_durability_without_poisoning() {
+        let directory = test_directory(70);
+        let mut store = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create logical-preflight store");
+        register_rotation_fixture(&mut store);
+        let admission = test_support::no_change_admission_with_retry_key("preflight");
+        let sequence = store.next_append_sequence().expect("preflight sequence");
+        let frame = PreparedAdmissionV1::new(admission)
+            .expect("preflight admission")
+            .into_frame(sequence)
+            .expect("preflight frame");
+        let end = store.append(&frame).expect("preflight append");
+        let before = directory_bytes(&directory);
+        assert_eq!(
+            store.sync_pending(&[]),
+            Err(ManifestStoreError::InvalidRetry)
+        );
+        assert_eq!(directory_bytes(&directory), before);
+        assert_eq!(store.inspection().write_state(), StoreWriteState::Writable);
+        assert_eq!(
+            store
+                .inspection()
+                .active()
+                .durable_cutoff()
+                .append_sequence(),
+            0
+        );
+        store
+            .sync_pending(&[PendingRetryOutcome::new(
+                frame.admission().retry().clone(),
+                sequence.get(),
+                end,
+            )])
+            .expect("valid prepared transaction remains usable");
+        fs::remove_dir_all(directory).expect("remove logical-preflight fixture");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recovery_and_genesis_pressure_are_typed_and_only_reopen_can_continue() {
+        let genesis = test_directory(71);
+        set_pressure_fault(41, ErrorKind::StorageFull);
+        let Err(error) = ManifestStore::open(test_config(
+            genesis.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        )) else {
+            panic!("genesis pressure must refuse");
+        };
+        assert!(matches!(
+            error,
+            ManifestStoreError::StoragePressure(evidence)
+                if evidence.operation() == ManifestIoOperation::SyncArtifact
+                    && evidence.kind() == ErrorKind::StorageFull
+        ));
+        let reopened = ManifestStore::open(test_config(
+            genesis.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ));
+        assert!(matches!(
+            &reopened,
+            Ok(_) | Err(ManifestStoreError::InterruptedPublication)
+        ));
+        drop(reopened);
+        fs::remove_dir_all(genesis).expect("remove genesis-pressure fixture");
+
+        let recovery = test_directory(72);
+        let store = ManifestStore::open(test_config(
+            recovery.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create recovery-pressure store");
+        let source = store.inspection().committed();
+        drop(store);
+        append_raw_suffix(&recovery, 1, b"OCHF\0\x01\x01\0\0\0\0");
+        crate::active::set_recovery_pressure_fault(50, ErrorKind::QuotaExceeded);
+        let Err(error) = ManifestStore::open(test_config(
+            recovery.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        )) else {
+            panic!("recovery truncate pressure must refuse");
+        };
+        assert!(matches!(
+            error,
+            ManifestStoreError::Active(ActiveJournalError::StoragePressure(evidence))
+                if evidence.operation() == crate::StoreIoOperation::Truncate
+                    && evidence.kind() == ErrorKind::QuotaExceeded
+        ));
+        let after_pressure = directory_bytes(&recovery);
+        assert_eq!(
+            select_current_manifest(
+                read_manifest_slots(&recovery, test_support::store_id(1))
+                    .expect("read unchanged recovery root")
+            )
+            .expect("select unchanged recovery root")
+            .expect("recovery source root")
+            .1
+            .generation,
+            source.manifest_generation()
+        );
+        let reopened = ManifestStore::open(test_config(
+            recovery.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("reopen alone continues current recovery transaction");
+        assert!(reopened.inspection().latest_recovery().is_some());
+        assert_ne!(directory_bytes(&recovery), after_pressure);
+        drop(reopened);
+        fs::remove_dir_all(recovery).expect("remove recovery-pressure fixture");
+
+        let recovery_sync = test_directory(76);
+        let store = ManifestStore::open(test_config(
+            recovery_sync.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create recovery-sync-pressure store");
+        let source = store.inspection().committed();
+        drop(store);
+        append_raw_suffix(&recovery_sync, 1, b"OCHF\0\x01\x01\0\0\0\0");
+        crate::active::set_recovery_pressure_fault(51, ErrorKind::StorageFull);
+        let Err(error) = ManifestStore::open(test_config(
+            recovery_sync.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        )) else {
+            panic!("recovery sync pressure must refuse");
+        };
+        assert!(matches!(
+            error,
+            ManifestStoreError::Active(ActiveJournalError::StoragePressure(evidence))
+                if evidence.operation() == crate::StoreIoOperation::SyncJournal
+                    && evidence.kind() == ErrorKind::StorageFull
+        ));
+        assert_eq!(
+            select_current_manifest(
+                read_manifest_slots(&recovery_sync, test_support::store_id(1))
+                    .expect("read recovery-sync root")
+            )
+            .expect("select recovery-sync root")
+            .expect("recovery-sync source root")
+            .1
+            .generation,
+            source.manifest_generation()
+        );
+        let reopened = ManifestStore::open(test_config(
+            recovery_sync.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("reopen completes recovery after sync pressure");
+        assert!(reopened.inspection().latest_recovery().is_some());
+        drop(reopened);
+        fs::remove_dir_all(recovery_sync).expect("remove recovery-sync-pressure fixture");
     }
 
     #[test]

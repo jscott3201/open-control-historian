@@ -11,7 +11,9 @@ registry persistence, a bounded durable replay/guard horizon, bounded
 successor rotation and raw-Journal sealing, bounded reopen evidence, and volatile
 latest-observation snapshots. Current-V1 reopen may also commit one bounded report
 while removing only a proven terminal invalid/torn active suffix; valid post-root
-frames and ambiguity refuse unchanged. It does **not** yet provide final native segments,
+frames and ambiguity refuse unchanged. Store-owned mutating boundaries also
+report typed standard-library storage pressure and put that live store handle in
+sticky reopen custody without adding durable state. It does **not** yet provide final native segments,
 retention/reclamation, unbounded or time-based retry, current/held-value, or
 query behavior.
 
@@ -73,6 +75,11 @@ the selected current root and every registry, retry, catalog/seal,
 active/checkpoint, declaration, and report relationship under both retained
 locks. A successful recovery remains runtime `Healthy`; inspection exposes the
 latest committed report as event history, not proof it occurred during that open.
+Direct active-journal and manifest-store inspection also expose volatile write
+custody. Logical bounds and all knowable exact candidate records are preflighted
+before each transaction's first mutation; this is not a physical-space or future-I/O guarantee.
+The runtime still maps store pressure through its existing generic fail-stop path;
+degraded/latest/receipt policy is deferred to M02-PR03b2.
 
 The current workspace contains:
 
@@ -80,7 +87,7 @@ The current workspace contains:
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model, bounded series declaration authority, and a measurement-only example |
 | [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, durable retry replay/guard classification, automatic safe-boundary rotation, recovery-report inspection, writer-serialized registry control, manifest-backed receipts, and volatile latest snapshots |
-| [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, conservative terminal-suffix recovery, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
+| [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, conservative terminal-suffix recovery, typed pressure/reopen custody, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
 `och-core` has no dependencies. `och-store` depends inward on `och-core`, and
@@ -193,6 +200,9 @@ through nextest rather than being repeated with `cargo test`.
 - [M02-PR03a implementation brief](docs/implementation-brief-m02-pr03a.md) and
   [continuation](docs/continuation-m02-pr03a.md) record conservative current-V1
   recovery evidence and the remaining deferrals.
+- [M02-PR03b1 implementation brief](docs/implementation-brief-m02-pr03b1.md) and
+  [continuation](docs/continuation-m02-pr03b1.md) record store-only logical
+  preflight, typed pressure evidence, sticky reopen custody, and the PR03b2 handoff.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

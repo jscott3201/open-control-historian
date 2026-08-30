@@ -9,7 +9,9 @@
 //! locking, bounded registry/retry/catalog snapshots, immutable raw-Journal
 //! sealing, successor rotation, and a manifest-backed durable cutoff. The crate
 //! also owns one manifest-rooted conservative terminal-suffix recovery event.
-//! It owns no runtime scheduling, final segment encoding, or query behavior.
+//! Store-owned mutation boundaries report typed storage pressure and retain
+//! volatile reopen custody without changing durable formats. The crate owns no
+//! runtime scheduling, degraded policy, final segment encoding, or query behavior.
 
 mod active;
 mod codec;
@@ -17,6 +19,7 @@ mod decoded;
 mod error;
 mod generation;
 mod manifest;
+mod pressure;
 mod recovery;
 mod retry;
 
@@ -55,6 +58,7 @@ pub use manifest::{
     STORE_FORMAT_FILE_NAME, STORE_FORMAT_LEN, STORE_FORMAT_MAGIC, STORE_FORMAT_STAGING_FILE_NAME,
     STORE_FORMAT_VERSION, STORE_LOCK_FILE_NAME,
 };
+pub use pressure::StoreWriteState;
 pub use recovery::{
     RECOVERY_SLOT_0_FILE_NAME, RECOVERY_SLOT_1_FILE_NAME, RECOVERY_SLOT_2_FILE_NAME,
     RECOVERY_STAGING_FILE_NAME, RECOVERY_STATE_LEN, RECOVERY_STATE_MAGIC, RECOVERY_STATE_VERSION,
