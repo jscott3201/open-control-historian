@@ -188,7 +188,7 @@ impl HistorianRuntime {
     #[must_use]
     pub fn inspection(&self) -> RuntimeInspection {
         self.inspection
-            .snapshot(&self.ingress.shared(), self.initial_inspection)
+            .snapshot(&self.ingress.shared(), &self.initial_inspection)
     }
 
     /// Returns bounded decoded reopen evidence without authorizing it.
@@ -4832,7 +4832,7 @@ mod tests {
     }
 
     #[test]
-    fn option_relationships_and_active_age_rotation_fail_closed() {
+    fn option_relationships_and_active_age_rotation_commit_successor() {
         assert_eq!(
             GroupCommitPolicy::new(
                 std::time::Duration::ZERO,
@@ -4869,37 +4869,161 @@ mod tests {
                 .expect("finite age rotation policy"),
             )
             .with_test_cleanup();
-            let runtime = complete_bounded(HistorianRuntime::open(options))
+            let runtime = complete_bounded(open_durable_test(options))
                 .await
                 .expect("age rotation runtime opens at genesis");
-            assert_eq!(
-                runtime.inspection().health(),
-                RuntimeHealth::RotationRequired
-            );
+            assert_eq!(runtime.inspection().health(), RuntimeHealth::Healthy);
             let ingress = runtime.ingress();
             let receipt = ingress
                 .try_submit(command("age-rotation", 88, 80))
                 .expect("rotation demand is decided by the sole worker")
                 .into_receipt();
-            assert_eq!(
-                complete_bounded(receipt.wait_durable()).await,
-                DurableOutcome::WriterStopped
+            let outcome = complete_bounded(receipt.wait_durable()).await;
+            let DurableOutcome::Durable(commit) = outcome else {
+                panic!("age-triggered append must retain ordinary durability: {outcome:?}");
+            };
+            assert_eq!(commit.append().journal().generation(), 1);
+            complete_bounded(async {
+                loop {
+                    if runtime.inspection().generations().active_generation() == 2 {
+                        break;
+                    }
+                    yield_now().await;
+                }
+            })
+            .await;
+            let inspection = runtime.inspection();
+            assert_eq!(inspection.health(), RuntimeHealth::Healthy);
+            assert_eq!(inspection.generations().active_generation(), 2);
+            assert_eq!(inspection.generations().sealed_count(), 1);
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("rotated runtime shuts down cleanly");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn repeated_count_rotation_preserves_global_sequences_and_cross_generation_replay() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let bytes =
+                ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("rotation byte limits");
+            let options_for = |mode| {
+                StoreOptions::new(
+                    directory.clone(),
+                    store_id(1),
+                    mode,
+                    och_store::ActiveJournalLimits::new(
+                        och_store::MAX_ADMISSION_PAYLOAD_V1,
+                        64 * 1_024 * 1_024,
+                        1,
+                    )
+                    .expect("one-record rotation limit"),
+                    bytes,
+                    group_policy(
+                        std::time::Duration::from_secs(5),
+                        MAX_OUTSTANDING_COMMANDS,
+                        64 * 1_024 * 1_024,
+                    ),
+                    och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(16, 64))
+                        .expect("rotation registry options"),
+                    och_store::RetryPersistenceOptions::new(4, 4).expect("rotation retry options"),
+                )
+                .expect("rotation store options")
+            };
+            let runtime = complete_bounded(open_durable_test(options_for(
+                och_store::ActiveJournalOpenMode::CreateNew,
+            )))
+            .await
+            .expect("open rotating runtime");
+            let ingress = runtime.ingress();
+            let submit = |key: &'static str, digest: u8| {
+                let ingress = ingress.clone();
+                async move {
+                    let submission = ingress
+                        .try_submit(IngressCommand::with_policy(
+                            command(key, digest, u128::from(digest)).into_admission(),
+                            AdmissionPriority::Normal,
+                            BarrierDemand::Immediate,
+                        ))
+                        .expect("fresh rotating command");
+                    let DurableOutcome::Durable(commit) =
+                        complete_bounded(submission.into_receipt().wait_durable()).await
+                    else {
+                        panic!("rotating command must become durable");
+                    };
+                    commit
+                }
+            };
+            let first = submit("rotate-first", 31).await;
+            complete_bounded(async {
+                while runtime.inspection().generations().active_generation() != 2 {
+                    assert_eq!(
+                        runtime.inspection().health(),
+                        RuntimeHealth::Healthy,
+                        "first rotation must not fault"
+                    );
+                    yield_now().await;
+                }
+            })
+            .await;
+            let second = submit("rotate-second", 32).await;
+            complete_bounded(async {
+                while runtime.inspection().generations().active_generation() != 3 {
+                    assert_eq!(
+                        runtime.inspection().health(),
+                        RuntimeHealth::Healthy,
+                        "second rotation must not fault"
+                    );
+                    yield_now().await;
+                }
+            })
+            .await;
+            assert_eq!(first.append().journal().generation(), 1);
+            assert_eq!(first.append().append_sequence(), 1);
+            assert_eq!(second.append().journal().generation(), 2);
+            assert_eq!(second.append().append_sequence(), 2);
+            assert!(second.append().end_offset() > och_store::JOURNAL_V1_HEADER_LEN as u64);
+            assert!(second.manifest_commit().generation_catalog().is_some());
+            assert_eq!(runtime.inspection().generations().sealed_count(), 2);
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("rotating runtime shutdown");
+
+            let reopened = complete_bounded(open_durable_test(options_for(
+                och_store::ActiveJournalOpenMode::OpenExisting,
+            )))
+            .await
+            .expect("reopen rotating runtime");
+            assert!(reopened.recovered_records().is_empty());
+            assert!(
+                reopened
+                    .read_handle()
+                    .snapshot()
+                    .expect("latest remains available")
+                    .is_empty()
             );
-            assert_eq!(
-                runtime.inspection().health(),
-                RuntimeHealth::RotationRequired
-            );
-            assert_eq!(
-                ingress
-                    .try_submit(command("closed-after-age", 89, 81))
-                    .expect_err("rotation demand closes admission")
-                    .kind(),
-                TrySubmitErrorKind::Closed
-            );
-            assert_eq!(
-                complete_bounded(runtime.shutdown()).await,
-                Err(ShutdownError::WriterExitedBeforeShutdown)
-            );
+            for (key, digest, expected) in [
+                ("rotate-first", 31_u8, first),
+                ("rotate-second", 32_u8, second),
+            ] {
+                let replay = reopened
+                    .ingress()
+                    .try_submit(command(key, digest, 99))
+                    .expect("cross-generation retry must replay");
+                assert_eq!(replay.disposition(), SubmissionDisposition::Replayed);
+                let DurableOutcome::Durable(actual) =
+                    complete_bounded(replay.into_receipt().wait_durable()).await
+                else {
+                    panic!("cross-generation replay remains durable");
+                };
+                assert_eq!(actual, expected);
+            }
+            complete_bounded(reopened.shutdown())
+                .await
+                .expect("reopened rotating runtime shutdown");
+            fs::remove_dir_all(directory).expect("remove rotating directory");
         });
     }
 

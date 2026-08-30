@@ -1,10 +1,12 @@
-# Retry State V1 format and horizon law
+# Retry State V1/V2 format and horizon law
 
 M02-PR02b defines one dependency-free, manifest-rooted, durable retry
 projection. It preserves the exact `och-core::RetryQualification` comparison and
 adds only a bounded persistence policy: a replayable outcome tier followed by a
 non-replayable expired/conflict guard. The sole blocking `ManifestStore` is the
-mutator; ingress receives immutable committed snapshots.
+mutator; ingress receives immutable committed snapshots. M02-PR02c preserves
+exact V1 bytes and decode while adding V2 only when retained replay evidence
+needs journal-generation, sequence-floor, and catalog identity.
 
 All integers are big-endian. The complete artifact is capped at 2 MiB and uses
 the Journal V1 CRC-32C parameters. Configured replay and guard capacities are
@@ -18,7 +20,7 @@ CRC-32C over header plus payload:
 | Offset | Length | Field | Contract |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | ASCII `OCHRET01` |
-| 8 | 2 | version | unsigned `1` |
+| 8 | 2 | version | unsigned `1` or `2` |
 | 10 | 2 | header length | unsigned `64` |
 | 12 | 16 | store identity | manifest `StoreId` |
 | 28 | 8 | snapshot generation | positive |
@@ -47,7 +49,7 @@ Journal V1 admission:
 6. exact 32-byte SHA-256 identity.
 
 The existing core constructors validate all nominal identities, strings, and
-content. Retry State V1 does not normalize, derive, hash, or reinterpret them.
+content. Retry State V1/V2 does not normalize, derive, hash, or reinterpret them.
 
 ## Payload entries
 
@@ -63,7 +65,7 @@ qualification:
 | 1 | original registry slot | `0..3` |
 | 7 | reserved | zero |
 | 8 | original registry generation | positive |
-| 8 | journal generation | exactly `1` |
+| 8 | journal generation | exactly `1` in V1; in V2, `1` when catalog identity is absent or the positive catalog-covered successor when present |
 | 8 | checkpoint generation | positive |
 | 8 | committed append sequence | covers the original append |
 | 8 | committed end offset | covers the original frame end |
@@ -77,6 +79,25 @@ only the retry slot and generation, not retry artifact length/checksum. An
 outcome can therefore identify the snapshot that first made it durable without
 checksum recursion.
 
+V2 appends exactly 48 bytes after that unchanged suffix for every replay entry:
+
+| Length | Field | Contract |
+| ---: | --- | --- |
+| 8 | active exclusive sequence floor | zero for legacy generation one; positive for successors |
+| 1 | catalog-present tag | `0` or `1` |
+| 1 | catalog slot | zero when absent; otherwise `0..3` |
+| 6 | reserved | zero |
+| 8 | catalog generation | zero when absent; otherwise positive |
+| 8 | catalog artifact length | zero when absent; otherwise positive and bounded |
+| 4 | catalog complete-byte checksum | zero when absent |
+| 12 | reserved | zero |
+
+V2 extends every retained entry so one snapshot has a uniform fixed suffix.
+Legacy outcomes retain zero floor and absent catalog exactly; successor outcomes
+retain the full `GenerationCatalogReference` from their original commit. Encoding
+selects V1 when no replay outcome has catalog identity and V2 otherwise. It never
+rewrites an embedded commit merely to migrate formats.
+
 A guard entry appends only the original positive append sequence, eight fixed
 bytes total. It retains exact classification and FIFO order but no frame-end or
 replayable receipt evidence.
@@ -89,14 +110,17 @@ commit and scoped to the snapshot store and generation history. Trailing bytes,
 nonzero reserved bytes, impossible counts or lengths, invalid ordering, bad
 coverage, foreign scope, or a noncanonical re-encoding refuse.
 
-The owning Manifest V2 is also part of canonical decoding. Its retry reference
+The owning Manifest V2/V3 is also part of canonical decoding. Its retry reference
 must equal the artifact slot/generation. Every retained append is at or below the
 owning cutoff and the newest replay exactly reaches that cutoff and names that
 retry reference. The retained guard-then-replay chronology is one contiguous
 suffix; a nonempty guard requires a full replay tier. All outcomes from one
 retry generation carry one exact commit, and transitions between retained retry
 generations advance generation, slot, checkpoint, append, and end-offset evidence
-exactly as publication does. Embedded manifest, registry, checkpoint, cutoff, or
+exactly as publication does. Across journal generations, append sequence remains
+globally contiguous while offsets and checkpoint generations restart and compare
+only within one generation. Older outcomes must be covered by the exact sealed
+range in the owning Manifest V3 catalog. Embedded manifest, registry, checkpoint, cutoff, or
 retry evidence cannot be newer than the owning root. An empty snapshot is
 reachable only at retry generation one; later retry generations are created only
 by nonempty append batches.
@@ -138,10 +162,13 @@ waiters.
 
 ## Publication and compatibility
 
-New-store genesis publishes and verifies an empty generation-one retry snapshot
-before Manifest V2. Every append barrier publishes the next retry generation to
-a slot unreferenced by both valid manifests, then publishes Manifest V2 naming
-it. Registry-only commits preserve the existing retry reference.
+New-store genesis publishes and verifies an empty generation-one Retry State V1
+snapshot before Manifest V2. Every append barrier publishes the next retry
+generation to a slot unreferenced by both valid manifests, then publishes
+Manifest V2 or V3 naming it. Registry-only commits preserve the existing retry
+reference. The empty successor V3 created by rotation also preserves the existing
+V1 snapshot/reference because no retry outcome changed; the first successor
+append emits V2 when its retained outcomes span generations.
 
 Open applies the full owning-root law to every referenced artifact from both
 valid manifest candidates, not only the selected current manifest. A
@@ -151,6 +178,8 @@ outcomes or tier shape could not have been produced under that manifest root.
 A legacy Manifest V1 has no retry reference and restores empty tiers. No retained
 Journal V1 history is scanned or backfilled; pre-PR02b keys keep the former
 no-restart-horizon contract until new V2 completions establish entries. Invalid,
-foreign, options-mismatched, staged, or unreferenced retry artifacts refuse
-strictly. Fallback, convergence, repair, rotation, time-based expiry, and
-unbounded retry history are outside this format.
+foreign, options-mismatched, staged, or unrelated retry artifacts refuse
+strictly. Narrow post-rotation convergence may remove one older valid predecessor
+slot only after the committed V3 root and its retry/catalog evidence are verified.
+Broad fallback, repair, time-based expiry, and unbounded retry history remain
+outside this format.

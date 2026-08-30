@@ -17,8 +17,24 @@ use std::path::{Path, PathBuf};
 pub const ACTIVE_JOURNAL_FILE_NAME: &str = "active-journal-v1.och";
 /// Exact active durable-high-water artifact name.
 pub const ACTIVE_CHECKPOINT_FILE_NAME: &str = "active-journal-v1.checkpoint";
-/// Fixed active journal generation before manifest-owned rotation exists.
+/// Legacy first active journal generation with fixed artifact names.
 pub const ACTIVE_JOURNAL_GENERATION: u64 = 1;
+
+pub(crate) fn active_journal_file_name(generation: u64) -> String {
+    if generation == ACTIVE_JOURNAL_GENERATION {
+        ACTIVE_JOURNAL_FILE_NAME.to_owned()
+    } else {
+        format!("active-journal-v1-g{generation:020}.och")
+    }
+}
+
+pub(crate) fn active_checkpoint_file_name(generation: u64) -> String {
+    if generation == ACTIVE_JOURNAL_GENERATION {
+        ACTIVE_CHECKPOINT_FILE_NAME.to_owned()
+    } else {
+        format!("active-journal-v1-g{generation:020}.checkpoint")
+    }
+}
 /// Hard maximum configured active journal bytes for this bounded vertical.
 pub const MAX_ACTIVE_JOURNAL_BYTES: u64 = 512 * 1_024 * 1_024;
 /// Hard maximum active admission frames for this bounded vertical.
@@ -102,6 +118,8 @@ pub struct ActiveJournalConfig {
     limits: ActiveJournalLimits,
     header_requirement: HeaderRequirement,
     recovery_policy: RecoveryPolicy,
+    generation: u64,
+    sequence_floor: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,6 +158,8 @@ impl ActiveJournalConfig {
             limits,
             header_requirement: HeaderRequirement::LegacyV1,
             recovery_policy: RecoveryPolicy::Converge,
+            generation: ACTIVE_JOURNAL_GENERATION,
+            sequence_floor: 0,
         })
     }
 
@@ -177,6 +197,19 @@ impl ActiveJournalConfig {
         self.header_requirement = HeaderRequirement::BootstrapEither;
         self.recovery_policy = RecoveryPolicy::Converge;
         self
+    }
+
+    pub(crate) fn manifest_generation(
+        mut self,
+        generation: u64,
+        sequence_floor: u64,
+    ) -> Result<Self, ActiveJournalError> {
+        if generation == 0 || (generation == ACTIVE_JOURNAL_GENERATION && sequence_floor != 0) {
+            return Err(ActiveJournalError::InvalidOptions);
+        }
+        self.generation = generation;
+        self.sequence_floor = sequence_floor;
+        Ok(self)
     }
 }
 
@@ -265,6 +298,8 @@ pub enum ActiveJournalError {
     StoreMismatch,
     /// The next frame would exceed the active byte or record limit.
     RotationRequired,
+    /// One frame cannot fit an otherwise empty configured active generation.
+    FrameTooLarge,
     /// Append sequence is not the exact writer-owned successor.
     SequenceMismatch,
     /// A prior append I/O failure may have changed bytes, so this handle is unusable.
@@ -285,6 +320,7 @@ impl fmt::Display for ActiveJournalError {
             Self::InvalidLayout => "invalid active journal layout",
             Self::StoreMismatch => "active journal store identity mismatch",
             Self::RotationRequired => "active journal rotation is required",
+            Self::FrameTooLarge => "Journal V1 frame exceeds empty active generation capacity",
             Self::SequenceMismatch => "active journal append sequence mismatch",
             Self::Faulted => "active journal authority is faulted",
             Self::Journal(_) => "invalid Journal V1 evidence",
@@ -475,16 +511,23 @@ impl ActiveJournal {
             limits,
             header_requirement,
             recovery_policy,
+            generation,
+            sequence_floor,
         } = config;
         let directory = open_directory(&directory_path)?;
-        let journal_path = directory_path.join(ACTIVE_JOURNAL_FILE_NAME);
-        let checkpoint_path = directory_path.join(ACTIVE_CHECKPOINT_FILE_NAME);
+        let journal_path = directory_path.join(active_journal_file_name(generation));
+        let checkpoint_path = directory_path.join(active_checkpoint_file_name(generation));
+        let identity = JournalIdentity {
+            store_id,
+            generation,
+        };
         match mode {
             ActiveJournalOpenMode::CreateNew => Self::create_new(
                 &directory,
                 &journal_path,
                 &checkpoint_path,
-                store_id,
+                identity,
+                sequence_floor,
                 limits,
                 header_requirement,
             ),
@@ -492,7 +535,8 @@ impl ActiveJournal {
                 &directory,
                 &journal_path,
                 &checkpoint_path,
-                store_id,
+                identity,
+                sequence_floor,
                 limits,
                 header_requirement,
                 recovery_policy,
@@ -504,19 +548,21 @@ impl ActiveJournal {
         directory: &File,
         journal_path: &Path,
         checkpoint_path: &Path,
-        store_id: StoreId,
+        identity: JournalIdentity,
+        sequence_floor: u64,
         limits: ActiveJournalLimits,
         header_requirement: HeaderRequirement,
     ) -> Result<Self, ActiveJournalError> {
         let mut journal = create_artifact(journal_path)?;
         lock_journal(&journal)?;
         let (header_version, header_bytes) = match header_requirement {
-            HeaderRequirement::LegacyV1 => {
-                (JOURNAL_V1_VERSION, JournalHeaderV1::new(store_id).encode())
-            }
+            HeaderRequirement::LegacyV1 => (
+                JOURNAL_V1_VERSION,
+                JournalHeaderV1::new(identity.store_id).encode(),
+            ),
             HeaderRequirement::ManifestV2 | HeaderRequirement::BootstrapEither => (
                 ACTIVE_JOURNAL_HEADER_V2_VERSION,
-                JournalHeaderV2::new(store_id).encode(),
+                JournalHeaderV2::new(identity.store_id).encode(),
             ),
         };
         journal
@@ -525,12 +571,9 @@ impl ActiveJournal {
         journal
             .sync_all()
             .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))?;
-        let identity = JournalIdentity {
-            store_id,
-            generation: ACTIVE_JOURNAL_GENERATION,
-        };
         let checkpoint = create_artifact(checkpoint_path)?;
-        let checkpoint_state = initialize_checkpoint(&checkpoint, directory, identity)?;
+        let checkpoint_state =
+            initialize_checkpoint(&checkpoint, directory, identity, sequence_floor)?;
         Ok(Self {
             journal,
             checkpoint,
@@ -548,11 +591,13 @@ impl ActiveJournal {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     fn open_existing(
         directory: &File,
         journal_path: &Path,
         checkpoint_path: &Path,
-        store_id: StoreId,
+        identity: JournalIdentity,
+        sequence_floor: u64,
         limits: ActiveJournalLimits,
         header_requirement: HeaderRequirement,
         recovery_policy: RecoveryPolicy,
@@ -588,13 +633,9 @@ impl ActiveJournal {
                 Err(error) => return Err(error.into()),
             },
         };
-        if header_store_id != store_id {
+        if header_store_id != identity.store_id {
             return Err(ActiveJournalError::StoreMismatch);
         }
-        let identity = JournalIdentity {
-            store_id,
-            generation: ACTIVE_JOURNAL_GENERATION,
-        };
         let (checkpoint, mut initialized_state) = match open_artifact(checkpoint_path) {
             Ok(checkpoint) => (checkpoint, None),
             Err(ActiveJournalError::MissingArtifact)
@@ -602,7 +643,8 @@ impl ActiveJournal {
                     && journal_len == JOURNAL_V1_HEADER_LEN as u64 =>
             {
                 let checkpoint = create_artifact(checkpoint_path)?;
-                let state = initialize_checkpoint(&checkpoint, directory, identity)?;
+                let state =
+                    initialize_checkpoint(&checkpoint, directory, identity, sequence_floor)?;
                 (checkpoint, Some(state))
             }
             Err(error) => return Err(error),
@@ -616,27 +658,33 @@ impl ActiveJournal {
             && journal_len == JOURNAL_V1_HEADER_LEN as u64
         {
             if initialized_state.is_none() {
-                initialized_state = Some(initialize_checkpoint(&checkpoint, directory, identity)?);
+                initialized_state = Some(initialize_checkpoint(
+                    &checkpoint,
+                    directory,
+                    identity,
+                    sequence_floor,
+                )?);
             }
         } else if checkpoint_len != CHECKPOINT_FILE_LEN as u64 {
             return Err(ActiveJournalError::InvalidLayout);
         }
         let checkpoint_state = match initialized_state {
             Some(state) => Some(state),
-            None => read_checkpoint(&checkpoint, identity, journal_len)?,
+            None => read_checkpoint(&checkpoint, identity, sequence_floor, journal_len)?,
         };
         if checkpoint_state.is_none() && journal_len != JOURNAL_V1_HEADER_LEN as u64 {
             return Err(ActiveJournalError::InvalidLayout);
         }
         let mut checkpoint_state = match checkpoint_state {
             Some(state) => state,
-            None => initialize_checkpoint(&checkpoint, directory, identity)?,
+            None => initialize_checkpoint(&checkpoint, directory, identity, sequence_floor)?,
         };
         let scan = scan_journal(
             &mut journal,
             identity,
             limits,
             checkpoint_state,
+            sequence_floor,
             journal_len,
         )?;
         if recovery_policy == RecoveryPolicy::Strict
@@ -656,7 +704,7 @@ impl ActiveJournal {
         let last_sequence = scan
             .records
             .last()
-            .map_or(0, |record| record.admission.append_sequence());
+            .map_or(sequence_floor, |record| record.admission.append_sequence());
         if active_bytes > checkpoint_state.end_offset {
             journal
                 .sync_all()
@@ -708,7 +756,9 @@ impl ActiveJournal {
             last_append_sequence: self
                 .records
                 .last()
-                .map_or(0, |record| record.admission.append_sequence()),
+                .map_or(self.checkpoint_state.append_sequence, |record| {
+                    record.admission.append_sequence()
+                }),
             durable_cutoff: self.durable_cutoff(),
             sync_count: self.sync_count,
         }
@@ -722,6 +772,10 @@ impl ActiveJournal {
 
     pub(crate) const fn header_version(&self) -> u16 {
         self.header_version
+    }
+
+    pub(crate) const fn limits(&self) -> ActiveJournalLimits {
+        self.limits
     }
 
     pub(crate) fn upgrade_to_manifest_header(&mut self) -> Result<(), ActiveJournalError> {
@@ -761,7 +815,9 @@ impl ActiveJournal {
         let last = self
             .records
             .last()
-            .map_or(0, |record| record.admission.append_sequence());
+            .map_or(self.checkpoint_state.append_sequence, |record| {
+                record.admission.append_sequence()
+            });
         AppendSequenceV1::new(
             last.checked_add(1)
                 .ok_or(ActiveJournalError::SequenceMismatch)?,
@@ -838,6 +894,19 @@ impl ActiveJournal {
         Ok(end_offset)
     }
 
+    /// Returns whether one encoded frame fits the current active generation.
+    #[must_use]
+    pub fn can_fit(&self, frame_len: usize) -> bool {
+        let Ok(frame_len) = u64::try_from(frame_len) else {
+            return false;
+        };
+        self.records.len() < self.limits.record_limit
+            && self
+                .active_bytes
+                .checked_add(frame_len)
+                .is_some_and(|end| end <= self.limits.active_bytes)
+    }
+
     /// Synchronizes journal bytes, advances the alternate checkpoint slot, and
     /// synchronizes that mechanical durable cutoff in the required order.
     ///
@@ -850,7 +919,9 @@ impl ActiveJournal {
         let last_sequence = self
             .records
             .last()
-            .map_or(0, |record| record.admission.append_sequence());
+            .map_or(self.checkpoint_state.append_sequence, |record| {
+                record.admission.append_sequence()
+            });
         if last_sequence == self.checkpoint_state.append_sequence
             && self.active_bytes == self.checkpoint_state.end_offset
         {
@@ -939,11 +1010,16 @@ fn scan_journal(
     identity: JournalIdentity,
     limits: ActiveJournalLimits,
     checkpoint: CheckpointState,
+    sequence_floor: u64,
     journal_len: u64,
 ) -> Result<ScanResult, ActiveJournalError> {
     let mut records = Vec::new();
     let mut offset = JOURNAL_V1_HEADER_LEN as u64;
-    let mut previous = None;
+    let mut previous = if sequence_floor == 0 {
+        None
+    } else {
+        Some(AppendSequenceV1::new(sequence_floor).map_err(ActiveJournalError::Journal)?)
+    };
     let mut truncate_to = None;
     while offset < journal_len {
         if records.len() >= limits.record_limit {
@@ -1033,14 +1109,14 @@ fn scan_journal(
     }
     if checkpoint.end_offset > offset
         || (checkpoint.end_offset == JOURNAL_V1_HEADER_LEN as u64
-            && checkpoint.append_sequence != 0)
+            && checkpoint.append_sequence != sequence_floor)
     {
         return Err(ActiveJournalError::InvalidLayout);
     }
     let prefix_sequence = records
         .iter()
         .find(|record| record.end_offset == checkpoint.end_offset)
-        .map_or(0, |record| record.admission.append_sequence());
+        .map_or(sequence_floor, |record| record.admission.append_sequence());
     if checkpoint.append_sequence != prefix_sequence {
         return Err(ActiveJournalError::InvalidLayout);
     }
@@ -1101,13 +1177,14 @@ fn initialize_checkpoint(
     checkpoint: &File,
     directory: &File,
     identity: JournalIdentity,
+    sequence_floor: u64,
 ) -> Result<CheckpointState, ActiveJournalError> {
     checkpoint
         .set_len(CHECKPOINT_FILE_LEN as u64)
         .map_err(|error| io_error(StoreIoOperation::Write, error))?;
     let state = CheckpointState {
         slot_generation: 1,
-        append_sequence: 0,
+        append_sequence: sequence_floor,
         end_offset: JOURNAL_V1_HEADER_LEN as u64,
     };
     write_checkpoint_slot(checkpoint, identity, state)?;
@@ -1161,14 +1238,27 @@ enum SlotDecode {
 fn read_checkpoint(
     file: &File,
     identity: JournalIdentity,
+    sequence_floor: u64,
     journal_len: u64,
 ) -> Result<Option<CheckpointState>, ActiveJournalError> {
     let mut bytes = [0_u8; CHECKPOINT_FILE_LEN];
     let mut file = file;
     file.read_exact(&mut bytes)
         .map_err(|error| io_error(StoreIoOperation::Read, error))?;
-    let first = decode_checkpoint_slot(&bytes[..CHECKPOINT_SLOT_LEN], 0, identity, journal_len);
-    let second = decode_checkpoint_slot(&bytes[CHECKPOINT_SLOT_LEN..], 1, identity, journal_len);
+    let first = decode_checkpoint_slot(
+        &bytes[..CHECKPOINT_SLOT_LEN],
+        0,
+        identity,
+        sequence_floor,
+        journal_len,
+    );
+    let second = decode_checkpoint_slot(
+        &bytes[CHECKPOINT_SLOT_LEN..],
+        1,
+        identity,
+        sequence_floor,
+        journal_len,
+    );
     match (first, second) {
         (SlotDecode::Zero, SlotDecode::Zero) => Ok(None),
         (SlotDecode::InvalidNonzero, _) | (_, SlotDecode::InvalidNonzero) => {
@@ -1203,6 +1293,7 @@ fn decode_checkpoint_slot(
     bytes: &[u8],
     slot_index: usize,
     identity: JournalIdentity,
+    sequence_floor: u64,
     journal_len: u64,
 ) -> SlotDecode {
     if bytes.iter().all(|byte| *byte == 0) {
@@ -1227,7 +1318,7 @@ fn decode_checkpoint_slot(
         || usize::try_from((slot_generation - 1) % 2).unwrap_or_default() != slot_index
         || end_offset < JOURNAL_V1_HEADER_LEN as u64
         || end_offset > journal_len
-        || (append_sequence == 0) != (end_offset == JOURNAL_V1_HEADER_LEN as u64)
+        || (append_sequence == sequence_floor) != (end_offset == JOURNAL_V1_HEADER_LEN as u64)
     {
         return SlotDecode::InvalidNonzero;
     }

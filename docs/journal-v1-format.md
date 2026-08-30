@@ -1,8 +1,10 @@
 # Journal V1 semantic format
 
 Journal V1 is the first canonical byte representation of one already-authorized
-`och_core::CanonicalAdmission`. M02-PR01b1 stores it in one bounded, locked,
-generation-one active journal with a mechanical durable-high-water checkpoint.
+`och_core::CanonicalAdmission`. M02-PR01b1 first stored it in one bounded, locked,
+generation-one active journal with a mechanical durable-high-water checkpoint;
+M02-PR02c retains those bytes across deterministic active generations and exact
+immutable raw-Journal seals.
 The bytes and decoded records never grant authorization. All multibyte integers
 use network byte order (big-endian). No value is inferred, normalized, generated,
 compressed, dictionary-encoded, or hashed with a platform-dependent algorithm.
@@ -23,7 +25,7 @@ version, identity variant, truncation, and trailing input fail closed. The V2
 header changes only the version field; all admission frames remain format version
 one. `JournalHeaderV1` rejects V2, so a premanifest writer fails closed after a
 store is upgraded. V1/V2 bootstrap and committed publication are specified in
-[Manifest V1/V2](manifest-v1-format.md).
+[Manifest V1/V2/V3](manifest-v1-format.md).
 
 ## Independent admission frame
 
@@ -54,11 +56,18 @@ value is `0xe3069283`.
 
 ## Active artifacts and bounds
 
-The active generation is exactly unsigned `1`. Its mechanical state uses exactly
-two files in one caller-supplied existing directory:
+Generation one preserves its exact legacy pair in one caller-supplied existing
+directory:
 
 - `active-journal-v1.och`: one header followed by independent frames;
 - `active-journal-v1.checkpoint`: exactly two 64-byte checkpoint slots.
+
+Successor generation `g >= 2` uses only the deterministic pair
+`active-journal-v1-g{g:020}.och` and
+`active-journal-v1-g{g:020}.checkpoint`. Caller text and paths never contribute
+to names. Each active open binds the exact positive generation and one exclusive
+global append-sequence floor. End offsets, checkpoint-slot generations, byte
+limits, and record limits are generation-local; append sequence is store-global.
 
 Legacy premanifest create-new follows one exact order: exclusively create and lock the single
 read/write journal, write and synchronize its header, exclusively create the
@@ -93,9 +102,9 @@ Each 64-byte checkpoint slot is self-contained:
 | 8 | 2 | version | unsigned `1` |
 | 10 | 2 | slot length | unsigned `64` |
 | 12 | 16 | store identity | Journal header `StoreId` |
-| 28 | 8 | journal generation | unsigned `1` |
+| 28 | 8 | journal generation | exact positive owning generation |
 | 36 | 8 | slot generation | positive, strict monotonic |
-| 44 | 8 | durable append sequence | zero only at genesis |
+| 44 | 8 | durable append sequence | generation floor when empty; otherwise inclusive cutoff |
 | 52 | 8 | durable end offset | exact frame boundary |
 | 60 | 4 | checksum | CRC-32C over bytes 0..60 |
 
@@ -103,7 +112,7 @@ Slot generation one occupies slot zero; each barrier increments generation and
 writes `(generation - 1) mod 2`. A barrier's required order is journal sync,
 alternate checkpoint-slot write, checkpoint sync, then in-memory cutoff advance
 and durable receipt resolution. Public `DurableCutoff` evidence carries this
-mechanical checkpoint generation separately from the fixed journal generation.
+mechanical checkpoint generation separately from journal generation.
 The checkpoint is only store/journal binding and mechanical cutoff evidence. It
 carries no declaration registry, retry outcome, latest state, or source
 interpretation authority.
@@ -134,6 +143,23 @@ If an append I/O failure may have changed journal bytes, that open
 `ActiveJournal` is terminally faulted: it refuses later sequence assignment,
 append, and synchronization. Only drop plus this validated reopen path may
 truncate a proven torn terminal suffix and establish a new writer authority.
+
+## Successor and sealed raw Journal V1
+
+Rotation requires an exact fully durable nonempty active range and no unpublished
+append. A frame that cannot fit even an empty configured active generation returns
+typed `FrameTooLarge`; it never starts an empty rotation loop. The successor is
+created with header version 2, checkpoint slot generation one, header-only end
+offset, and durable append sequence equal to the prior inclusive global cutoff.
+Its first frame is that cutoff's exact successor.
+
+Before successor authority, the source bytes are streamed with fixed memory into
+`sealed-journal-v1.staging`, synchronized, fully decoded and exact-compared, and
+published as `sealed-journal-v1-g{generation:020}.och`. The artifact is the raw
+header plus unchanged frames, not a native segment. Product code never mutates or
+deletes a published seal in this slice. The complete contract is in
+[sealed raw Journal V1](sealed-journal-v1-format.md), and its bounded authority is
+in [Generation Catalog V1](generation-catalog-v1-format.md).
 
 ## Primitive encoding
 

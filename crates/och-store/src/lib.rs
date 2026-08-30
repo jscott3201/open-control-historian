@@ -4,15 +4,17 @@
 //!
 //! The crate encodes already-authorized [`och_core::CanonicalAdmission`] values
 //! and decodes hostile bytes into non-authorizing inspection records. Its
-//! [`ActiveJournal`] is the sole synchronous owner of the fixed mechanical
-//! active artifacts. [`ManifestStore`] composes that journal with stable
-//! locking, bounded canonical-registry snapshots, and a manifest-backed durable
-//! cutoff. The crate owns no runtime scheduling, rotation, or query behavior.
+//! [`ActiveJournal`] is the sole synchronous owner of one generation's
+//! mechanical active artifacts. [`ManifestStore`] composes it with stable
+//! locking, bounded registry/retry/catalog snapshots, immutable raw-Journal
+//! sealing, successor rotation, and a manifest-backed durable cutoff. The crate
+//! owns no runtime scheduling, final segment encoding, or query behavior.
 
 mod active;
 mod codec;
 mod decoded;
 mod error;
+mod generation;
 mod manifest;
 mod retry;
 
@@ -35,6 +37,11 @@ pub use codec::{
 };
 pub use decoded::{DecodedAdmissionV1, DecodedDeclarationV1, DecodedObservationLineageV1};
 pub use error::JournalV1Error;
+pub use generation::{
+    GENERATION_CATALOG_STAGING_FILE_NAME, GenerationCatalogReference, GenerationCatalogSnapshot,
+    GenerationInventory, MAX_SEALED_GENERATIONS, ROTATION_INTENT_FILE_NAME,
+    SEALED_JOURNAL_STAGING_FILE_NAME, SealedGeneration,
+};
 pub use manifest::{
     MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME, MANIFEST_STAGING_FILE_NAME,
     MAX_PERSISTED_REGISTRY_REVISIONS, MAX_PERSISTED_REGISTRY_SERIES, MAX_REGISTRY_SNAPSHOT_BYTES,

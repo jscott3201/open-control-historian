@@ -115,13 +115,17 @@ fn lifecycle() -> CaptureLifecycle {
     .expect("linked lifecycle")
 }
 
-fn retry(series: SeriesId, producer: ProducerId) -> RetryQualification {
+fn retry_with_key(series: SeriesId, producer: ProducerId, key: &str) -> RetryQualification {
     RetryQualification::new(
         series,
         producer,
-        RetryKey::new("historian-request".to_owned()).expect("bounded retry key"),
+        RetryKey::new(key.to_owned()).expect("bounded retry key"),
         content(21),
     )
+}
+
+fn retry(series: SeriesId, producer: ProducerId) -> RetryQualification {
+    retry_with_key(series, producer, "historian-request")
 }
 
 fn batch(interval: SourceIntervalKind) -> SourceBatchMetadata {
@@ -321,6 +325,10 @@ pub fn observed_admission(
 }
 
 pub fn no_change_admission() -> CanonicalAdmission {
+    no_change_admission_with_retry_key("historian-request")
+}
+
+pub fn no_change_admission_with_retry_key(key: &str) -> CanonicalAdmission {
     let series = series_id(4);
     let producer = producer_id(5);
     let envelope = CollectionEnvelope::no_change(
@@ -336,7 +344,7 @@ pub fn no_change_admission() -> CanonicalAdmission {
     .expect("valid no-change envelope");
     CanonicalAdmission::no_change(
         registry_bound(envelope, ValueFamily::Boolean, false),
-        retry(series, producer),
+        retry_with_key(series, producer, key),
         batch(SourceIntervalKind::NoChange),
         lifecycle(),
     )
