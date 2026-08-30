@@ -2,6 +2,7 @@
 
 const MANIFEST_LEN: usize = 128;
 const MANIFEST_V3_LEN: usize = 160;
+const MANIFEST_V4_LEN: usize = 192;
 
 pub struct CatalogEntry {
     pub journal_generation: u64,
@@ -19,6 +20,97 @@ pub struct CatalogReference {
     pub generation: u64,
     pub length: u64,
     pub checksum: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct RecoveryReference {
+    pub slot: u8,
+    pub generation: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn recovery_state_v1(
+    store: [u8; 16],
+    generation: u64,
+    source_manifest_generation: u64,
+    journal_generation: u64,
+    checkpoint_generation: u64,
+    append_sequence: u64,
+    end_offset: u64,
+    removed_bytes: u64,
+    operation_count: u16,
+) -> [u8; 96] {
+    let mut bytes = [0_u8; 96];
+    bytes[..8].copy_from_slice(b"OCHRCV01");
+    bytes[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    bytes[10..12].copy_from_slice(&96_u16.to_be_bytes());
+    bytes[12..28].copy_from_slice(&store);
+    bytes[28..36].copy_from_slice(&generation.to_be_bytes());
+    bytes[36..44].copy_from_slice(&source_manifest_generation.to_be_bytes());
+    bytes[44..52].copy_from_slice(&journal_generation.to_be_bytes());
+    bytes[52..60].copy_from_slice(&checkpoint_generation.to_be_bytes());
+    bytes[60..68].copy_from_slice(&append_sequence.to_be_bytes());
+    bytes[68..76].copy_from_slice(&end_offset.to_be_bytes());
+    bytes[76..84].copy_from_slice(&removed_bytes.to_be_bytes());
+    bytes[84] = 1;
+    bytes[85] = 1;
+    bytes[86..88].copy_from_slice(&operation_count.to_be_bytes());
+    let checksum = crc32c(&bytes[..92]);
+    bytes[92..96].copy_from_slice(&checksum.to_be_bytes());
+    bytes
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn manifest_v4(
+    store: [u8; 16],
+    generation: u64,
+    journal_generation: u64,
+    checkpoint_generation: u64,
+    append_sequence: u64,
+    end_offset: u64,
+    registry_slot: u8,
+    registry_generation: u64,
+    registry_bytes: &[u8],
+    retry_slot: u8,
+    retry_generation: u64,
+    retry_bytes: &[u8],
+    sequence_floor: u64,
+    catalog: Option<CatalogReference>,
+    recovery: RecoveryReference,
+    recovery_bytes: &[u8],
+) -> [u8; MANIFEST_V4_LEN] {
+    let mut bytes = [0_u8; MANIFEST_V4_LEN];
+    bytes[..8].copy_from_slice(b"OCHMAN01");
+    bytes[8..10].copy_from_slice(&4_u16.to_be_bytes());
+    bytes[10..12].copy_from_slice(&192_u16.to_be_bytes());
+    bytes[12..28].copy_from_slice(&store);
+    bytes[28..36].copy_from_slice(&generation.to_be_bytes());
+    bytes[36..44].copy_from_slice(&journal_generation.to_be_bytes());
+    bytes[44..52].copy_from_slice(&checkpoint_generation.to_be_bytes());
+    bytes[52..60].copy_from_slice(&append_sequence.to_be_bytes());
+    bytes[60..68].copy_from_slice(&end_offset.to_be_bytes());
+    bytes[68] = registry_slot;
+    bytes[72..80].copy_from_slice(&registry_generation.to_be_bytes());
+    bytes[80..88].copy_from_slice(&(registry_bytes.len() as u64).to_be_bytes());
+    bytes[88..92].copy_from_slice(&crc32c(registry_bytes).to_be_bytes());
+    bytes[92] = retry_slot;
+    bytes[96..104].copy_from_slice(&retry_generation.to_be_bytes());
+    bytes[104..112].copy_from_slice(&(retry_bytes.len() as u64).to_be_bytes());
+    bytes[112..116].copy_from_slice(&crc32c(retry_bytes).to_be_bytes());
+    if let Some(catalog) = catalog {
+        bytes[124..132].copy_from_slice(&sequence_floor.to_be_bytes());
+        bytes[132] = catalog.slot;
+        bytes[136..144].copy_from_slice(&catalog.generation.to_be_bytes());
+        bytes[144..152].copy_from_slice(&catalog.length.to_be_bytes());
+        bytes[152..156].copy_from_slice(&catalog.checksum.to_be_bytes());
+    }
+    bytes[156] = recovery.slot;
+    bytes[160..168].copy_from_slice(&recovery.generation.to_be_bytes());
+    bytes[168..176].copy_from_slice(&(recovery_bytes.len() as u64).to_be_bytes());
+    bytes[176..180].copy_from_slice(&crc32c(recovery_bytes).to_be_bytes());
+    let checksum = crc32c(&bytes[..188]);
+    bytes[188..192].copy_from_slice(&checksum.to_be_bytes());
+    bytes
 }
 
 pub struct RetryV2Outcome<'a> {

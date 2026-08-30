@@ -460,6 +460,22 @@ impl fmt::Display for StartError {
     }
 }
 
+impl StartError {
+    /// Returns store-owned recovery classification when startup reached storage.
+    #[must_use]
+    pub const fn recovery_classification(self) -> Option<och_store::RecoveryClassification> {
+        match self {
+            Self::Store(error) => Some(error.recovery_classification()),
+            Self::NoActiveRuntime
+            | Self::WriterExitedBeforeReadiness
+            | Self::WriterTaskCancelled
+            | Self::WriterTaskPanicked
+            | Self::WorkerThreadUnavailable
+            | Self::WorkerExitedBeforeReadiness => None,
+        }
+    }
+}
+
 impl Error for StartError {}
 
 struct OpenGuard {
@@ -4966,6 +4982,114 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    fn successful_runtime_recovery_remains_healthy_and_exposes_sanitized_report() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let store = store_id(1);
+            let journal_limits = och_store::ActiveJournalLimits::new(
+                och_store::MAX_ADMISSION_PAYLOAD_V1,
+                64 * 1_024 * 1_024,
+                16,
+            )
+            .expect("recovery runtime journal limits");
+            let registry =
+                och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(16, 64))
+                    .expect("recovery runtime registry options");
+            let retry = och_store::RetryPersistenceOptions::new(2, 2)
+                .expect("recovery runtime retry options");
+            let mut fixture = och_store::ManifestStore::open(
+                och_store::ManifestStoreConfig::new(
+                    directory.clone(),
+                    store,
+                    och_store::ActiveJournalOpenMode::CreateNew,
+                    journal_limits,
+                    registry.clone(),
+                    retry,
+                )
+                .expect("recovery runtime fixture config"),
+            )
+            .expect("create recovery runtime fixture");
+            let root = command("runtime-recovery-root", 61, 61).into_admission();
+            let declaration = root.declaration();
+            fixture
+                .register(
+                    declaration.series_id(),
+                    declaration.binding().clone(),
+                    declaration.payload().clone(),
+                    declaration.evidence().clone(),
+                )
+                .expect("register runtime recovery declaration");
+            let root_qualification = root.retry().clone();
+            let first = och_store::PreparedAdmissionV1::new(root)
+                .expect("prepare runtime recovery root")
+                .into_frame(och_store::AppendSequenceV1::new(1).expect("root sequence"))
+                .expect("encode runtime recovery root");
+            let first_end = fixture
+                .append(&first)
+                .expect("append runtime recovery root");
+            let (prior, _) = fixture
+                .sync_pending(&[och_store::PendingRetryOutcome::new(
+                    root_qualification,
+                    1,
+                    first_end,
+                )])
+                .expect("commit runtime recovery root");
+            let suffix = och_store::PreparedAdmissionV1::new(
+                command("runtime-recovery-suffix", 62, 62).into_admission(),
+            )
+            .expect("prepare runtime recovery suffix")
+            .into_frame(och_store::AppendSequenceV1::new(2).expect("suffix sequence"))
+            .expect("encode runtime recovery suffix");
+            fixture
+                .append(&suffix)
+                .expect("append runtime recovery suffix");
+            drop(fixture);
+
+            let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                .expect("recovery runtime byte limits");
+            let runtime = complete_bounded(HistorianRuntime::open(
+                StoreOptions::new(
+                    directory.clone(),
+                    store,
+                    och_store::ActiveJournalOpenMode::OpenExisting,
+                    journal_limits,
+                    bytes,
+                    group_policy(
+                        std::time::Duration::from_secs(1),
+                        MAX_OUTSTANDING_COMMANDS,
+                        64 * 1_024 * 1_024,
+                    ),
+                    registry,
+                    retry,
+                )
+                .expect("recovery runtime open options"),
+            ))
+            .await
+            .expect("runtime opens recovered root");
+            let inspection = runtime.inspection();
+            assert_eq!(inspection.health(), RuntimeHealth::Healthy);
+            let report = inspection
+                .recovery_report()
+                .expect("runtime forwards recovery report");
+            assert_eq!(
+                report.classification(),
+                och_store::RecoveryClassification::CommittedRootSuffix
+            );
+            assert_eq!(
+                report.action(),
+                och_store::RecoveryAction::RemovedActiveSuffix
+            );
+            assert_eq!(report.durable_cutoff(), prior.durable_cutoff());
+            assert_eq!(runtime.recovered_records().len(), 1);
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("recovered runtime shuts down");
+            fs::remove_dir_all(directory).expect("remove recovery runtime fixture");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn repeated_count_rotation_preserves_global_sequences_and_cross_generation_replay() {
         harness().block_on(async {
             let directory = test_directory();
@@ -5333,12 +5457,28 @@ mod tests {
                 )))
                 .await;
                 if stage == "handled" {
-                    assert!(matches!(
-                        reopened,
-                        Err(StartError::Store(och_store::ManifestStoreError::Active(
-                            och_store::ActiveJournalError::InvalidLayout
-                        )))
-                    ));
+                    let reopened = reopened.expect("handled-only suffix must recover to the root");
+                    assert_eq!(reopened.inspection().health(), RuntimeHealth::Healthy);
+                    let report = reopened
+                        .inspection()
+                        .recovery_report()
+                        .expect("handled-only suffix recovery report");
+                    assert_eq!(
+                        report.action(),
+                        och_store::RecoveryAction::RemovedActiveSuffix
+                    );
+                    assert_eq!(reopened.recovered_records().len(), 0);
+                    assert_eq!(
+                        reopened
+                            .inspection()
+                            .store()
+                            .durable_cutoff()
+                            .append_sequence(),
+                        0
+                    );
+                    complete_bounded(reopened.shutdown())
+                        .await
+                        .expect("shutdown recovered child journal");
                     return;
                 }
                 let reopened = reopened.expect("durable manifest cutoff must reopen");

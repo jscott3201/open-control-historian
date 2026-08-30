@@ -48,6 +48,49 @@ const CHECKPOINT_SLOT_LEN: usize = 64;
 const CHECKPOINT_SLOT_LEN_U16: u16 = 64;
 const CHECKPOINT_FILE_LEN: usize = CHECKPOINT_SLOT_LEN * 2;
 
+#[cfg(test)]
+std::thread_local! {
+    static RECOVERY_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_recovery_fault(code: u8) {
+    RECOVERY_FAULT.with(|fault| fault.set(code));
+}
+
+#[cfg(test)]
+fn injected_recovery_fault(
+    code: u8,
+    operation: StoreIoOperation,
+) -> Result<(), ActiveJournalError> {
+    let active = RECOVERY_FAULT.with(|fault| {
+        if fault.get() == code {
+            fault.set(0);
+            true
+        } else {
+            false
+        }
+    });
+    if active {
+        Err(ActiveJournalError::Io(StoreIoEvidence {
+            operation,
+            kind: ErrorKind::Other,
+            raw_os_error: None,
+        }))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+#[allow(clippy::unnecessary_wraps)]
+const fn injected_recovery_fault(
+    _code: u8,
+    _operation: StoreIoOperation,
+) -> Result<(), ActiveJournalError> {
+    Ok(())
+}
+
 /// Whether open creates the fixed active artifacts or requires them to exist.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActiveJournalOpenMode {
@@ -133,6 +176,7 @@ enum HeaderRequirement {
 enum RecoveryPolicy {
     Converge,
     Strict,
+    ManifestRoot(DurableCutoff),
 }
 
 impl ActiveJournalConfig {
@@ -190,6 +234,12 @@ impl ActiveJournalConfig {
     pub(crate) fn manifest_existing(mut self) -> Self {
         self.header_requirement = HeaderRequirement::ManifestV2;
         self.recovery_policy = RecoveryPolicy::Strict;
+        self
+    }
+
+    pub(crate) fn manifest_root(mut self, cutoff: DurableCutoff) -> Self {
+        self.header_requirement = HeaderRequirement::ManifestV2;
+        self.recovery_policy = RecoveryPolicy::ManifestRoot(cutoff);
         self
     }
 
@@ -488,8 +538,15 @@ pub struct ActiveJournal {
     sync_count: u64,
     faulted: bool,
     header_version: u16,
+    pending_recovery: Option<PendingRecovery>,
     #[cfg(test)]
     faults: Faults,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingRecovery {
+    original_length: u64,
+    stale_checkpoint_slot: Option<usize>,
 }
 
 impl ActiveJournal {
@@ -585,6 +642,7 @@ impl ActiveJournal {
             sync_count: 0,
             faulted: false,
             header_version,
+            pending_recovery: None,
             #[cfg(test)]
             faults: Faults::default(),
         })
@@ -668,9 +726,25 @@ impl ActiveJournal {
         } else if checkpoint_len != CHECKPOINT_FILE_LEN as u64 {
             return Err(ActiveJournalError::InvalidLayout);
         }
-        let checkpoint_state = match initialized_state {
-            Some(state) => Some(state),
-            None => read_checkpoint(&checkpoint, identity, sequence_floor, journal_len)?,
+        let (checkpoint_state, stale_checkpoint_slot) = match initialized_state {
+            Some(state) => (Some(state), None),
+            None => match recovery_policy {
+                RecoveryPolicy::ManifestRoot(root) => {
+                    let (state, stale_slot) = read_checkpoint_for_root(
+                        &checkpoint,
+                        identity,
+                        sequence_floor,
+                        limits.active_bytes,
+                        journal_len,
+                        root,
+                    )?;
+                    (Some(state), stale_slot)
+                }
+                RecoveryPolicy::Converge | RecoveryPolicy::Strict => (
+                    read_checkpoint(&checkpoint, identity, sequence_floor, journal_len)?,
+                    None,
+                ),
+            },
         };
         if checkpoint_state.is_none() && journal_len != JOURNAL_V1_HEADER_LEN as u64 {
             return Err(ActiveJournalError::InvalidLayout);
@@ -687,12 +761,18 @@ impl ActiveJournal {
             sequence_floor,
             journal_len,
         )?;
+        let manifest_root = match recovery_policy {
+            RecoveryPolicy::ManifestRoot(root) => Some(root),
+            RecoveryPolicy::Converge | RecoveryPolicy::Strict => None,
+        };
         if recovery_policy == RecoveryPolicy::Strict
             && (scan.truncate_to.is_some() || scan.valid_end != checkpoint_state.end_offset)
         {
             return Err(ActiveJournalError::InvalidLayout);
         }
-        if let Some(truncate_to) = scan.truncate_to {
+        if manifest_root.is_none()
+            && let Some(truncate_to) = scan.truncate_to
+        {
             journal
                 .set_len(truncate_to)
                 .map_err(|error| io_error(StoreIoOperation::Truncate, error))?;
@@ -700,12 +780,18 @@ impl ActiveJournal {
                 .sync_all()
                 .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))?;
         }
-        let active_bytes = scan.valid_end;
-        let last_sequence = scan
-            .records
+        let active_bytes = manifest_root.map_or(scan.valid_end, DurableCutoff::end_offset);
+        let mut records = scan.records;
+        if let Some(root) = manifest_root {
+            records.retain(|record| record.end_offset <= root.end_offset());
+        }
+        let last_sequence = records
             .last()
             .map_or(sequence_floor, |record| record.admission.append_sequence());
-        if active_bytes > checkpoint_state.end_offset {
+        if manifest_root.is_some() {
+            // Root-scoped open remains read-only until all manifest-referenced
+            // registry/retry/catalog/recovery evidence has also been proved.
+        } else if active_bytes > checkpoint_state.end_offset {
             journal
                 .sync_all()
                 .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))?;
@@ -737,10 +823,18 @@ impl ActiveJournal {
             limits,
             checkpoint_state,
             active_bytes,
-            records: scan.records,
+            records,
             sync_count: 0,
             faulted: false,
             header_version,
+            pending_recovery: manifest_root.and_then(|root| {
+                (journal_len > root.end_offset() || stale_checkpoint_slot.is_some()).then_some(
+                    PendingRecovery {
+                        original_length: journal_len,
+                        stale_checkpoint_slot,
+                    },
+                )
+            }),
             #[cfg(test)]
             faults: Faults::default(),
         })
@@ -776,6 +870,51 @@ impl ActiveJournal {
 
     pub(crate) const fn limits(&self) -> ActiveJournalLimits {
         self.limits
+    }
+
+    pub(crate) fn apply_manifest_recovery(&mut self) -> Result<(u64, u16), ActiveJournalError> {
+        let Some(pending) = self.pending_recovery else {
+            return Ok((0, 0));
+        };
+        let removed = pending
+            .original_length
+            .checked_sub(self.checkpoint_state.end_offset)
+            .ok_or(ActiveJournalError::InvalidLayout)?;
+        let mut operations = 0_u16;
+        if removed > 0 {
+            injected_recovery_fault(1, StoreIoOperation::Truncate)?;
+            self.journal
+                .set_len(self.checkpoint_state.end_offset)
+                .map_err(|error| io_error(StoreIoOperation::Truncate, error))?;
+            injected_recovery_fault(2, StoreIoOperation::Truncate)?;
+            self.journal
+                .sync_all()
+                .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))?;
+            injected_recovery_fault(3, StoreIoOperation::SyncJournal)?;
+            operations = operations.saturating_add(1);
+        }
+        if let Some(slot) = pending.stale_checkpoint_slot {
+            let offset = u64::try_from(
+                slot.checked_mul(CHECKPOINT_SLOT_LEN)
+                    .ok_or(ActiveJournalError::InvalidLayout)?,
+            )
+            .map_err(|_| ActiveJournalError::InvalidLayout)?;
+            let mut checkpoint = &self.checkpoint;
+            checkpoint
+                .seek(SeekFrom::Start(offset))
+                .map_err(|error| io_error(StoreIoOperation::Seek, error))?;
+            checkpoint
+                .write_all(&[0_u8; CHECKPOINT_SLOT_LEN])
+                .map_err(|error| io_error(StoreIoOperation::Write, error))?;
+            injected_recovery_fault(4, StoreIoOperation::Write)?;
+            checkpoint
+                .sync_all()
+                .map_err(|error| io_error(StoreIoOperation::SyncCheckpoint, error))?;
+            injected_recovery_fault(5, StoreIoOperation::SyncCheckpoint)?;
+            operations = operations.saturating_add(1);
+        }
+        self.pending_recovery = None;
+        Ok((removed, operations))
     }
 
     pub(crate) fn upgrade_to_manifest_header(&mut self) -> Result<(), ActiveJournalError> {
@@ -994,6 +1133,29 @@ impl DurableCutoff {
             checkpoint_generation,
             append_sequence,
             end_offset,
+        }
+    }
+
+    pub(crate) const fn from_recovery(
+        journal: JournalIdentity,
+        checkpoint_generation: u64,
+        append_sequence: u64,
+        end_offset: u64,
+    ) -> Self {
+        Self {
+            journal,
+            checkpoint_generation,
+            append_sequence,
+            end_offset,
+        }
+    }
+}
+
+impl JournalIdentity {
+    pub(crate) const fn from_recovery(store_id: StoreId, generation: u64) -> Self {
+        Self {
+            store_id,
+            generation,
         }
     }
 }
@@ -1287,6 +1449,88 @@ fn read_checkpoint(
             Ok(Some(newer))
         }
     }
+}
+
+fn read_checkpoint_for_root(
+    file: &File,
+    identity: JournalIdentity,
+    sequence_floor: u64,
+    maximum_end: u64,
+    journal_len: u64,
+    root: DurableCutoff,
+) -> Result<(CheckpointState, Option<usize>), ActiveJournalError> {
+    if root.journal != identity
+        || root.end_offset > journal_len
+        || root.end_offset > maximum_end
+        || root.checkpoint_generation == 0
+    {
+        return Err(ActiveJournalError::InvalidLayout);
+    }
+    let mut bytes = [0_u8; CHECKPOINT_FILE_LEN];
+    let mut file = file;
+    file.read_exact(&mut bytes)
+        .map_err(|error| io_error(StoreIoOperation::Read, error))?;
+    let decoded = [
+        decode_checkpoint_slot(
+            &bytes[..CHECKPOINT_SLOT_LEN],
+            0,
+            identity,
+            sequence_floor,
+            maximum_end,
+        ),
+        decode_checkpoint_slot(
+            &bytes[CHECKPOINT_SLOT_LEN..],
+            1,
+            identity,
+            sequence_floor,
+            maximum_end,
+        ),
+    ];
+    if decoded
+        .iter()
+        .any(|slot| matches!(slot, SlotDecode::InvalidNonzero))
+    {
+        return Err(ActiveJournalError::InvalidLayout);
+    }
+    let mut valid = decoded
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| match slot {
+            SlotDecode::Valid(state) => Some((index, *state)),
+            SlotDecode::Zero | SlotDecode::InvalidNonzero => None,
+        })
+        .collect::<Vec<_>>();
+    valid.sort_by_key(|(_, state)| state.slot_generation);
+    match valid.as_slice() {
+        [(_, _)] => {}
+        [(_, older), (_, newer)]
+            if older.slot_generation.checked_add(1) == Some(newer.slot_generation)
+                && newer.append_sequence > older.append_sequence
+                && newer.end_offset > older.end_offset => {}
+        _ => return Err(ActiveJournalError::InvalidLayout),
+    }
+    let expected = CheckpointState {
+        slot_generation: root.checkpoint_generation,
+        append_sequence: root.append_sequence,
+        end_offset: root.end_offset,
+    };
+    let root_index = valid
+        .iter()
+        .find_map(|(index, state)| (*state == expected).then_some(*index))
+        .ok_or(ActiveJournalError::InvalidLayout)?;
+    let stale = valid.iter().find_map(|(index, state)| {
+        (state.slot_generation > expected.slot_generation).then_some(*index)
+    });
+    if valid.iter().any(|(_, state)| {
+        state.slot_generation > expected.slot_generation
+            && (state.slot_generation != expected.slot_generation.saturating_add(1)
+                || state.append_sequence <= expected.append_sequence
+                || state.end_offset <= expected.end_offset)
+    }) || stale == Some(root_index)
+    {
+        return Err(ActiveJournalError::InvalidLayout);
+    }
+    Ok((expected, stale))
 }
 
 fn decode_checkpoint_slot(

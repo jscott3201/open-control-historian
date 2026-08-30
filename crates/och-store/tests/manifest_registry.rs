@@ -14,9 +14,11 @@ use och_store::{
     ActiveJournalOpenMode, AppendSequenceV1, JOURNAL_V1_HEADER_LEN, JournalHeaderV1,
     JournalHeaderV2, MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME,
     MANIFEST_STAGING_FILE_NAME, MAX_ADMISSION_PAYLOAD_V1, ManifestStore, ManifestStoreConfig,
-    ManifestStoreError, PendingRetryOutcome, PreparedAdmissionV1, REGISTRY_SLOT_0_FILE_NAME,
-    REGISTRY_STAGING_FILE_NAME, RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME,
-    RETRY_SLOT_2_FILE_NAME, RegistryPersistenceOptions, RetryPersistenceOptions,
+    ManifestStoreError, PendingRetryOutcome, PreparedAdmissionV1, RECOVERY_SLOT_0_FILE_NAME,
+    RECOVERY_SLOT_1_FILE_NAME, RECOVERY_SLOT_2_FILE_NAME, REGISTRY_SLOT_0_FILE_NAME,
+    REGISTRY_SLOT_1_FILE_NAME, REGISTRY_SLOT_2_FILE_NAME, REGISTRY_STAGING_FILE_NAME,
+    RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME, RETRY_SLOT_2_FILE_NAME, RecoveryAction,
+    RecoveryClassification, RegistryPersistenceOptions, RetryPersistenceOptions,
     STORE_LOCK_FILE_NAME,
 };
 use std::fs::{self, OpenOptions};
@@ -228,6 +230,163 @@ fn genesis_bytes_match_the_independent_primitive_oracle() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn recovery_state_v1_and_manifest_v4_match_independent_primitive_oracles() {
+    let directory = TestDirectory::new("recovery-oracle");
+    let mut store = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::CreateNew,
+        registry_options(),
+    ))
+    .expect("create recovery oracle store");
+    let admission = support::no_change_admission();
+    let declaration = admission.declaration();
+    store
+        .register(
+            declaration.series_id(),
+            declaration.binding().clone(),
+            declaration.payload().clone(),
+            declaration.evidence().clone(),
+        )
+        .expect("register recovery oracle declaration");
+    let first = frame(admission, 1);
+    let first_end = store.append(&first).expect("append recovery root");
+    let (root, _) = store
+        .sync_pending(&[PendingRetryOutcome::new(
+            first.admission().retry().clone(),
+            1,
+            first_end,
+        )])
+        .expect("commit recovery root");
+    let suffix = frame(
+        support::no_change_admission_with_retry_key("recovery-oracle-suffix"),
+        2,
+    );
+    let suffix_end = store
+        .append(&suffix)
+        .expect("append recovery oracle suffix");
+    drop(store);
+
+    let recovered = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::OpenExisting,
+        registry_options(),
+    ))
+    .expect("recover oracle suffix");
+    let inspection = recovered.inspection();
+    let report = inspection
+        .recovery_report()
+        .expect("recovery report must be manifest-bound");
+    assert_eq!(
+        report.classification(),
+        RecoveryClassification::CommittedRootSuffix
+    );
+    assert_eq!(report.action(), RecoveryAction::RemovedActiveSuffix);
+    let recovery_names = [
+        RECOVERY_SLOT_0_FILE_NAME,
+        RECOVERY_SLOT_1_FILE_NAME,
+        RECOVERY_SLOT_2_FILE_NAME,
+    ];
+    let (recovery_slot, recovery_bytes) = recovery_names
+        .iter()
+        .enumerate()
+        .find_map(|(slot, name)| {
+            fs::read(directory.path().join(name)).ok().map(|bytes| {
+                (
+                    u8::try_from(slot).expect("three recovery slots fit u8"),
+                    bytes,
+                )
+            })
+        })
+        .expect("one recovery state slot");
+    let recovery_generation = u64::from_be_bytes(
+        recovery_bytes[28..36]
+            .try_into()
+            .expect("recovery generation"),
+    );
+    let expected_recovery = manifest_oracle::recovery_state_v1(
+        support::uuid_bytes(1),
+        recovery_generation,
+        root.manifest_generation(),
+        root.durable_cutoff().journal().generation(),
+        root.durable_cutoff().checkpoint_generation(),
+        root.durable_cutoff().append_sequence(),
+        root.durable_cutoff().end_offset(),
+        suffix_end - first_end,
+        report.operation_count(),
+    );
+    assert_eq!(recovery_bytes, expected_recovery);
+
+    let committed = inspection.committed();
+    let registry_names = [
+        REGISTRY_SLOT_0_FILE_NAME,
+        REGISTRY_SLOT_1_FILE_NAME,
+        REGISTRY_SLOT_2_FILE_NAME,
+    ];
+    let retry_names = [
+        RETRY_SLOT_0_FILE_NAME,
+        RETRY_SLOT_1_FILE_NAME,
+        RETRY_SLOT_2_FILE_NAME,
+    ];
+    let registry_bytes = fs::read(
+        directory
+            .path()
+            .join(registry_names[usize::from(committed.registry_slot())]),
+    )
+    .expect("read recovery registry bytes");
+    let retry = committed.retry_state().expect("recovery retry reference");
+    let retry_bytes = fs::read(
+        directory
+            .path()
+            .join(retry_names[usize::from(retry.slot())]),
+    )
+    .expect("read recovery retry bytes");
+    let manifest_bytes = [MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME]
+        .iter()
+        .find_map(|name| {
+            let bytes = fs::read(directory.path().join(name)).ok()?;
+            (u64::from_be_bytes(bytes[28..36].try_into().ok()?) == committed.manifest_generation())
+                .then_some(bytes)
+        })
+        .expect("read Manifest V4 bytes");
+    assert_eq!(
+        manifest_bytes,
+        manifest_oracle::manifest_v4(
+            support::uuid_bytes(1),
+            committed.manifest_generation(),
+            committed.durable_cutoff().journal().generation(),
+            committed.durable_cutoff().checkpoint_generation(),
+            committed.durable_cutoff().append_sequence(),
+            committed.durable_cutoff().end_offset(),
+            committed.registry_slot(),
+            committed.registry_generation(),
+            &registry_bytes,
+            retry.slot(),
+            retry.generation(),
+            &retry_bytes,
+            committed.sequence_floor(),
+            None,
+            manifest_oracle::RecoveryReference {
+                slot: recovery_slot,
+                generation: recovery_generation,
+            },
+            &recovery_bytes,
+        )
+    );
+    for forbidden in [
+        "och_store",
+        "och_core",
+        "encode_manifest",
+        "encode_recovery",
+    ] {
+        assert!(
+            !ORACLE_SOURCE.contains(forbidden),
+            "primitive recovery oracle cannot import production codec {forbidden}"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn legacy_v1_reopen_does_not_backfill_and_first_new_durability_publishes_v2() {
     let directory = TestDirectory::new("legacy-v1-retry");
     let admission = support::no_change_admission();
@@ -262,8 +421,8 @@ fn legacy_v1_reopen_does_not_backfill_and_first_new_durability_publishes_v2() {
 
     let registry_name = match registry_commit.registry_slot() {
         0 => REGISTRY_SLOT_0_FILE_NAME,
-        1 => och_store::REGISTRY_SLOT_1_FILE_NAME,
-        2 => och_store::REGISTRY_SLOT_2_FILE_NAME,
+        1 => REGISTRY_SLOT_1_FILE_NAME,
+        2 => REGISTRY_SLOT_2_FILE_NAME,
         _ => panic!("validated registry slot"),
     };
     let registry_bytes =
@@ -415,8 +574,8 @@ fn one_replay_retry_and_manifest_v2_match_the_primitive_oracle_exactly() {
 
     let registry_name = match commit.registry_slot() {
         0 => REGISTRY_SLOT_0_FILE_NAME,
-        1 => och_store::REGISTRY_SLOT_1_FILE_NAME,
-        2 => och_store::REGISTRY_SLOT_2_FILE_NAME,
+        1 => REGISTRY_SLOT_1_FILE_NAME,
+        2 => REGISTRY_SLOT_2_FILE_NAME,
         _ => panic!("validated registry slot"),
     };
     let registry_bytes =

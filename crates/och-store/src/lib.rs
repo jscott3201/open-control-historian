@@ -16,6 +16,7 @@ mod decoded;
 mod error;
 mod generation;
 mod manifest;
+mod recovery;
 mod retry;
 
 #[cfg(test)]
@@ -46,10 +47,15 @@ pub use manifest::{
     MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME, MANIFEST_STAGING_FILE_NAME,
     MAX_PERSISTED_REGISTRY_REVISIONS, MAX_PERSISTED_REGISTRY_SERIES, MAX_REGISTRY_SNAPSHOT_BYTES,
     ManifestCommit, ManifestIoEvidence, ManifestIoOperation, ManifestStore, ManifestStoreConfig,
-    ManifestStoreError, ManifestStoreInspection, REGISTRY_SLOT_0_FILE_NAME,
+    ManifestStoreError, ManifestStoreInspection, ManifestStoreOpenError, REGISTRY_SLOT_0_FILE_NAME,
     REGISTRY_SLOT_1_FILE_NAME, REGISTRY_SLOT_2_FILE_NAME, REGISTRY_STAGING_FILE_NAME,
     RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME, RETRY_SLOT_2_FILE_NAME,
     RETRY_STAGING_FILE_NAME, RegistryPersistenceOptions, STORE_LOCK_FILE_NAME,
+};
+pub use recovery::{
+    RECOVERY_SLOT_0_FILE_NAME, RECOVERY_SLOT_1_FILE_NAME, RECOVERY_SLOT_2_FILE_NAME,
+    RECOVERY_STAGING_FILE_NAME, RECOVERY_STATE_V1_LEN, RecoveryAction, RecoveryClassification,
+    RecoveryReport,
 };
 pub use retry::{
     MAX_PERSISTED_RETRY_ENTRIES, MAX_RETRY_STATE_BYTES, PendingRetryOutcome, RetryGuardEntry,

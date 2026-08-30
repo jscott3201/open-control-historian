@@ -11,7 +11,7 @@ use och_store::{
     ActiveJournalError, ActiveJournalInspection, ActiveJournalLimits, ActiveJournalOpenMode,
     GenerationInventory, ManifestCommit, ManifestStore, ManifestStoreConfig, ManifestStoreError,
     ManifestStoreInspection, PendingRetryOutcome, PreparedAdmissionV1, RecoveredAdmissionV1,
-    RegistryPersistenceOptions, RetryPersistenceOptions, RetryStateSnapshot,
+    RecoveryReport, RegistryPersistenceOptions, RetryPersistenceOptions, RetryStateSnapshot,
 };
 use std::fmt;
 use std::path::PathBuf;
@@ -344,6 +344,7 @@ pub struct RuntimeInspection {
     store: ActiveJournalInspection,
     committed: ManifestCommit,
     generations: GenerationInventory,
+    recovery: Option<RecoveryReport>,
     pending_count: usize,
     pending_bytes: usize,
     health: RuntimeHealth,
@@ -366,6 +367,12 @@ impl RuntimeInspection {
     #[must_use]
     pub const fn generations(self) -> GenerationInventory {
         self.generations
+    }
+
+    /// Returns the latest manifest-bound recovery report, when one exists.
+    #[must_use]
+    pub const fn recovery_report(self) -> Option<RecoveryReport> {
+        self.recovery
     }
 
     /// Returns commands retaining an outstanding slot.
@@ -457,6 +464,7 @@ impl InspectionShared {
             store: store.active(),
             committed: store.committed(),
             generations: store.generations(),
+            recovery: store.recovery_report(),
             pending_count,
             pending_bytes,
             health,
