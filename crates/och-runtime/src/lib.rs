@@ -1074,6 +1074,24 @@ mod tests {
             .expect("current-thread Tokio test harness should build")
     }
 
+    fn directory_bytes(directory: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut artifacts = fs::read_dir(directory)
+            .expect("read runtime store inventory")
+            .map(|entry| {
+                let entry = entry.expect("read runtime store artifact");
+                (
+                    entry
+                        .file_name()
+                        .into_string()
+                        .expect("runtime store artifact name should be Unicode"),
+                    fs::read(entry.path()).expect("read runtime store artifact bytes"),
+                )
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| left.0.cmp(&right.0));
+        artifacts
+    }
+
     fn durable_options(
         directory: PathBuf,
         store: StoreId,
@@ -4755,25 +4773,68 @@ mod tests {
     }
 
     #[test]
-    fn unknown_historical_declaration_is_an_intentional_terminal_authority_refusal() {
+    #[allow(clippy::too_many_lines)]
+    fn unknown_historical_declaration_at_rotation_boundary_refuses_without_mutation() {
         harness().block_on(async {
             let directory = test_directory();
             let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
                 .expect("historical-refusal byte limits");
-            let runtime = complete_bounded(open_durable_test(durable_options(
-                directory.clone(),
-                store_id(1),
+            let first_command = IngressCommand::with_policy(
+                command("rotation-boundary-prior", 239, 239).into_admission(),
+                AdmissionPriority::Normal,
+                BarrierDemand::Immediate,
+            );
+            let first_frame_len = och_store::admission_frame_len_v1(first_command.admission())
+                .expect("prior admission frame length");
+            let active_bytes = u64::try_from(och_store::JOURNAL_V1_HEADER_LEN)
+                .expect("journal header length should fit")
+                .checked_add(u64::try_from(first_frame_len).expect("frame length should fit"))
+                .and_then(|length| length.checked_add(1))
+                .expect("test active byte limit should fit");
+            let options_for = |mode| {
+                StoreOptions::new(
+                    directory.clone(),
+                    store_id(1),
+                    mode,
+                    och_store::ActiveJournalLimits::new(
+                        och_store::MAX_ADMISSION_PAYLOAD_V1,
+                        active_bytes,
+                        8,
+                    )
+                    .expect("historical-refusal journal limits"),
+                    bytes,
+                    group_policy(
+                        std::time::Duration::from_secs(60),
+                        MAX_OUTSTANDING_COMMANDS,
+                        64 * 1_024 * 1_024,
+                    ),
+                    och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(16, 64))
+                        .expect("historical-refusal registry options"),
+                    och_store::RetryPersistenceOptions::new(2, 2)
+                        .expect("historical-refusal retry options"),
+                )
+                .expect("historical-refusal store options")
+            };
+            let runtime = complete_bounded(open_durable_test(options_for(
                 och_store::ActiveJournalOpenMode::CreateNew,
-                bytes,
-                group_policy(
-                    std::time::Duration::from_secs(60),
-                    MAX_OUTSTANDING_COMMANDS,
-                    64 * 1_024 * 1_024,
-                ),
             )))
             .await
             .expect("historical-refusal runtime");
+            let first = runtime
+                .ingress()
+                .try_submit(first_command)
+                .expect("prior admission reaches the sole writer")
+                .into_receipt();
+            assert!(matches!(
+                complete_bounded(first.wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
             let before = runtime.inspection();
+            assert_eq!(before.store().active_records(), 1);
+            assert_eq!(before.generations().active_generation(), 1);
+            assert_eq!(before.generations().sealed_count(), 0);
+            assert_eq!(before.store().active_bytes() + 1, active_bytes);
+            let artifacts_before = directory_bytes(&directory);
             let (envelope, retry) = model_parts(
                 series_id(240),
                 producer_id(241),
@@ -4781,13 +4842,18 @@ mod tests {
                 240,
                 240,
             );
+            let unknown = canonical_admission(store_id(1), envelope, retry);
+            let unknown_frame_len = och_store::admission_frame_len_v1(&unknown)
+                .expect("unknown admission frame length");
+            assert!(
+                before.store().active_bytes()
+                    + u64::try_from(unknown_frame_len).expect("unknown frame length should fit")
+                    > active_bytes,
+                "the refused command must reach the automatic fit-rotation boundary"
+            );
             let receipt = runtime
                 .ingress()
-                .try_submit(IngressCommand::new(canonical_admission(
-                    store_id(1),
-                    envelope,
-                    retry,
-                )))
+                .try_submit(IngressCommand::new(unknown))
                 .expect("bounded admission reaches sole registry authority")
                 .into_receipt();
             assert_eq!(
@@ -4801,29 +4867,25 @@ mod tests {
             let after = runtime.inspection();
             assert_eq!(after.store(), before.store());
             assert_eq!(after.committed(), before.committed());
+            assert_eq!(after.generations(), before.generations());
             assert_eq!(after.health(), RuntimeHealth::Faulted);
             assert_eq!(after.pending_count(), 0);
             assert_eq!(after.pending_bytes(), 0);
+            assert_eq!(directory_bytes(&directory), artifacts_before);
             assert_eq!(
                 complete_bounded(runtime.shutdown()).await,
                 Err(ShutdownError::WriterExitedBeforeShutdown)
             );
 
-            let reopened = complete_bounded(open_durable_test(durable_options(
-                directory.clone(),
-                store_id(1),
+            let reopened = complete_bounded(HistorianRuntime::open(options_for(
                 och_store::ActiveJournalOpenMode::OpenExisting,
-                bytes,
-                group_policy(
-                    std::time::Duration::from_millis(2),
-                    MAX_OUTSTANDING_COMMANDS,
-                    64 * 1_024 * 1_024,
-                ),
             )))
             .await
             .expect("terminal refusal leaves committed store reopenable");
-            assert!(reopened.recovered_records().is_empty());
+            assert_eq!(reopened.recovered_records().len(), 1);
             assert_eq!(reopened.inspection().committed(), before.committed());
+            assert_eq!(reopened.inspection().generations(), before.generations());
+            assert_eq!(reopened.inspection().generations().sealed_count(), 0);
             complete_bounded(reopened.shutdown())
                 .await
                 .expect("shutdown reopened store");

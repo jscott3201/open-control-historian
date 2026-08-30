@@ -586,6 +586,31 @@ pub(crate) fn run_store_worker(
                     return;
                 }
                 let frame_len = prepared.frame_len();
+                let sequence = match store.next_append_sequence() {
+                    Ok(sequence) => sequence,
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                        fail_worker(&ingress, &inspection);
+                        return;
+                    }
+                };
+                let frame = match (*prepared).into_frame(sequence) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let _ = response.send(Err(ManifestStoreError::Active(
+                            ActiveJournalError::Journal(error.error()),
+                        )));
+                        fail_worker(&ingress, &inspection);
+                        return;
+                    }
+                };
+                if let Err(error) =
+                    store.preflight_historical_declaration(frame.admission().declaration())
+                {
+                    let _ = response.send(Err(error));
+                    fail_worker(&ingress, &inspection);
+                    return;
+                }
                 let age_rotation = store.inspection().active().active_records() > 0
                     && generation_opened_at.elapsed() >= options.group_commit.rotation_age;
                 let fit_rotation = match store.requires_rotation(frame_len) {
@@ -618,24 +643,6 @@ pub(crate) fn run_store_worker(
                         }
                     }
                 }
-                let sequence = match store.next_append_sequence() {
-                    Ok(sequence) => sequence,
-                    Err(error) => {
-                        let _ = response.send(Err(error));
-                        fail_worker(&ingress, &inspection);
-                        return;
-                    }
-                };
-                let frame = match (*prepared).into_frame(sequence) {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        let _ = response.send(Err(ManifestStoreError::Active(
-                            ActiveJournalError::Journal(error.error()),
-                        )));
-                        fail_worker(&ingress, &inspection);
-                        return;
-                    }
-                };
                 let end_offset = match store.append(&frame) {
                     Ok(end_offset) => end_offset,
                     Err(error) => {

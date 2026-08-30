@@ -855,14 +855,16 @@ impl ManifestStore {
             .map_err(ManifestStoreError::Active)
     }
 
-    /// Validates historical declaration authority and appends one frame.
+    /// Validates one declaration against the exact retained historical authority.
     ///
     /// # Errors
     ///
-    /// Unknown or altered historical declarations refuse before journal bytes.
-    pub fn append(&mut self, frame: &PreparedFrameV1) -> Result<u64, ManifestStoreError> {
+    /// Refuses a terminal store or an unknown or altered historical declaration.
+    pub fn preflight_historical_declaration(
+        &self,
+        declaration: &SeriesDeclaration,
+    ) -> Result<(), ManifestStoreError> {
         self.ensure_usable()?;
-        let declaration = frame.admission().declaration();
         if self
             .registry
             .resolve(declaration.series_id(), declaration.revision())
@@ -870,6 +872,16 @@ impl ManifestStore {
         {
             return Err(ManifestStoreError::HistoricalDeclarationMismatch);
         }
+        Ok(())
+    }
+
+    /// Validates historical declaration authority and appends one frame.
+    ///
+    /// # Errors
+    ///
+    /// Unknown or altered historical declarations refuse before journal bytes.
+    pub fn append(&mut self, frame: &PreparedFrameV1) -> Result<u64, ManifestStoreError> {
+        self.preflight_historical_declaration(frame.admission().declaration())?;
         self.journal
             .append(frame)
             .map_err(ManifestStoreError::Active)
@@ -3580,6 +3592,36 @@ mod tests {
             .collect::<Vec<_>>();
         artifacts.sort_by(|left, right| left.0.cmp(&right.0));
         artifacts
+    }
+
+    #[test]
+    fn historical_declaration_preflight_and_append_share_exact_refusal() {
+        let directory = test_directory(23);
+        let mut store = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create historical-preflight fixture");
+        let admission = test_support::no_change_admission();
+        let sequence = store.next_append_sequence().expect("fixture sequence");
+        let frame = PreparedAdmissionV1::new(admission)
+            .expect("fixture admission")
+            .into_frame(sequence)
+            .expect("fixture frame");
+        let before = directory_bytes(&directory);
+
+        assert_eq!(
+            store.preflight_historical_declaration(frame.admission().declaration()),
+            Err(ManifestStoreError::HistoricalDeclarationMismatch)
+        );
+        assert_eq!(
+            store.append(&frame),
+            Err(ManifestStoreError::HistoricalDeclarationMismatch)
+        );
+        assert_eq!(directory_bytes(&directory), before);
+
+        drop(store);
+        fs::remove_dir_all(directory).expect("remove historical-preflight fixture");
     }
 
     fn rewrite_catalog_entry_registry_generation(
