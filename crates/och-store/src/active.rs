@@ -1254,6 +1254,11 @@ fn scan_journal(
             }
             Err(_) => return Err(ActiveJournalError::InvalidLayout),
         };
+        // The zero floor has no positive AppendSequenceV1 sentinel, so enforce
+        // its exact first successor before suffix evidence can be discarded.
+        if previous.is_none() && decoded.append_sequence() != 1 {
+            return Err(ActiveJournalError::InvalidLayout);
+        }
         if decoded.store_id() != identity.store_id
             || decoded.declaration().store_id() != identity.store_id
         {

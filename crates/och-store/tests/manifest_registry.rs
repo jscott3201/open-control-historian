@@ -10,16 +10,16 @@ use och_core::{
     SeriesRegistry, SeriesRegistryLimits, SeriesRegistrySnapshot, Timestamp, ValueFamily,
 };
 use och_store::{
-    ACTIVE_JOURNAL_FILE_NAME, ActiveJournal, ActiveJournalConfig, ActiveJournalLimits,
-    ActiveJournalOpenMode, AppendSequenceV1, JOURNAL_V1_HEADER_LEN, JournalHeaderV1,
-    JournalHeaderV2, MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME,
+    ACTIVE_JOURNAL_FILE_NAME, ActiveJournal, ActiveJournalConfig, ActiveJournalError,
+    ActiveJournalLimits, ActiveJournalOpenMode, AppendSequenceV1, JOURNAL_V1_HEADER_LEN,
+    JournalHeaderV1, JournalHeaderV2, MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME,
     MANIFEST_STAGING_FILE_NAME, MAX_ADMISSION_PAYLOAD_V1, ManifestStore, ManifestStoreConfig,
     ManifestStoreError, PendingRetryOutcome, PreparedAdmissionV1, RECOVERY_SLOT_0_FILE_NAME,
-    RECOVERY_SLOT_1_FILE_NAME, RECOVERY_SLOT_2_FILE_NAME, REGISTRY_SLOT_0_FILE_NAME,
-    REGISTRY_SLOT_1_FILE_NAME, REGISTRY_SLOT_2_FILE_NAME, REGISTRY_STAGING_FILE_NAME,
-    RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME, RETRY_SLOT_2_FILE_NAME, RecoveryAction,
-    RecoveryClassification, RegistryPersistenceOptions, RetryPersistenceOptions,
-    STORE_LOCK_FILE_NAME,
+    RECOVERY_SLOT_1_FILE_NAME, RECOVERY_SLOT_2_FILE_NAME, RECOVERY_STAGING_FILE_NAME,
+    REGISTRY_SLOT_0_FILE_NAME, REGISTRY_SLOT_1_FILE_NAME, REGISTRY_SLOT_2_FILE_NAME,
+    REGISTRY_STAGING_FILE_NAME, RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME,
+    RETRY_SLOT_2_FILE_NAME, RecoveryAction, RecoveryClassification, RegistryPersistenceOptions,
+    RetryPersistenceOptions, STORE_LOCK_FILE_NAME,
 };
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -163,6 +163,46 @@ fn exact_file_inventory(directory: &Path) -> Vec<(String, Vec<u8>)> {
         .collect::<Vec<_>>();
     inventory.sort_by(|first, second| first.0.cmp(&second.0));
     inventory
+}
+
+fn install_exact_legacy_v1_pair(
+    directory: &TestDirectory,
+    older: och_store::ManifestCommit,
+    current: och_store::ManifestCommit,
+    registry_bytes: &[u8],
+) {
+    for (name, commit) in [
+        (MANIFEST_SLOT_1_FILE_NAME, older),
+        (MANIFEST_SLOT_0_FILE_NAME, current),
+    ] {
+        assert_eq!(commit.durable_cutoff().journal().generation(), 1);
+        assert_eq!(commit.sequence_floor(), 0);
+        fs::write(
+            directory.path().join(name),
+            manifest_oracle::manifest_v1(
+                support::uuid_bytes(1),
+                commit.manifest_generation(),
+                commit.durable_cutoff().checkpoint_generation(),
+                commit.durable_cutoff().append_sequence(),
+                commit.durable_cutoff().end_offset(),
+                commit.registry_slot(),
+                commit.registry_generation(),
+                registry_bytes,
+            ),
+        )
+        .expect("write exact legacy manifest");
+    }
+    for name in [
+        RETRY_SLOT_0_FILE_NAME,
+        RETRY_SLOT_1_FILE_NAME,
+        RETRY_SLOT_2_FILE_NAME,
+    ] {
+        match fs::remove_file(directory.path().join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove retry fixture: {error}"),
+        }
+    }
 }
 
 #[test]
@@ -360,9 +400,11 @@ fn recovery_state_v1_and_manifest_v4_match_independent_primitive_oracles() {
             committed.registry_slot(),
             committed.registry_generation(),
             &registry_bytes,
-            retry.slot(),
-            retry.generation(),
-            &retry_bytes,
+            Some(manifest_oracle::RetryReference {
+                slot: retry.slot(),
+                generation: retry.generation(),
+                bytes: &retry_bytes,
+            }),
             committed.sequence_floor(),
             None,
             manifest_oracle::RecoveryReference {
@@ -427,48 +469,7 @@ fn legacy_v1_reopen_does_not_backfill_and_first_new_durability_publishes_v2() {
     };
     let registry_bytes =
         fs::read(directory.path().join(registry_name)).expect("read fixture registry bytes");
-    let store_bytes = support::uuid_bytes(1);
-    let legacy_older = manifest_oracle::manifest_v1(
-        store_bytes,
-        2,
-        registry_commit.durable_cutoff().checkpoint_generation(),
-        0,
-        JOURNAL_V1_HEADER_LEN as u64,
-        registry_commit.registry_slot(),
-        registry_commit.registry_generation(),
-        &registry_bytes,
-    );
-    let legacy_current = manifest_oracle::manifest_v1(
-        store_bytes,
-        3,
-        durable.durable_cutoff().checkpoint_generation(),
-        1,
-        end_offset,
-        durable.registry_slot(),
-        durable.registry_generation(),
-        &registry_bytes,
-    );
-    fs::write(
-        directory.path().join(MANIFEST_SLOT_1_FILE_NAME),
-        legacy_older,
-    )
-    .expect("write older legacy manifest");
-    fs::write(
-        directory.path().join(MANIFEST_SLOT_0_FILE_NAME),
-        legacy_current,
-    )
-    .expect("write current legacy manifest");
-    for name in [
-        RETRY_SLOT_0_FILE_NAME,
-        RETRY_SLOT_1_FILE_NAME,
-        RETRY_SLOT_2_FILE_NAME,
-    ] {
-        match fs::remove_file(directory.path().join(name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => panic!("remove retry fixture: {error}"),
-        }
-    }
+    install_exact_legacy_v1_pair(&directory, registry_commit, durable, &registry_bytes);
 
     let mut legacy = ManifestStore::open(manifest_config(
         &directory,
@@ -504,6 +505,239 @@ fn legacy_v1_reopen_does_not_backfill_and_first_new_durability_publishes_v2() {
     ))
     .expect("mixed V1/V2 manifest pair reopens");
     assert_eq!(reopened.retry_state_snapshot(), restored);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn legacy_v1_suffix_recovery_commits_retry_absent_v4_then_first_append_establishes_retry() {
+    let directory = TestDirectory::new("legacy-v1-recovery");
+    let admission = support::no_change_admission();
+    let declaration = admission.declaration();
+    let first_frame = frame(admission.clone(), 1);
+    let mut store = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::CreateNew,
+        registry_options(),
+    ))
+    .expect("create legacy recovery fixture");
+    let (_, registry_commit) = store
+        .register(
+            declaration.series_id(),
+            declaration.binding().clone(),
+            declaration.payload().clone(),
+            declaration.evidence().clone(),
+        )
+        .expect("register legacy recovery declaration");
+    let first_end = store
+        .append(&first_frame)
+        .expect("append committed legacy root");
+    let (durable, _) = store
+        .sync_pending(&[PendingRetryOutcome::new(
+            first_frame.admission().retry().clone(),
+            1,
+            first_end,
+        )])
+        .expect("commit legacy root fixture");
+    drop(store);
+
+    let registry_names = [
+        REGISTRY_SLOT_0_FILE_NAME,
+        REGISTRY_SLOT_1_FILE_NAME,
+        REGISTRY_SLOT_2_FILE_NAME,
+    ];
+    let registry_bytes = fs::read(
+        directory
+            .path()
+            .join(registry_names[usize::from(durable.registry_slot())]),
+    )
+    .expect("read legacy recovery registry");
+    install_exact_legacy_v1_pair(&directory, registry_commit, durable, &registry_bytes);
+
+    let suffix = frame(
+        support::no_change_admission_with_retry_key("legacy-v1-recovery-suffix"),
+        2,
+    );
+    let mut journal = OpenOptions::new()
+        .append(true)
+        .open(directory.path().join(ACTIVE_JOURNAL_FILE_NAME))
+        .expect("open legacy journal suffix");
+    journal
+        .write_all(suffix.bytes())
+        .expect("write exact uncommitted suffix");
+    journal.sync_all().expect("sync exact uncommitted suffix");
+    drop(journal);
+
+    let recovered = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::OpenExisting,
+        registry_options(),
+    ))
+    .expect("legacy V1 suffix recovers to retry-absent V4");
+    let recovery_inspection = recovered.inspection();
+    let recovery_commit = recovery_inspection.committed();
+    let report = recovery_inspection
+        .recovery_report()
+        .expect("legacy suffix recovery report");
+    assert_eq!(recovery_commit.manifest_generation(), 4);
+    assert_eq!(recovery_commit.retry_state(), None);
+    assert!(recovered.retry_state_snapshot().replay().is_empty());
+    assert!(recovered.retry_state_snapshot().guard().is_empty());
+    assert_eq!(recovered.recovered_records().len(), 1);
+    assert_eq!(
+        report.removed_bytes(),
+        u64::try_from(suffix.bytes().len()).expect("bounded suffix length fits u64")
+    );
+    assert!(!directory.path().join(MANIFEST_STAGING_FILE_NAME).exists());
+    assert!(!directory.path().join(RECOVERY_STAGING_FILE_NAME).exists());
+
+    let recovery_names = [
+        RECOVERY_SLOT_0_FILE_NAME,
+        RECOVERY_SLOT_1_FILE_NAME,
+        RECOVERY_SLOT_2_FILE_NAME,
+    ];
+    let (recovery_slot, recovery_bytes) = recovery_names
+        .iter()
+        .enumerate()
+        .find_map(|(slot, name)| {
+            fs::read(directory.path().join(name)).ok().map(|bytes| {
+                (
+                    u8::try_from(slot).expect("three recovery slots fit u8"),
+                    bytes,
+                )
+            })
+        })
+        .expect("legacy recovery state slot");
+    let recovery_generation = u64::from_be_bytes(
+        recovery_bytes[28..36]
+            .try_into()
+            .expect("legacy recovery generation"),
+    );
+    let manifest_bytes = [MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME]
+        .iter()
+        .find_map(|name| {
+            let bytes = fs::read(directory.path().join(name)).ok()?;
+            (u64::from_be_bytes(bytes[28..36].try_into().ok()?)
+                == recovery_commit.manifest_generation())
+            .then_some(bytes)
+        })
+        .expect("read retry-absent Manifest V4");
+    assert_eq!(
+        manifest_bytes,
+        manifest_oracle::manifest_v4(
+            support::uuid_bytes(1),
+            recovery_commit.manifest_generation(),
+            recovery_commit.durable_cutoff().journal().generation(),
+            recovery_commit.durable_cutoff().checkpoint_generation(),
+            recovery_commit.durable_cutoff().append_sequence(),
+            recovery_commit.durable_cutoff().end_offset(),
+            recovery_commit.registry_slot(),
+            recovery_commit.registry_generation(),
+            &registry_bytes,
+            None,
+            recovery_commit.sequence_floor(),
+            None,
+            manifest_oracle::RecoveryReference {
+                slot: recovery_slot,
+                generation: recovery_generation,
+            },
+            &recovery_bytes,
+        )
+    );
+    drop(recovered);
+
+    let mut reopened = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::OpenExisting,
+        registry_options(),
+    ))
+    .expect("retry-absent V4 reopens idempotently");
+    assert_eq!(reopened.inspection(), recovery_inspection);
+    assert!(!directory.path().join(MANIFEST_STAGING_FILE_NAME).exists());
+    assert!(!directory.path().join(RECOVERY_STAGING_FILE_NAME).exists());
+
+    let second_end = reopened
+        .append(&suffix)
+        .expect("removed suffix remains the first new append");
+    let (transition, retry) = reopened
+        .sync_pending(&[PendingRetryOutcome::new(
+            suffix.admission().retry().clone(),
+            2,
+            second_end,
+        )])
+        .expect("first post-recovery durability establishes retry");
+    assert_eq!(
+        transition
+            .retry_state()
+            .map(och_store::RetryStateReference::generation),
+        Some(1)
+    );
+    assert_eq!(retry.replay().len(), 1);
+    assert_eq!(retry.replay()[0].append_sequence(), 2);
+    assert_eq!(reopened.inspection().recovery_report(), Some(report));
+    drop(reopened);
+
+    let reopened = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::OpenExisting,
+        registry_options(),
+    ))
+    .expect("post-legacy-recovery retry transition reopens");
+    assert_eq!(reopened.retry_state_snapshot(), retry);
+    assert_eq!(reopened.inspection().recovery_report(), Some(report));
+}
+
+#[test]
+fn generation_one_header_root_refuses_first_suffix_sequence_two_without_mutation() {
+    let directory = TestDirectory::new("first-sequence-two");
+    let admission = support::no_change_admission();
+    let declaration = admission.declaration();
+    let mut store = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::CreateNew,
+        registry_options(),
+    ))
+    .expect("create first-sequence fixture");
+    store
+        .register(
+            declaration.series_id(),
+            declaration.binding().clone(),
+            declaration.payload().clone(),
+            declaration.evidence().clone(),
+        )
+        .expect("register first-sequence fixture");
+    assert_eq!(
+        store
+            .inspection()
+            .committed()
+            .durable_cutoff()
+            .append_sequence(),
+        0
+    );
+    drop(store);
+
+    let invalid_first = frame(admission, 2);
+    let mut journal = OpenOptions::new()
+        .append(true)
+        .open(directory.path().join(ACTIVE_JOURNAL_FILE_NAME))
+        .expect("open first-sequence journal");
+    journal
+        .write_all(invalid_first.bytes())
+        .expect("write first frame numbered two");
+    journal.sync_all().expect("sync first frame numbered two");
+    drop(journal);
+    let before = exact_file_inventory(directory.path());
+
+    assert!(matches!(
+        ManifestStore::open(manifest_config(
+            &directory,
+            ActiveJournalOpenMode::OpenExisting,
+            registry_options(),
+        )),
+        Err(ManifestStoreError::Active(
+            ActiveJournalError::InvalidLayout
+        ))
+    ));
+    assert_eq!(exact_file_inventory(directory.path()), before);
 }
 
 #[test]

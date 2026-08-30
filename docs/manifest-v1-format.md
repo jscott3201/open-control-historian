@@ -112,6 +112,9 @@ Manifest V1 requires bytes 92..124 to be zero. Manifest V2 assigns them as:
 Manifest V1 also uses the checksum at bytes 124..128. Its original bytes and
 decoder remain unchanged. V2 requires the referenced retry artifact to match
 slot, generation, length, checksum, `StoreId`, and configured capacities exactly.
+V3 has the same mandatory retry body. Manifest V4 normally does too, but the
+recovery-only successor of a legacy V1 root may retain bytes 92..124 as canonical
+all-zero absence. Partially populated retry bytes are never absence and refuse.
 
 Manifest V3 preserves bytes 0..124 with V2 retry fields and assigns the remaining
 36 bytes as follows:
@@ -153,6 +156,14 @@ binds the report whose source generation and cutoff equal the older manifest.
 Later append, lifecycle, retry, and rotation manifests remain V4 and preserve the
 reference until a later proven recovery supersedes it.
 
+When that older root is Manifest V1, recovery preserves its absent retry
+reference and empty in-memory retry tiers; it does not synthesize an empty retry
+artifact or backfill outcomes. The retained V1/V4 pair proves the recovery-only
+transition. Registry-only and rotation commits may continue to preserve that
+absence. The first new durable append publishes retry generation one while
+preserving the recovery reference. Any V4 with a retry reference follows the
+unchanged strict V2/V3 reference and retry-comparison laws.
+
 Genesis has manifest, registry, and retry generation one and publishes an empty
 Retry State V1 snapshot before Manifest V2. With two manifest slots, the current
 candidate is the greater of exactly consecutive generations. A lone manifest is
@@ -163,14 +174,17 @@ commits, or advance that reference by exactly one generation to a different
 slot. V2 cannot regress to V1. V3 requires exact successor generation/catalog
 progression and cannot regress to V1/V2. Recovery references may transition
 `None -> generation 1`, remain exact, or advance by exactly one into a different
-slot; they never disappear. The selected cutoff must equal the
+slot; they never disappear. An absent retry may remain absent only through the
+legacy V1 recovery path and its preserving successors; `None -> retry generation
+1` remains the only establishment transition. The selected cutoff must equal the
 active checkpoint exactly.
 
 A legacy valid Manifest V1 remains openable with empty in-memory retry tiers and
 no retry reference. Open does not scan or backfill its retained Journal V1
 history. Registry-only commits may remain V1. The first newly durable append
-publishes retry generation one and Manifest V2; after that transition every
-manifest preserves a retry reference.
+publishes retry generation one and Manifest V2, or Manifest V4 when a recovery
+reference must also be preserved; after that transition every manifest preserves
+a retry reference.
 
 ## Registry snapshot
 
@@ -285,7 +299,10 @@ the permissive premanifest convergence policy. The committed prefix and exact
 checkpoint slot must exist. A fully valid suffix, a torn final suffix, or one
 malformed final candidate may be classified only after the root boundary;
 committed/interior corruption and a malformed candidate followed by later bytes
-refuse unchanged. Accepted recovery truncates and synchronizes exactly to the
+refuse unchanged. At a zero sequence floor, the first complete frame must be
+numbered exactly one before it can be classified as committed or removable;
+higher-generation floors retain the exact existing successor rule. Accepted
+recovery truncates and synchronizes exactly to the
 manifest end, clears only a strictly newer mechanical checkpoint slot when one
 exists, publishes Recovery State V1, and publishes Manifest V4 last. It never
 adopts suffix records or checkpoints forward.

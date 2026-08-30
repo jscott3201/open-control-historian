@@ -3619,13 +3619,17 @@ fn decode_manifest(bytes: &[u8], store_id: StoreId) -> Result<ManifestRecord, Ma
     {
         return Err(ManifestStoreError::InvalidManifest);
     }
+    let retry_body_absent = bytes[92..124].iter().all(|byte| *byte == 0);
     let retry = match version {
         MANIFEST_V1_VERSION => {
-            if bytes[92..124].iter().any(|byte| *byte != 0) {
+            if !retry_body_absent {
                 return Err(ManifestStoreError::InvalidManifest);
             }
             None
         }
+        // Recovery cannot invent retry authority for a legacy V1 root. V4 owns
+        // the one checksummed all-zero absence encoding until new durability.
+        MANIFEST_V4_VERSION if retry_body_absent => None,
         MANIFEST_V2_VERSION | MANIFEST_V3_VERSION | MANIFEST_V4_VERSION => {
             if bytes[93..96].iter().any(|byte| *byte != 0)
                 || bytes[116..124].iter().any(|byte| *byte != 0)
@@ -6017,6 +6021,18 @@ mod tests {
         let mut checksum = canonical;
         checksum[159] ^= 1;
         assert!(decode_manifest(&checksum, store_id).is_err());
+
+        let retry_absent = ManifestRecord {
+            retry: None,
+            ..record
+        };
+        let retry_absent = encode_manifest(retry_absent);
+        assert_eq!(retry_absent.len(), MANIFEST_V3_LEN);
+        assert_eq!(
+            decode_manifest(&retry_absent, store_id),
+            Err(ManifestStoreError::InvalidManifest),
+            "Manifest V3 always retains retry authority"
+        );
     }
 
     #[test]
@@ -6077,6 +6093,28 @@ mod tests {
         let mut checksum = canonical;
         checksum[191] ^= 1;
         assert!(decode_manifest(&checksum, store_id).is_err());
+
+        let retry_absent_record = ManifestRecord {
+            retry: None,
+            ..record
+        };
+        let retry_absent = encode_manifest(retry_absent_record);
+        assert!(retry_absent[92..124].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            decode_manifest(&retry_absent, store_id),
+            Ok(retry_absent_record)
+        );
+        for offset in [92_usize, 93, 96, 104, 112, 116] {
+            let mut partial = retry_absent.clone();
+            partial[offset] = 1;
+            let checksum = crc32c(&partial[..188]);
+            partial[188..192].copy_from_slice(&checksum.to_be_bytes());
+            assert_eq!(
+                decode_manifest(&partial, store_id),
+                Err(ManifestStoreError::InvalidManifest),
+                "partially populated optional V4 retry body at {offset} must refuse"
+            );
+        }
     }
 
     #[test]

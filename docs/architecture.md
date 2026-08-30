@@ -140,10 +140,13 @@ lifecycle replay, and requires exact snapshot re-encoding. The selected manifest
 cutoff must equal the mechanical checkpoint, and every recovered declaration
 must resolve exactly from retained history. A nonempty premanifest store requires
 an explicit matching snapshot; exact header-only V1/V2 stores may bootstrap
-empty. Manifest V2/V3/V4 restores only its referenced canonical retry snapshot. A
-legacy Manifest V1 restores empty retry tiers without scanning or backfilling
-retained Journal V1 records; its first new durable append establishes V2. Decoded
-evidence never authorizes registry or retry state, and latest restarts empty.
+empty. Manifest V2/V3 and V4 with a retry reference restore only that referenced
+canonical snapshot. A legacy Manifest V1 restores empty retry tiers without
+scanning or backfilling retained Journal V1 records. Its recovery-only V4
+successor canonically preserves the all-zero absent retry body; the first new
+durable append establishes retry generation one in V2 or report-preserving V4.
+Decoded evidence never authorizes registry or retry state, and latest restarts
+empty.
 Normal open validates bounded catalog bytes and sealed length/header metadata,
 not every sealed payload byte. A narrow exact-intent path converges only to the
 prior root before Manifest V3 or the new root after it; missing or mismatched
@@ -161,6 +164,9 @@ metadata-only successor at an equal active cutoff.
 Only after registry, retry, catalog/seal metadata, inventory, active
 identity/header/checkpoint/cutoff, retained declarations, and the narrow rotation
 law validate does root-scoped active scan expose a strictly post-cutoff suffix.
+At sequence floor zero its first complete frame must be numbered one; normal
+higher-generation floors retain exact successor numbering. A first frame numbered
+two refuses unchanged rather than becoming removable suffix evidence.
 Accepted recovery synchronizes truncation without adoption, publishes fixed
 96-byte Recovery State V1, then commits Manifest V4. Later metadata and rotation
 commits preserve that report reference. Interrupted precommit evidence refuses;

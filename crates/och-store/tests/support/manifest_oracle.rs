@@ -28,6 +28,12 @@ pub struct RecoveryReference {
     pub generation: u64,
 }
 
+pub struct RetryReference<'a> {
+    pub slot: u8,
+    pub generation: u64,
+    pub bytes: &'a [u8],
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn recovery_state_v1(
     store: [u8; 16],
@@ -71,9 +77,7 @@ pub fn manifest_v4(
     registry_slot: u8,
     registry_generation: u64,
     registry_bytes: &[u8],
-    retry_slot: u8,
-    retry_generation: u64,
-    retry_bytes: &[u8],
+    retry: Option<RetryReference<'_>>,
     sequence_floor: u64,
     catalog: Option<CatalogReference>,
     recovery: RecoveryReference,
@@ -93,10 +97,12 @@ pub fn manifest_v4(
     bytes[72..80].copy_from_slice(&registry_generation.to_be_bytes());
     bytes[80..88].copy_from_slice(&(registry_bytes.len() as u64).to_be_bytes());
     bytes[88..92].copy_from_slice(&crc32c(registry_bytes).to_be_bytes());
-    bytes[92] = retry_slot;
-    bytes[96..104].copy_from_slice(&retry_generation.to_be_bytes());
-    bytes[104..112].copy_from_slice(&(retry_bytes.len() as u64).to_be_bytes());
-    bytes[112..116].copy_from_slice(&crc32c(retry_bytes).to_be_bytes());
+    if let Some(retry) = retry {
+        bytes[92] = retry.slot;
+        bytes[96..104].copy_from_slice(&retry.generation.to_be_bytes());
+        bytes[104..112].copy_from_slice(&(retry.bytes.len() as u64).to_be_bytes());
+        bytes[112..116].copy_from_slice(&crc32c(retry.bytes).to_be_bytes());
+    }
     if let Some(catalog) = catalog {
         bytes[124..132].copy_from_slice(&sequence_floor.to_be_bytes());
         bytes[132] = catalog.slot;

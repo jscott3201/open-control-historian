@@ -23,14 +23,20 @@ manifest cutoff read-only, removes and synchronizes only bytes strictly after
 that cutoff, and clears only a strictly newer mechanical checkpoint slot. It
 does not adopt valid suffix frames or checkpoint forward. Committed/interior
 corruption and malformed suffix evidence followed by later bytes refuse
-unchanged.
+unchanged. Sequence floor zero requires the first complete frame to be numbered
+one before it can be classified as committed or removable; higher floors retain
+their strict successor rule.
 
 Recovery State V1 is exactly 96 bytes in three reusable slots. Its fixed fields
 are store/recovery/source-root/journal/checkpoint generations, exact cutoff,
 removed bytes, closed class/action tags, bounded operation count, reserved zeros,
 and CRC-32C. Manifest V4 is exactly 192 bytes and binds that artifact after the
 unchanged V2 retry and optional V3 catalog bodies. Exact V1/V2/V3 decoding and
-old-writer fail-closed behavior remain.
+old-writer fail-closed behavior remain. A recovery-only V1-to-V4 transition keeps
+the V4 retry body canonically all zero and the in-memory tiers empty. It never
+synthesizes retry state; the first later durable append establishes retry
+generation one in report-preserving V4. V2, V3, and populated V4 retry bodies
+remain strict.
 
 Publication is active truncate/sync, optional stale checkpoint clear/sync,
 recovery state publish, then Manifest V4 publish as the only commit point.
@@ -65,7 +71,9 @@ independent primitive-only oracle; valid and mechanically checkpointed suffix
 rollback; retry-authority refusal before mutation; missing/corrupt/unsupported
 equal-cutoff successors; receipt/replay preservation; report persistence through
 append and rotation; runtime `Healthy` forwarding; suffix synchronization fault
-points; and recovery-state/manifest publication fault points. Existing lock,
+points; recovery-state/manifest publication fault points; legacy V1 suffix
+recovery through exact retry-absent V4 bytes and later retry establishment; and
+byte-identical refusal of a generation-one first frame numbered two. Existing lock,
 rotation, retry, registry, child-process, latest-empty restart, no-false-commit,
 catalog-capacity, and sealed-open-bound regressions remain in the PR gate.
 
