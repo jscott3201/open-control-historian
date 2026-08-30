@@ -14,6 +14,7 @@ mod codec;
 mod decoded;
 mod error;
 mod manifest;
+mod retry;
 
 #[cfg(test)]
 #[path = "../tests/support/mod.rs"]
@@ -40,7 +41,13 @@ pub use manifest::{
     ManifestCommit, ManifestIoEvidence, ManifestIoOperation, ManifestStore, ManifestStoreConfig,
     ManifestStoreError, ManifestStoreInspection, REGISTRY_SLOT_0_FILE_NAME,
     REGISTRY_SLOT_1_FILE_NAME, REGISTRY_SLOT_2_FILE_NAME, REGISTRY_STAGING_FILE_NAME,
-    RegistryPersistenceOptions, STORE_LOCK_FILE_NAME,
+    RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME, RETRY_SLOT_2_FILE_NAME,
+    RETRY_STAGING_FILE_NAME, RegistryPersistenceOptions, STORE_LOCK_FILE_NAME,
+};
+pub use retry::{
+    MAX_PERSISTED_RETRY_ENTRIES, MAX_RETRY_STATE_BYTES, PendingRetryOutcome, RetryGuardEntry,
+    RetryOptionsError, RetryPersistenceOptions, RetryReplayOutcome, RetryStateMatch,
+    RetryStateReference, RetryStateSnapshot,
 };
 
 /// Journal V1 format version written in premanifest headers and every admission frame.

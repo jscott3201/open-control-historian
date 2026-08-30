@@ -969,7 +969,10 @@ fn encode_gap(encoder: &mut Encoder, gap: &Gap) {
     });
 }
 
-fn encode_retry(encoder: &mut Encoder, retry: &RetryQualification) -> Result<(), JournalV1Error> {
+pub(crate) fn encode_retry(
+    encoder: &mut Encoder,
+    retry: &RetryQualification,
+) -> Result<(), JournalV1Error> {
     encode_series_id(encoder, retry.series_id());
     encode_producer_id(encoder, retry.producer_id());
     encoder.string(retry.key().as_str())?;
@@ -1591,7 +1594,7 @@ fn decode_gap(cursor: &mut Cursor<'_>) -> Result<Gap, JournalV1Error> {
     Gap::new(epoch, start, end, reason).map_err(invalid_model)
 }
 
-fn decode_retry(cursor: &mut Cursor<'_>) -> Result<RetryQualification, JournalV1Error> {
+pub(crate) fn decode_retry(cursor: &mut Cursor<'_>) -> Result<RetryQualification, JournalV1Error> {
     Ok(RetryQualification::new(
         decode_series_id(cursor)?,
         decode_producer_id(cursor)?,

@@ -16,7 +16,9 @@ non-authorizing inspection evidence. M02-PR01b1 changes no core semantics either
 it makes that exact byte format the sole runtime active-journal path and adds
 mechanical durable cutoff evidence around it. M02-PR02a again leaves core
 unchanged while persisting the complete bounded `SeriesRegistry` snapshot and
-making one manifest the outer committed cutoff. All pre-existing exact value,
+making one manifest the outer committed cutoff. M02-PR02b also leaves core
+unchanged: `och-store` persists the exact core `RetryQualification` comparison
+inputs inside a bounded two-tier runtime persistence policy. All pre-existing exact value,
 time, quality, order, collection, gap/no-change, envelope, and retry semantics
 remain unchanged. The model is native
 Historian authority rather than a serialization of a Studio, Engine, transport,
@@ -25,7 +27,7 @@ reject or report unsupported unsigned, unavailable, or collection-mode extension
 instead of truncating them.
 
 The core model does not generate identities, normalize content, hash bytes,
-define a wire format, schedule work, retain retry state, persist itself, answer
+define a wire format, schedule work, select a retry horizon, persist itself, answer
 queries, or integrate a platform. `och-store` persists a snapshot only by replay
 through these public core semantics and exact comparison. MIT OR Apache-2.0
 remains the repository license.
@@ -215,14 +217,17 @@ history, mutate a registry, or be submitted to runtime.
 M02-PR01b1 places those frames in one fixed generation-one active journal paired
 with a two-slot mechanical checkpoint. M02-PR02a adds a stable store lock, a
 header-v2 compatibility fence in the unchanged 28-byte layout, two manifest
-slots, and three complete registry snapshot slots. Admission-frame bytes remain
+slots, and three complete registry snapshot slots. M02-PR02b adds Manifest V2
+within the same 128-byte slots and three reusable Retry State V1 slots.
+Admission-frame bytes remain
 Journal V1. The runtime computes the exact frame size
 without allocating, reserves count and bytes atomically, then allocates and
 encodes under that retained reservation. The sole blocking writer assigns append
 sequence and validates frame and declaration StoreId against the journal header.
 Durable order is append, volatile publication, journal sync, alternate checkpoint
-write, checkpoint sync, manifest publication naming that exact cutoff and the
-current registry snapshot, then receipt and reservation release. The checkpoint
+write, checkpoint sync, retry snapshot publication, Manifest V2 publication
+naming that exact cutoff and the current registry/retry snapshots, then one
+atomic runtime projection/receipt transition and waiter wake. The checkpoint
 retains only store and journal identity, slot generation, append sequence, end
 offset, and CRC. The
 public cutoff exposes slot generation separately from journal generation. Two
@@ -238,12 +243,15 @@ store requires an explicit matching snapshot; an exact header-only store may
 bootstrap empty. New binding uses the current active registry, while append
 requires exact equality with `resolve(series, revision)` and therefore preserves
 already-issued historical evidence after correction or retirement. Returned
-reopen records remain `DecodedAdmissionV1` inspection evidence, never seed a
-completed retry cache, and do not rebuild volatile latest. Persistence remains
-bounded to this active generation and manifest cutoff; rotation, immutable
-history, broad recovery, latest projection, and durable long-term retry remain
-absent. Exact bytes and publication law are specified in
-[Manifest V1](manifest-v1-format.md).
+reopen records remain `DecodedAdmissionV1` inspection evidence and do not rebuild
+volatile latest. A referenced Retry State V1 snapshot, rather than decoded
+journal history, restores the bounded completed-retry projection. A legacy
+Manifest V1 restores empty retry tiers and deliberately receives no backfill.
+Persistence remains bounded to this active generation and manifest cutoff;
+rotation, immutable history, broad recovery, latest projection, and an unbounded
+or time-based durable retry horizon remain absent. Exact bytes and publication
+law are specified in [Manifest V1/V2](manifest-v1-format.md) and
+[Retry State V1](retry-state-v1-format.md).
 
 ### Values and content
 
@@ -329,6 +337,18 @@ Comparison is closed and exact:
 
 The model does not derive keys or HMACs, hash retry content, set a durable horizon,
 or treat transport redelivery as idempotency.
+
+M02-PR02b applies that exact classification inside a store-owned, finite
+persistence policy without changing the core type. The replay tier retains the
+original append identity and exact first manifest commit; an equivalent request
+returns that outcome immediately without current/latest-state publication. FIFO
+overflow moves the oldest replay entry to a non-replayable guard. Equivalent
+guard hits return `RetryExpired`, while changed content in either tier remains a
+conflict. Only eviction from both tiers makes the scope/key fresh. Ordering is
+durable append sequence only, and replay, conflict, or expired hits never refresh
+it. The sole blocking store writer mutates this projection; runtime ingress holds
+only the immutable committed snapshot installed atomically with the receipts it
+covers.
 
 ## Evidence ownership
 

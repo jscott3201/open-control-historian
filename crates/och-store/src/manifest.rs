@@ -5,10 +5,17 @@ use crate::codec::{
     Cursor, Encoder, crc32c, decode_declaration, decode_declaration_evidence, encode_declaration,
     encode_declaration_evidence,
 };
+use crate::retry::{
+    RetryArtifactReference, RetryStateCodecError, decode_retry_state_at_slot, encode_retry_state,
+};
 use crate::{
     ACTIVE_CHECKPOINT_FILE_NAME, ACTIVE_JOURNAL_FILE_NAME, ACTIVE_JOURNAL_GENERATION,
     ACTIVE_JOURNAL_HEADER_V2_VERSION, ActiveJournalError, ActiveJournalInspection,
     ActiveJournalLimits, ActiveJournalOpenMode, DurableCutoff, JournalV1Error, PreparedFrameV1,
+};
+use crate::{
+    MAX_PERSISTED_RETRY_ENTRIES, MAX_RETRY_STATE_BYTES, PendingRetryOutcome,
+    RetryPersistenceOptions, RetryStateReference, RetryStateSnapshot,
 };
 use och_core::{
     CollectionEnvelope, DeclarationEvidence, DeclarationRevision, DeclaredCollectionEnvelope,
@@ -39,6 +46,14 @@ pub const REGISTRY_SLOT_2_FILE_NAME: &str = "series-registry-v1-slot-2.och";
 pub const MANIFEST_STAGING_FILE_NAME: &str = "manifest-v1.staging";
 /// Exact fixed registry staging artifact.
 pub const REGISTRY_STAGING_FILE_NAME: &str = "series-registry-v1.staging";
+/// Exact first reusable durable retry snapshot slot.
+pub const RETRY_SLOT_0_FILE_NAME: &str = "retry-state-v1-slot-0.och";
+/// Exact second reusable durable retry snapshot slot.
+pub const RETRY_SLOT_1_FILE_NAME: &str = "retry-state-v1-slot-1.och";
+/// Exact third reusable durable retry snapshot slot.
+pub const RETRY_SLOT_2_FILE_NAME: &str = "retry-state-v1-slot-2.och";
+/// Exact fixed durable retry snapshot staging artifact.
+pub const RETRY_STAGING_FILE_NAME: &str = "retry-state-v1.staging";
 /// Hard maximum persisted registry series, including tombstones.
 pub const MAX_PERSISTED_REGISTRY_SERIES: usize = 4_096;
 /// Hard maximum persisted declaration revisions across one registry.
@@ -47,7 +62,8 @@ pub const MAX_PERSISTED_REGISTRY_REVISIONS: usize = 16_384;
 pub const MAX_REGISTRY_SNAPSHOT_BYTES: usize = 64 * 1_024 * 1_024;
 
 const MANIFEST_MAGIC: [u8; 8] = *b"OCHMAN01";
-const MANIFEST_VERSION: u16 = 1;
+const MANIFEST_V1_VERSION: u16 = 1;
+const MANIFEST_V2_VERSION: u16 = 2;
 const MANIFEST_LEN: usize = 128;
 const MANIFEST_LEN_U16: u16 = 128;
 const REGISTRY_MAGIC: [u8; 8] = *b"OCHREG01";
@@ -61,7 +77,12 @@ const REGISTRY_SLOT_NAMES: [&str; 3] = [
     REGISTRY_SLOT_1_FILE_NAME,
     REGISTRY_SLOT_2_FILE_NAME,
 ];
-const MAX_INVENTORY_ENTRIES: usize = 10;
+const RETRY_SLOT_NAMES: [&str; 3] = [
+    RETRY_SLOT_0_FILE_NAME,
+    RETRY_SLOT_1_FILE_NAME,
+    RETRY_SLOT_2_FILE_NAME,
+];
+const MAX_INVENTORY_ENTRIES: usize = 14;
 
 #[cfg(test)]
 static PUBLISH_FAULT: AtomicU8 = AtomicU8::new(0);
@@ -132,6 +153,7 @@ pub struct ManifestStoreConfig {
     mode: ActiveJournalOpenMode,
     journal_limits: ActiveJournalLimits,
     registry: RegistryPersistenceOptions,
+    retry: RetryPersistenceOptions,
 }
 
 impl ManifestStoreConfig {
@@ -146,6 +168,7 @@ impl ManifestStoreConfig {
         mode: ActiveJournalOpenMode,
         journal_limits: ActiveJournalLimits,
         registry: RegistryPersistenceOptions,
+        retry: RetryPersistenceOptions,
     ) -> Result<Self, ManifestStoreError> {
         ActiveJournalConfig::new(directory.clone(), store_id, mode, journal_limits)
             .map_err(ManifestStoreError::Active)?;
@@ -164,6 +187,7 @@ impl ManifestStoreConfig {
             mode,
             journal_limits,
             registry,
+            retry,
         })
     }
 }
@@ -234,6 +258,8 @@ pub enum ManifestStoreError {
     InvalidManifest,
     /// A registry snapshot is invalid, ambiguous, or inconsistent.
     InvalidRegistry,
+    /// A durable retry snapshot is invalid, ambiguous, or inconsistent.
+    InvalidRetry,
     /// The configured store identity differs from durable evidence.
     StoreMismatch,
     /// A nonempty pre-manifest journal lacks an explicit registry snapshot.
@@ -264,6 +290,7 @@ impl fmt::Display for ManifestStoreError {
             Self::InvalidInventory => "invalid manifest store inventory",
             Self::InvalidManifest => "invalid manifest evidence",
             Self::InvalidRegistry => "invalid registry evidence",
+            Self::InvalidRetry => "invalid durable retry evidence",
             Self::StoreMismatch => "manifest store identity mismatch",
             Self::BootstrapSnapshotRequired => "registry bootstrap snapshot required",
             Self::BootstrapSnapshotMismatch => "registry bootstrap snapshot mismatch",
@@ -293,6 +320,7 @@ pub struct ManifestCommit {
     registry_generation: u64,
     registry_slot: u8,
     durable_cutoff: DurableCutoff,
+    retry_state: Option<RetryStateReference>,
 }
 
 impl ManifestCommit {
@@ -318,6 +346,30 @@ impl ManifestCommit {
     #[must_use]
     pub const fn durable_cutoff(self) -> DurableCutoff {
         self.durable_cutoff
+    }
+
+    /// Returns the committed durable retry snapshot identity.
+    ///
+    /// This is absent only while opened under a legacy Manifest V1 record.
+    #[must_use]
+    pub const fn retry_state(self) -> Option<RetryStateReference> {
+        self.retry_state
+    }
+
+    pub(crate) const fn from_parts(
+        manifest_generation: u64,
+        registry_generation: u64,
+        registry_slot: u8,
+        durable_cutoff: DurableCutoff,
+        retry_state: Option<RetryStateReference>,
+    ) -> Self {
+        Self {
+            manifest_generation,
+            registry_generation,
+            registry_slot,
+            durable_cutoff,
+            retry_state,
+        }
     }
 }
 
@@ -355,6 +407,22 @@ struct ManifestRecord {
     generation: u64,
     registry: RegistryReference,
     cutoff: DurableCutoff,
+    retry: Option<RetryArtifactReference>,
+}
+
+impl ManifestRecord {
+    const fn commit(self) -> ManifestCommit {
+        ManifestCommit::from_parts(
+            self.generation,
+            self.registry.generation,
+            self.registry.slot,
+            self.cutoff,
+            match self.retry {
+                Some(reference) => Some(reference.public),
+                None => None,
+            },
+        )
+    }
 }
 
 /// Sole blocking owner of stable locking, active journal, registry, and manifests.
@@ -364,6 +432,7 @@ pub struct ManifestStore {
     _store_lock: File,
     journal: ActiveJournal,
     registry: SeriesRegistry,
+    retry: RetryStateSnapshot,
     manifest_slots: [Option<ManifestRecord>; 2],
     current_slot: usize,
     current: ManifestRecord,
@@ -454,12 +523,25 @@ impl ManifestStore {
         }
         validate_recovered_declarations(&registry, journal.recovered_records())
             .map_err(|_| ManifestStoreError::InvalidRegistry)?;
+        let retry = match current.retry {
+            Some(_) => {
+                read_referenced_retry(&config.directory, current, config.store_id, config.retry)?
+            }
+            None => RetryStateSnapshot::empty(config.store_id, config.retry),
+        };
+        validate_retry_inventory(
+            &config.directory,
+            manifest_slots,
+            config.store_id,
+            config.retry,
+        )?;
         Ok(Self {
             directory_path: config.directory,
             directory,
             _store_lock: store_lock,
             journal,
             registry,
+            retry,
             manifest_slots,
             current_slot,
             current,
@@ -515,6 +597,7 @@ impl ManifestStore {
             _store_lock: store_lock,
             journal,
             registry,
+            retry: RetryStateSnapshot::empty(config.store_id, config.retry),
             manifest_slots,
             current_slot: 0,
             current: ManifestRecord {
@@ -526,6 +609,7 @@ impl ManifestStore {
                     checksum: 0,
                 },
                 cutoff: genesis_placeholder(config.store_id),
+                retry: None,
             },
             faulted: false,
         };
@@ -534,11 +618,27 @@ impl ManifestStore {
         } else {
             read_interrupted_genesis_registry(&store.directory_path, &store.registry.snapshot())?
         };
+        let retry_reference = if inventory.retry_slots == 0 {
+            let reference = RetryStateReference::new(0, 1);
+            store.publish_retry_snapshot(
+                reference,
+                &RetryStateSnapshot::empty_persisted(
+                    store.retry.store_id(),
+                    store.retry.options(),
+                    reference,
+                ),
+            )?
+        } else {
+            read_interrupted_genesis_retry(&store.directory_path, config.store_id, config.retry)?
+        };
         let record = ManifestRecord {
             generation: 1,
             registry: registry_reference,
             cutoff: store.journal.durable_cutoff(),
+            retry: Some(retry_reference),
         };
+        store.retry =
+            read_referenced_retry(&store.directory_path, record, config.store_id, config.retry)?;
         let slot = store.publish_manifest(record)?;
         manifest_slots[slot] = Some(record);
         store.manifest_slots = manifest_slots;
@@ -566,6 +666,12 @@ impl ManifestStore {
     #[must_use]
     pub fn registry_snapshot(&self) -> SeriesRegistrySnapshot {
         self.registry.snapshot()
+    }
+
+    /// Captures the immutable committed durable retry projection.
+    #[must_use]
+    pub fn retry_state_snapshot(&self) -> RetryStateSnapshot {
+        self.retry.clone()
     }
 
     /// Returns the next writer-owned append sequence.
@@ -607,23 +713,70 @@ impl ManifestStore {
     ///
     /// A publication failure returns no committed proof and terminally faults
     /// this open authority.
-    pub fn sync_pending(&mut self) -> Result<ManifestCommit, ManifestStoreError> {
+    pub fn sync_pending(
+        &mut self,
+        pending: &[PendingRetryOutcome],
+    ) -> Result<(ManifestCommit, RetryStateSnapshot), ManifestStoreError> {
         self.ensure_usable()?;
+        if pending.len() > MAX_PERSISTED_RETRY_ENTRIES {
+            return Err(ManifestStoreError::InvalidRetry);
+        }
         let cutoff = self.journal.sync_pending()?;
         if cutoff == self.current.cutoff {
-            return Ok(self.commit());
+            if !pending.is_empty() {
+                self.faulted = true;
+                return Err(ManifestStoreError::InvalidRetry);
+            }
+            return Ok((self.commit(), self.retry.clone()));
         }
+        let result = self.commit_synced_pending(cutoff, pending);
+        if result.is_err() {
+            self.faulted = true;
+        }
+        result
+    }
+
+    fn commit_synced_pending(
+        &mut self,
+        cutoff: DurableCutoff,
+        pending: &[PendingRetryOutcome],
+    ) -> Result<(ManifestCommit, RetryStateSnapshot), ManifestStoreError> {
+        validate_pending_retry(self.current.cutoff, cutoff, pending)?;
         let generation = self
             .current
             .generation
             .checked_add(1)
             .ok_or(ManifestStoreError::GenerationExhausted)?;
+        let retry_generation = self.current.retry.map_or(Ok(1), |reference| {
+            reference
+                .public
+                .generation()
+                .checked_add(1)
+                .ok_or(ManifestStoreError::GenerationExhausted)
+        })?;
+        let retry_slot = self.select_retry_candidate_slot()?;
+        let retry_public = RetryStateReference::new(retry_slot, retry_generation);
+        let anticipated = ManifestCommit::from_parts(
+            generation,
+            self.current.registry.generation,
+            self.current.registry.slot,
+            cutoff,
+            Some(retry_public),
+        );
+        let candidate = self
+            .retry
+            .advance(retry_public, pending, anticipated)
+            .map_err(|_| ManifestStoreError::InvalidRetry)?;
+        let retry = self.publish_retry_snapshot(retry_public, &candidate)?;
         let next = ManifestRecord {
             generation,
             registry: self.current.registry,
             cutoff,
+            retry: Some(retry),
         };
-        self.publish_and_adopt_manifest(next)
+        let committed = self.publish_and_adopt_manifest(next)?;
+        self.retry = candidate;
+        Ok((committed, self.retry.clone()))
     }
 
     /// Registers revision one and commits the complete resulting snapshot.
@@ -725,6 +878,7 @@ impl ManifestStore {
             generation: manifest_generation,
             registry: registry_reference,
             cutoff: self.journal.durable_cutoff(),
+            retry: self.current.retry,
         };
         let commit = match self.publish_and_adopt_manifest(record) {
             Ok(commit) => commit,
@@ -748,7 +902,15 @@ impl ManifestStore {
                 return Err(error);
             }
         };
-        self.manifest_slots[slot] = Some(record);
+        let mut manifest_slots = self.manifest_slots;
+        manifest_slots[slot] = Some(record);
+        if let Err(error) =
+            remove_unreferenced_retry_slots(&self.directory_path, &self.directory, manifest_slots)
+        {
+            self.faulted = true;
+            return Err(error);
+        }
+        self.manifest_slots = manifest_slots;
         self.current_slot = slot;
         self.current = record;
         Ok(self.commit())
@@ -790,6 +952,57 @@ impl ManifestStore {
         Ok(reference)
     }
 
+    fn select_retry_candidate_slot(&self) -> Result<u8, ManifestStoreError> {
+        let referenced = self
+            .manifest_slots
+            .map(|slot| slot.and_then(|record| record.retry.map(|retry| retry.public.slot())));
+        (0_u8..3)
+            .find(|candidate| !referenced.iter().flatten().any(|slot| slot == candidate))
+            .ok_or(ManifestStoreError::InvalidRetry)
+    }
+
+    fn publish_retry_snapshot(
+        &self,
+        public: RetryStateReference,
+        snapshot: &RetryStateSnapshot,
+    ) -> Result<RetryArtifactReference, ManifestStoreError> {
+        if snapshot.reference() != Some(public) || public.slot() >= 3 {
+            return Err(ManifestStoreError::InvalidRetry);
+        }
+        let selected = self.select_retry_candidate_slot()?;
+        if selected != public.slot() {
+            return Err(ManifestStoreError::InvalidRetry);
+        }
+        let bytes = encode_retry_state(snapshot).map_err(map_retry_codec)?;
+        let reference = RetryArtifactReference {
+            public,
+            length: u64::try_from(bytes.len()).map_err(|_| ManifestStoreError::InvalidRetry)?,
+            checksum: crc32c(&bytes),
+        };
+        publish_reusable_slot(
+            &self.directory_path,
+            &self.directory,
+            RETRY_STAGING_FILE_NAME,
+            RETRY_SLOT_NAMES[usize::from(public.slot())],
+            &bytes,
+            MAX_RETRY_STATE_BYTES,
+            |candidate| {
+                let (decoded_reference, decoded) = decode_retry_state_at_slot(
+                    candidate,
+                    public.slot(),
+                    snapshot.store_id(),
+                    snapshot.options(),
+                )
+                .map_err(map_retry_codec)?;
+                if decoded_reference != reference || decoded != *snapshot {
+                    return Err(ManifestStoreError::InvalidRetry);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(reference)
+    }
+
     fn publish_manifest(&self, record: ManifestRecord) -> Result<usize, ManifestStoreError> {
         let target = if record.generation == 1 {
             self.manifest_slots
@@ -818,12 +1031,7 @@ impl ManifestStore {
     }
 
     fn commit(&self) -> ManifestCommit {
-        ManifestCommit {
-            manifest_generation: self.current.generation,
-            registry_generation: self.current.registry.generation,
-            registry_slot: self.current.registry.slot,
-            durable_cutoff: self.current.cutoff,
-        }
+        self.current.commit()
     }
 
     fn ensure_usable(&self) -> Result<(), ManifestStoreError> {
@@ -839,6 +1047,7 @@ impl ManifestStore {
 struct Inventory {
     staging: bool,
     registry_slots: usize,
+    retry_slots: usize,
     store_lock: bool,
 }
 
@@ -846,6 +1055,7 @@ fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> 
     let mut count = 0_usize;
     let mut staging = false;
     let mut registry_slots = 0_usize;
+    let mut retry_slots = 0_usize;
     let mut store_lock = false;
     for entry in directory
         .read_dir()
@@ -871,10 +1081,15 @@ fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> 
         };
         if name == STORE_LOCK_FILE_NAME {
             store_lock = true;
-        } else if name == MANIFEST_STAGING_FILE_NAME || name == REGISTRY_STAGING_FILE_NAME {
+        } else if name == MANIFEST_STAGING_FILE_NAME
+            || name == REGISTRY_STAGING_FILE_NAME
+            || name == RETRY_STAGING_FILE_NAME
+        {
             staging = true;
         } else if REGISTRY_SLOT_NAMES.contains(&name) {
             registry_slots += 1;
+        } else if RETRY_SLOT_NAMES.contains(&name) {
+            retry_slots += 1;
         } else if name != STORE_LOCK_FILE_NAME
             && name != ACTIVE_JOURNAL_FILE_NAME
             && name != ACTIVE_CHECKPOINT_FILE_NAME
@@ -886,6 +1101,7 @@ fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> 
     Ok(Inventory {
         staging,
         registry_slots,
+        retry_slots,
         store_lock,
     })
 }
@@ -945,10 +1161,30 @@ fn select_current_manifest(
                 (1, second, 0, first)
             };
             let _ = older_index;
-            if newer.generation != older.generation.saturating_add(1) {
+            if newer.generation != older.generation.saturating_add(1)
+                || !retry_reference_progresses(older.retry, newer.retry)
+            {
                 return Err(ManifestStoreError::InvalidManifest);
             }
             Ok(Some((newer_index, newer)))
+        }
+    }
+}
+
+fn retry_reference_progresses(
+    older: Option<RetryArtifactReference>,
+    newer: Option<RetryArtifactReference>,
+) -> bool {
+    match (older, newer) {
+        (None, None) => true,
+        (None, Some(newer)) => newer.public.generation() == 1,
+        (Some(_), None) => false,
+        (Some(older), Some(newer)) if newer.public.generation() == older.public.generation() => {
+            newer == older
+        }
+        (Some(older), Some(newer)) => {
+            newer.public.generation() == older.public.generation().saturating_add(1)
+                && newer.public.slot() != older.public.slot()
         }
     }
 }
@@ -1043,6 +1279,178 @@ fn read_interrupted_genesis_registry(
     found.ok_or(ManifestStoreError::InvalidRegistry)
 }
 
+fn read_referenced_retry(
+    directory: &Path,
+    owning_manifest: ManifestRecord,
+    store_id: StoreId,
+    options: RetryPersistenceOptions,
+) -> Result<RetryStateSnapshot, ManifestStoreError> {
+    let reference = owning_manifest
+        .retry
+        .ok_or(ManifestStoreError::InvalidRetry)?;
+    let name = RETRY_SLOT_NAMES
+        .get(usize::from(reference.public.slot()))
+        .ok_or(ManifestStoreError::InvalidRetry)?;
+    let bytes = read_required_bounded(&directory.join(name), MAX_RETRY_STATE_BYTES)?;
+    if u64::try_from(bytes.len()).ok() != Some(reference.length)
+        || crc32c(&bytes) != reference.checksum
+    {
+        return Err(ManifestStoreError::InvalidRetry);
+    }
+    let (decoded_reference, snapshot) =
+        decode_retry_state_at_slot(&bytes, reference.public.slot(), store_id, options)
+            .map_err(map_retry_codec)?;
+    if decoded_reference != reference || !snapshot.validates_root(owning_manifest.commit()) {
+        return Err(ManifestStoreError::InvalidRetry);
+    }
+    Ok(snapshot)
+}
+
+fn validate_retry_inventory(
+    directory: &Path,
+    manifests: [Option<ManifestRecord>; 2],
+    store_id: StoreId,
+    options: RetryPersistenceOptions,
+) -> Result<(), ManifestStoreError> {
+    for (slot, name) in RETRY_SLOT_NAMES.iter().enumerate() {
+        let Some(bytes) = read_optional_bounded(&directory.join(name), MAX_RETRY_STATE_BYTES)?
+        else {
+            continue;
+        };
+        let slot = u8::try_from(slot).map_err(|_| ManifestStoreError::InvalidRetry)?;
+        let (reference, _) =
+            decode_retry_state_at_slot(&bytes, slot, store_id, options).map_err(map_retry_codec)?;
+        let referenced = manifests
+            .iter()
+            .flatten()
+            .any(|manifest| manifest.retry == Some(reference));
+        if !referenced {
+            return Err(ManifestStoreError::InvalidRetry);
+        }
+    }
+    for manifest in manifests.into_iter().flatten() {
+        if manifest.retry.is_some() {
+            let _ = read_referenced_retry(directory, manifest, store_id, options)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_interrupted_genesis_retry(
+    directory: &Path,
+    store_id: StoreId,
+    options: RetryPersistenceOptions,
+) -> Result<RetryArtifactReference, ManifestStoreError> {
+    let mut found = None;
+    for (slot, name) in RETRY_SLOT_NAMES.iter().enumerate() {
+        let Some(bytes) = read_optional_bounded(&directory.join(name), MAX_RETRY_STATE_BYTES)?
+        else {
+            continue;
+        };
+        if found.is_some() {
+            return Err(ManifestStoreError::InvalidRetry);
+        }
+        let slot = u8::try_from(slot).map_err(|_| ManifestStoreError::InvalidRetry)?;
+        let (reference, snapshot) =
+            decode_retry_state_at_slot(&bytes, slot, store_id, options).map_err(map_retry_codec)?;
+        if reference.public.generation() != 1
+            || !snapshot.replay().is_empty()
+            || !snapshot.guard().is_empty()
+        {
+            return Err(ManifestStoreError::InvalidRetry);
+        }
+        found = Some(reference);
+    }
+    found.ok_or(ManifestStoreError::InvalidRetry)
+}
+
+fn remove_unreferenced_retry_slots(
+    directory_path: &Path,
+    directory: &File,
+    manifests: [Option<ManifestRecord>; 2],
+) -> Result<(), ManifestStoreError> {
+    let mut removed = false;
+    for (slot, name) in RETRY_SLOT_NAMES.iter().enumerate() {
+        let slot = u8::try_from(slot).map_err(|_| ManifestStoreError::InvalidRetry)?;
+        if manifests.iter().flatten().any(|manifest| {
+            manifest
+                .retry
+                .is_some_and(|reference| reference.public.slot() == slot)
+        }) {
+            continue;
+        }
+        match std::fs::remove_file(directory_path.join(name)) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(manifest_io(ManifestIoOperation::Publish, &error)),
+        }
+    }
+    if removed {
+        directory
+            .sync_all()
+            .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))?;
+    }
+    Ok(())
+}
+
+fn validate_pending_retry(
+    prior: DurableCutoff,
+    cutoff: DurableCutoff,
+    pending: &[PendingRetryOutcome],
+) -> Result<(), ManifestStoreError> {
+    validate_pending_retry_preflight(prior, cutoff, pending.len())?;
+    let mut expected_sequence = prior
+        .append_sequence()
+        .checked_add(1)
+        .ok_or(ManifestStoreError::GenerationExhausted)?;
+    let mut previous_end = prior.end_offset();
+    for entry in pending {
+        if entry.append_sequence() != expected_sequence || entry.end_offset() <= previous_end {
+            return Err(ManifestStoreError::InvalidRetry);
+        }
+        previous_end = entry.end_offset();
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or(ManifestStoreError::GenerationExhausted)?;
+    }
+    let last = pending.last().ok_or(ManifestStoreError::InvalidRetry)?;
+    if last.append_sequence() != cutoff.append_sequence()
+        || last.end_offset() != cutoff.end_offset()
+    {
+        return Err(ManifestStoreError::InvalidRetry);
+    }
+    Ok(())
+}
+
+fn validate_pending_retry_preflight(
+    prior: DurableCutoff,
+    cutoff: DurableCutoff,
+    pending_len: usize,
+) -> Result<(), ManifestStoreError> {
+    let delta = cutoff
+        .append_sequence()
+        .checked_sub(prior.append_sequence())
+        .and_then(|delta| usize::try_from(delta).ok());
+    if pending_len == 0
+        || pending_len > MAX_PERSISTED_RETRY_ENTRIES
+        || prior.journal() != cutoff.journal()
+        || delta != Some(pending_len)
+        || cutoff.end_offset() <= prior.end_offset()
+    {
+        return Err(ManifestStoreError::InvalidRetry);
+    }
+    Ok(())
+}
+
+fn map_retry_codec(error: RetryStateCodecError) -> ManifestStoreError {
+    match error {
+        RetryStateCodecError::Invalid | RetryStateCodecError::OptionsMismatch => {
+            ManifestStoreError::InvalidRetry
+        }
+        RetryStateCodecError::StoreMismatch => ManifestStoreError::StoreMismatch,
+    }
+}
+
 fn publish_reusable_slot(
     directory_path: &Path,
     directory: &File,
@@ -1077,6 +1485,7 @@ fn publish_reusable_slot(
     staging
         .sync_all()
         .map_err(|error| manifest_io(ManifestIoOperation::SyncArtifact, &error))?;
+    injected_publication_fault(staging_name, PublicationPoint::Readback)?;
     let candidate = read_required_bounded(&staging_path, maximum)?;
     verify(&candidate)?;
     injected_publication_fault(staging_name, PublicationPoint::Publish)?;
@@ -1092,8 +1501,9 @@ fn publish_reusable_slot(
 enum PublicationPoint {
     Write = 1,
     SyncArtifact = 2,
-    Publish = 3,
-    SyncDirectory = 4,
+    Readback = 3,
+    Publish = 4,
+    SyncDirectory = 5,
 }
 
 #[cfg(not(test))]
@@ -1110,12 +1520,24 @@ fn injected_publication_fault(
     staging_name: &str,
     point: PublicationPoint,
 ) -> Result<(), ManifestStoreError> {
-    let family = if staging_name == REGISTRY_STAGING_FILE_NAME {
-        0_u8
-    } else {
-        4_u8
+    let code = match (staging_name, point) {
+        (REGISTRY_STAGING_FILE_NAME, PublicationPoint::Write) => 1,
+        (REGISTRY_STAGING_FILE_NAME, PublicationPoint::SyncArtifact) => 2,
+        (REGISTRY_STAGING_FILE_NAME, PublicationPoint::Readback) => 9,
+        (REGISTRY_STAGING_FILE_NAME, PublicationPoint::Publish) => 3,
+        (REGISTRY_STAGING_FILE_NAME, PublicationPoint::SyncDirectory) => 4,
+        (MANIFEST_STAGING_FILE_NAME, PublicationPoint::Write) => 5,
+        (MANIFEST_STAGING_FILE_NAME, PublicationPoint::SyncArtifact) => 6,
+        (MANIFEST_STAGING_FILE_NAME, PublicationPoint::Readback) => 10,
+        (MANIFEST_STAGING_FILE_NAME, PublicationPoint::Publish) => 7,
+        (MANIFEST_STAGING_FILE_NAME, PublicationPoint::SyncDirectory) => 8,
+        (RETRY_STAGING_FILE_NAME, PublicationPoint::Write) => 11,
+        (RETRY_STAGING_FILE_NAME, PublicationPoint::SyncArtifact) => 12,
+        (RETRY_STAGING_FILE_NAME, PublicationPoint::Readback) => 13,
+        (RETRY_STAGING_FILE_NAME, PublicationPoint::Publish) => 14,
+        (RETRY_STAGING_FILE_NAME, PublicationPoint::SyncDirectory) => 15,
+        _ => 0,
     };
-    let code = family + point as u8;
     if PUBLISH_FAULT
         .compare_exchange(code, 0, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
@@ -1123,6 +1545,7 @@ fn injected_publication_fault(
         let operation = match point {
             PublicationPoint::Write => ManifestIoOperation::Write,
             PublicationPoint::SyncArtifact => ManifestIoOperation::SyncArtifact,
+            PublicationPoint::Readback => ManifestIoOperation::Read,
             PublicationPoint::Publish => ManifestIoOperation::Publish,
             PublicationPoint::SyncDirectory => ManifestIoOperation::SyncDirectory,
         };
@@ -1163,7 +1586,12 @@ fn read_required_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, Manifes
 fn encode_manifest(record: ManifestRecord) -> [u8; MANIFEST_LEN] {
     let mut bytes = [0_u8; MANIFEST_LEN];
     bytes[..8].copy_from_slice(&MANIFEST_MAGIC);
-    bytes[8..10].copy_from_slice(&MANIFEST_VERSION.to_be_bytes());
+    let version = if record.retry.is_some() {
+        MANIFEST_V2_VERSION
+    } else {
+        MANIFEST_V1_VERSION
+    };
+    bytes[8..10].copy_from_slice(&version.to_be_bytes());
     bytes[10..12].copy_from_slice(&MANIFEST_LEN_U16.to_be_bytes());
     bytes[12..28].copy_from_slice(record.cutoff.journal().store_id().as_bytes());
     bytes[28..36].copy_from_slice(&record.generation.to_be_bytes());
@@ -1175,6 +1603,12 @@ fn encode_manifest(record: ManifestRecord) -> [u8; MANIFEST_LEN] {
     bytes[72..80].copy_from_slice(&record.registry.generation.to_be_bytes());
     bytes[80..88].copy_from_slice(&record.registry.length.to_be_bytes());
     bytes[88..92].copy_from_slice(&record.registry.checksum.to_be_bytes());
+    if let Some(retry) = record.retry {
+        bytes[92] = retry.public.slot();
+        bytes[96..104].copy_from_slice(&retry.public.generation().to_be_bytes());
+        bytes[104..112].copy_from_slice(&retry.length.to_be_bytes());
+        bytes[112..116].copy_from_slice(&retry.checksum.to_be_bytes());
+    }
     let checksum = crc32c(&bytes[..124]);
     bytes[124..128].copy_from_slice(&checksum.to_be_bytes());
     bytes
@@ -1183,15 +1617,50 @@ fn encode_manifest(record: ManifestRecord) -> [u8; MANIFEST_LEN] {
 fn decode_manifest(bytes: &[u8], store_id: StoreId) -> Result<ManifestRecord, ManifestStoreError> {
     if bytes.len() != MANIFEST_LEN
         || bytes[..8] != MANIFEST_MAGIC
-        || u16::from_be_bytes(bytes[8..10].try_into().unwrap_or_default()) != MANIFEST_VERSION
         || u16::from_be_bytes(bytes[10..12].try_into().unwrap_or_default()) != MANIFEST_LEN_U16
         || bytes[69..72].iter().any(|byte| *byte != 0)
-        || bytes[92..124].iter().any(|byte| *byte != 0)
         || crc32c(&bytes[..124])
             != u32::from_be_bytes(bytes[124..128].try_into().unwrap_or_default())
     {
         return Err(ManifestStoreError::InvalidManifest);
     }
+    let version = u16::from_be_bytes(bytes[8..10].try_into().unwrap_or_default());
+    if version != MANIFEST_V1_VERSION && version != MANIFEST_V2_VERSION {
+        return Err(ManifestStoreError::InvalidManifest);
+    }
+    let retry = match version {
+        MANIFEST_V1_VERSION => {
+            if bytes[92..124].iter().any(|byte| *byte != 0) {
+                return Err(ManifestStoreError::InvalidManifest);
+            }
+            None
+        }
+        MANIFEST_V2_VERSION => {
+            if bytes[93..96].iter().any(|byte| *byte != 0)
+                || bytes[116..124].iter().any(|byte| *byte != 0)
+            {
+                return Err(ManifestStoreError::InvalidManifest);
+            }
+            let reference = RetryArtifactReference {
+                public: RetryStateReference::new(
+                    bytes[92],
+                    u64::from_be_bytes(bytes[96..104].try_into().unwrap_or_default()),
+                ),
+                length: u64::from_be_bytes(bytes[104..112].try_into().unwrap_or_default()),
+                checksum: u32::from_be_bytes(bytes[112..116].try_into().unwrap_or_default()),
+            };
+            if reference.public.slot() >= 3
+                || reference.public.generation() == 0
+                || reference.length == 0
+                || usize::try_from(reference.length)
+                    .map_or(true, |length| length > MAX_RETRY_STATE_BYTES)
+            {
+                return Err(ManifestStoreError::InvalidManifest);
+            }
+            Some(reference)
+        }
+        _ => return Err(ManifestStoreError::InvalidManifest),
+    };
     let decoded_store = StoreId::from_bytes(bytes[12..28].try_into().unwrap_or_default())
         .map_err(|_| ManifestStoreError::InvalidManifest)?;
     if decoded_store != store_id {
@@ -1213,9 +1682,11 @@ fn decode_manifest(bytes: &[u8], store_id: StoreId) -> Result<ManifestRecord, Ma
         || checkpoint_generation == 0
         || registry.slot >= 3
         || registry.generation == 0
+        || registry.generation > generation
         || registry.length == 0
         || usize::try_from(registry.length)
             .map_or(true, |length| length > MAX_REGISTRY_SNAPSHOT_BYTES)
+        || retry.is_some_and(|reference| reference.public.generation() > generation)
         || (append_sequence == 0) != (end_offset == crate::JOURNAL_V1_HEADER_LEN as u64)
     {
         return Err(ManifestStoreError::InvalidManifest);
@@ -1230,6 +1701,7 @@ fn decode_manifest(bytes: &[u8], store_id: StoreId) -> Result<ManifestRecord, Ma
             append_sequence,
             end_offset,
         ),
+        retry,
     })
 }
 
@@ -1597,11 +2069,13 @@ fn genesis_placeholder(store_id: StoreId) -> DurableCutoff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support;
+    use crate::{PreparedAdmissionV1, test_support};
     use std::fs;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+    static PUBLISH_FAULT_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_directory(code: u8) -> PathBuf {
         let sequence = NEXT_DIRECTORY.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1622,19 +2096,114 @@ mod tests {
                 .expect("fault journal limits"),
             RegistryPersistenceOptions::new(SeriesRegistryLimits::new(2, 4))
                 .expect("fault registry limits"),
+            RetryPersistenceOptions::new(2, 2).expect("fault retry limits"),
         )
         .expect("fault store config")
     }
 
     #[test]
+    fn pending_retry_preflight_enforces_exact_delta_and_hard_count_before_entry_walk() {
+        let store_id = test_support::store_id(1);
+        let prior = DurableCutoff::from_manifest(store_id, 1, 7, 10, 1_000);
+        let exact = DurableCutoff::from_manifest(
+            store_id,
+            1,
+            8,
+            10 + MAX_PERSISTED_RETRY_ENTRIES as u64,
+            2_000,
+        );
+        assert_eq!(
+            validate_pending_retry_preflight(prior, exact, MAX_PERSISTED_RETRY_ENTRIES),
+            Ok(())
+        );
+        let one_over = DurableCutoff::from_manifest(
+            store_id,
+            1,
+            8,
+            11 + MAX_PERSISTED_RETRY_ENTRIES as u64,
+            2_000,
+        );
+        assert_eq!(
+            validate_pending_retry_preflight(prior, one_over, MAX_PERSISTED_RETRY_ENTRIES + 1,),
+            Err(ManifestStoreError::InvalidRetry)
+        );
+        assert_eq!(
+            validate_pending_retry_preflight(prior, exact, MAX_PERSISTED_RETRY_ENTRIES - 1),
+            Err(ManifestStoreError::InvalidRetry)
+        );
+        assert_eq!(
+            validate_pending_retry_preflight(prior, exact, 0),
+            Err(ManifestStoreError::InvalidRetry)
+        );
+    }
+
+    #[test]
+    fn retry_transition_refusal_after_journal_sync_terminally_faults_store() {
+        let directory = test_directory(16);
+        let mut store = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create transition-refusal fixture");
+        let admission = test_support::no_change_admission();
+        let declaration = admission.declaration();
+        store
+            .register(
+                declaration.series_id(),
+                declaration.binding().clone(),
+                declaration.payload().clone(),
+                declaration.evidence().clone(),
+            )
+            .expect("register transition-refusal declaration");
+
+        let first_sequence = store.next_append_sequence().expect("first sequence");
+        let first = PreparedAdmissionV1::new(admission.clone())
+            .expect("first prepared admission")
+            .into_frame(first_sequence)
+            .expect("first frame");
+        let first_end = store.append(&first).expect("first append");
+        store
+            .sync_pending(&[PendingRetryOutcome::new(
+                first.admission().retry().clone(),
+                first_sequence.get(),
+                first_end,
+            )])
+            .expect("first durable retry transition");
+
+        let second_sequence = store.next_append_sequence().expect("second sequence");
+        let second = PreparedAdmissionV1::new(admission)
+            .expect("second prepared admission")
+            .into_frame(second_sequence)
+            .expect("second frame");
+        let second_end = store.append(&second).expect("second append");
+        assert_eq!(
+            store.sync_pending(&[PendingRetryOutcome::new(
+                second.admission().retry().clone(),
+                second_sequence.get(),
+                second_end,
+            )]),
+            Err(ManifestStoreError::InvalidRetry),
+            "a retained key cannot be advanced as fresh after journal sync"
+        );
+        assert_eq!(
+            store.bind(second.admission().envelope().clone()),
+            Err(ManifestStoreError::Faulted)
+        );
+        fs::remove_dir_all(directory).expect("remove transition-refusal fixture");
+    }
+
+    #[test]
     fn every_registry_and_manifest_publication_boundary_fails_stop_without_false_success() {
+        let _fault_lock = PUBLISH_FAULT_LOCK.lock().expect("publication fault lock");
         let cases = [
             (1, ManifestIoOperation::Write, false, false),
             (2, ManifestIoOperation::SyncArtifact, false, false),
+            (9, ManifestIoOperation::Read, false, false),
             (3, ManifestIoOperation::Publish, false, false),
             (4, ManifestIoOperation::SyncDirectory, true, false),
             (5, ManifestIoOperation::Write, false, true),
             (6, ManifestIoOperation::SyncArtifact, false, true),
+            (10, ManifestIoOperation::Read, false, true),
             (7, ManifestIoOperation::Publish, false, true),
             (8, ManifestIoOperation::SyncDirectory, true, true),
         ];
@@ -1688,6 +2257,83 @@ mod tests {
     }
 
     #[test]
+    fn every_retry_and_following_manifest_publication_boundary_has_no_false_commit() {
+        let _fault_lock = PUBLISH_FAULT_LOCK.lock().expect("publication fault lock");
+        let cases = [
+            (11, ManifestIoOperation::Write, false),
+            (12, ManifestIoOperation::SyncArtifact, false),
+            (13, ManifestIoOperation::Read, false),
+            (14, ManifestIoOperation::Publish, false),
+            (15, ManifestIoOperation::SyncDirectory, false),
+            (5, ManifestIoOperation::Write, false),
+            (6, ManifestIoOperation::SyncArtifact, false),
+            (10, ManifestIoOperation::Read, false),
+            (7, ManifestIoOperation::Publish, false),
+            (8, ManifestIoOperation::SyncDirectory, true),
+        ];
+        for (code, operation, manifest_published) in cases {
+            let directory = test_directory(code);
+            let mut store = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::CreateNew,
+            ))
+            .expect("create retry fault fixture");
+            let admission = test_support::no_change_admission();
+            let declaration = admission.declaration();
+            store
+                .register(
+                    declaration.series_id(),
+                    declaration.binding().clone(),
+                    declaration.payload().clone(),
+                    declaration.evidence().clone(),
+                )
+                .expect("register retry fault declaration");
+            let sequence = store.next_append_sequence().expect("fault append sequence");
+            let frame = PreparedAdmissionV1::new(admission)
+                .expect("fault prepared admission")
+                .into_frame(sequence)
+                .expect("fault prepared frame");
+            let end_offset = store.append(&frame).expect("fault append");
+            let pending = [PendingRetryOutcome::new(
+                frame.admission().retry().clone(),
+                sequence.get(),
+                end_offset,
+            )];
+            PUBLISH_FAULT.store(code, Ordering::SeqCst);
+            let error = store
+                .sync_pending(&pending)
+                .expect_err("injected retry publication boundary must refuse");
+            assert!(matches!(
+                error,
+                ManifestStoreError::Io(evidence) if evidence.operation() == operation
+            ));
+            assert_eq!(
+                store.bind(frame.admission().envelope().clone()),
+                Err(ManifestStoreError::Faulted)
+            );
+            drop(store);
+
+            let reopened = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::OpenExisting,
+            ));
+            if manifest_published {
+                let reopened = reopened.expect("renamed manifest commits retry projection");
+                assert_eq!(reopened.retry_state_snapshot().replay().len(), 1);
+            } else {
+                assert!(matches!(
+                    reopened,
+                    Err(ManifestStoreError::InterruptedPublication
+                        | ManifestStoreError::InvalidManifest
+                        | ManifestStoreError::InvalidRetry)
+                ));
+            }
+            fs::remove_dir_all(directory).expect("remove retry fault directory");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn manifest_parser_refuses_hostile_version_bounds_reserved_scope_and_checksum() {
         let store_id = test_support::store_id(1);
         let record = ManifestRecord {
@@ -1699,6 +2345,7 @@ mod tests {
                 checksum: 7,
             },
             cutoff: genesis_placeholder(store_id),
+            retry: None,
         };
         let canonical = encode_manifest(record);
         assert_eq!(decode_manifest(&canonical, store_id), Ok(record));
@@ -1741,6 +2388,95 @@ mod tests {
             decode_manifest(&canonical, test_support::store_id(2)),
             Err(ManifestStoreError::StoreMismatch)
         ));
+
+        let v2_record = ManifestRecord {
+            retry: Some(RetryArtifactReference {
+                public: RetryStateReference::new(0, 1),
+                length: 68,
+                checksum: 9,
+            }),
+            ..record
+        };
+        let v2 = encode_manifest(v2_record);
+        assert_eq!(decode_manifest(&v2, store_id), Ok(v2_record));
+        for offset in [93_usize, 116] {
+            let mut hostile = v2;
+            hostile[offset] = 1;
+            let checksum = crc32c(&hostile[..124]);
+            hostile[124..].copy_from_slice(&checksum.to_be_bytes());
+            assert_eq!(
+                decode_manifest(&hostile, store_id),
+                Err(ManifestStoreError::InvalidManifest)
+            );
+        }
+        for (range, value) in [
+            (96..104, 0_u64),
+            (104..112, (MAX_RETRY_STATE_BYTES as u64) + 1),
+        ] {
+            let mut hostile = v2;
+            hostile[range].copy_from_slice(&value.to_be_bytes());
+            let checksum = crc32c(&hostile[..124]);
+            hostile[124..].copy_from_slice(&checksum.to_be_bytes());
+            assert_eq!(
+                decode_manifest(&hostile, store_id),
+                Err(ManifestStoreError::InvalidManifest)
+            );
+        }
+        let mut retry_slot = v2;
+        retry_slot[92] = 3;
+        let checksum = crc32c(&retry_slot[..124]);
+        retry_slot[124..].copy_from_slice(&checksum.to_be_bytes());
+        assert_eq!(
+            decode_manifest(&retry_slot, store_id),
+            Err(ManifestStoreError::InvalidManifest)
+        );
+
+        let v1_generation_two = ManifestRecord {
+            generation: 2,
+            ..record
+        };
+        assert_eq!(
+            select_current_manifest([Some(v2_record), Some(v1_generation_two)]),
+            Err(ManifestStoreError::InvalidManifest)
+        );
+        let skipped_retry_generation = ManifestRecord {
+            generation: 2,
+            retry: Some(RetryArtifactReference {
+                public: RetryStateReference::new(1, 2),
+                length: 68,
+                checksum: 10,
+            }),
+            ..record
+        };
+        assert_eq!(
+            select_current_manifest([Some(record), Some(skipped_retry_generation)]),
+            Err(ManifestStoreError::InvalidManifest)
+        );
+        let altered_same_generation = ManifestRecord {
+            generation: 2,
+            retry: Some(RetryArtifactReference {
+                public: RetryStateReference::new(1, 1),
+                length: 68,
+                checksum: 10,
+            }),
+            ..record
+        };
+        assert_eq!(
+            select_current_manifest([Some(v2_record), Some(altered_same_generation)]),
+            Err(ManifestStoreError::InvalidManifest)
+        );
+        let preserved_retry = ManifestRecord {
+            generation: 2,
+            ..v2_record
+        };
+        assert_eq!(
+            select_current_manifest([Some(v2_record), Some(preserved_retry)]),
+            Ok(Some((1, preserved_retry)))
+        );
+        assert_eq!(
+            select_current_manifest([Some(v2_record), Some(skipped_retry_generation)]),
+            Ok(Some((1, skipped_retry_generation)))
+        );
     }
 
     #[test]
