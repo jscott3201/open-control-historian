@@ -9,7 +9,7 @@ use och_core::{
 };
 use och_store::{
     ActiveJournalError, ActiveJournalInspection, ActiveJournalLimits, ActiveJournalOpenMode,
-    ManifestCommit, ManifestStore, ManifestStoreConfig, ManifestStoreError,
+    GenerationInventory, ManifestCommit, ManifestStore, ManifestStoreConfig, ManifestStoreError,
     ManifestStoreInspection, PendingRetryOutcome, PreparedAdmissionV1, RecoveredAdmissionV1,
     RegistryPersistenceOptions, RetryPersistenceOptions, RetryStateSnapshot,
 };
@@ -76,7 +76,7 @@ impl GroupCommitPolicy {
         self.max_bytes
     }
 
-    /// Returns session age that demands pre-manifest rotation.
+    /// Returns nonempty active-generation age that demands safe-boundary rotation.
     #[must_use]
     pub const fn rotation_age(self) -> Duration {
         self.rotation_age
@@ -343,6 +343,7 @@ pub enum RuntimeHealth {
 pub struct RuntimeInspection {
     store: ActiveJournalInspection,
     committed: ManifestCommit,
+    generations: GenerationInventory,
     pending_count: usize,
     pending_bytes: usize,
     health: RuntimeHealth,
@@ -359,6 +360,12 @@ impl RuntimeInspection {
     #[must_use]
     pub const fn committed(self) -> ManifestCommit {
         self.committed
+    }
+
+    /// Returns bounded path-free active and sealed generation facts.
+    #[must_use]
+    pub const fn generations(self) -> GenerationInventory {
+        self.generations
     }
 
     /// Returns commands retaining an outstanding slot.
@@ -400,20 +407,20 @@ impl InspectionShared {
         }
     }
 
-    fn update(&self, store: ManifestStoreInspection, health: RuntimeHealth) {
+    fn update(&self, store: &ManifestStoreInspection, health: RuntimeHealth) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.store = Some(store);
+        state.store = Some(*store);
         state.health = health;
     }
 
-    fn update_store(&self, store: ManifestStoreInspection) {
+    fn update_store(&self, store: &ManifestStoreInspection) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .store = Some(store);
+            .store = Some(*store);
     }
 
     fn set_health(&self, health: RuntimeHealth) {
@@ -436,19 +443,20 @@ impl InspectionShared {
     pub(crate) fn snapshot(
         &self,
         ingress: &IngressShared,
-        fallback: ManifestStoreInspection,
+        fallback: &ManifestStoreInspection,
     ) -> RuntimeInspection {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let store = state.store.unwrap_or(fallback);
+        let store = state.store.unwrap_or(*fallback);
         let health = state.health;
         drop(state);
         let (pending_count, pending_bytes) = ingress.pending_counts();
         RuntimeInspection {
             store: store.active(),
             committed: store.committed(),
+            generations: store.generations(),
             pending_count,
             pending_bytes,
             health,
@@ -530,13 +538,9 @@ pub(crate) fn run_store_worker(
             return;
         }
     };
-    let opened_at = Instant::now();
-    let initial_health = if rotation_required(&store, &options, opened_at) {
-        RuntimeHealth::RotationRequired
-    } else {
-        RuntimeHealth::Healthy
-    };
-    inspection.update(store.inspection(), initial_health);
+    let mut generation_opened_at = Instant::now();
+    let initial_health = RuntimeHealth::Healthy;
+    inspection.update(&store.inspection(), initial_health);
     if readiness
         .send(Ok(WorkerReady {
             inspection: store.inspection(),
@@ -556,9 +560,6 @@ pub(crate) fn run_store_worker(
         if stop.load(Ordering::Acquire) {
             ingress.stop();
             return;
-        }
-        if opened_at.elapsed() >= options.group_commit.rotation_age {
-            inspection.set_health(RuntimeHealth::RotationRequired);
         }
         let timeout = pending_since.map_or(options.group_commit.max_delay, |started| {
             options
@@ -584,16 +585,7 @@ pub(crate) fn run_store_worker(
                     fail_worker(&ingress, &inspection);
                     return;
                 }
-                if opened_at.elapsed() >= options.group_commit.rotation_age {
-                    let admission = prepared.into_admission();
-                    drop(admission);
-                    let _ = response.send(Err(ManifestStoreError::Active(
-                        ActiveJournalError::RotationRequired,
-                    )));
-                    inspection.set_health(RuntimeHealth::RotationRequired);
-                    ingress.stop();
-                    return;
-                }
+                let frame_len = prepared.frame_len();
                 let sequence = match store.next_append_sequence() {
                     Ok(sequence) => sequence,
                     Err(error) => {
@@ -602,7 +594,6 @@ pub(crate) fn run_store_worker(
                         return;
                     }
                 };
-                let frame_len = prepared.frame_len();
                 let frame = match (*prepared).into_frame(sequence) {
                     Ok(frame) => frame,
                     Err(error) => {
@@ -613,6 +604,45 @@ pub(crate) fn run_store_worker(
                         return;
                     }
                 };
+                if let Err(error) =
+                    store.preflight_historical_declaration(frame.admission().declaration())
+                {
+                    let _ = response.send(Err(error));
+                    fail_worker(&ingress, &inspection);
+                    return;
+                }
+                let age_rotation = store.inspection().active().active_records() > 0
+                    && generation_opened_at.elapsed() >= options.group_commit.rotation_age;
+                let fit_rotation = match store.requires_rotation(frame_len) {
+                    Ok(required) => required,
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                        fail_worker(&ingress, &inspection);
+                        return;
+                    }
+                };
+                if age_rotation || fit_rotation {
+                    if flush_pending(&mut store, &mut pending, &ingress, &inspection).is_err() {
+                        let _ = response.send(Err(ManifestStoreError::Faulted));
+                        return;
+                    }
+                    match store.rotate() {
+                        Ok(_) => {
+                            generation_opened_at = Instant::now();
+                            inspection.update(&store.inspection(), RuntimeHealth::Healthy);
+                        }
+                        Err(error) => {
+                            let _ = response.send(Err(error));
+                            if error == ManifestStoreError::GenerationCatalogFull {
+                                inspection.set_health(RuntimeHealth::RotationRequired);
+                                ingress.stop();
+                            } else {
+                                fail_worker(&ingress, &inspection);
+                            }
+                            return;
+                        }
+                    }
+                }
                 let end_offset = match store.append(&frame) {
                     Ok(end_offset) => end_offset,
                     Err(error) => {
@@ -635,10 +665,7 @@ pub(crate) fn run_store_worker(
                     sequence.get(),
                     end_offset,
                 );
-                inspection.update_store(store.inspection());
-                if rotation_required(&store, &options, opened_at) {
-                    inspection.set_health(RuntimeHealth::RotationRequired);
-                }
+                inspection.update_store(&store.inspection());
                 let admission = frame.into_admission();
                 unpublished = Some((slot, frame_len));
                 if response
@@ -671,13 +698,32 @@ pub(crate) fn run_store_worker(
                     append,
                 });
                 let pending_bytes = pending.iter().map(|entry| entry.bytes).sum::<usize>();
+                let rotation_demand = rotation_required(&store, &options, generation_opened_at);
                 let forced = priority == AdmissionPriority::Protected
                     || barrier == BarrierDemand::Immediate
                     || pending.len() >= options.group_commit.max_records
-                    || pending_bytes >= options.group_commit.max_bytes;
+                    || pending_bytes >= options.group_commit.max_bytes
+                    || rotation_demand;
                 if forced && flush_pending(&mut store, &mut pending, &ingress, &inspection).is_err()
                 {
                     return;
+                }
+                if rotation_demand && pending.is_empty() {
+                    match store.rotate() {
+                        Ok(_) => {
+                            generation_opened_at = Instant::now();
+                            inspection.update(&store.inspection(), RuntimeHealth::Healthy);
+                        }
+                        Err(ManifestStoreError::GenerationCatalogFull) => {
+                            inspection.set_health(RuntimeHealth::RotationRequired);
+                            ingress.stop();
+                            return;
+                        }
+                        Err(_) => {
+                            fail_worker(&ingress, &inspection);
+                            return;
+                        }
+                    }
                 }
                 if pending.is_empty() {
                     pending_since = None;
@@ -748,7 +794,7 @@ pub(crate) fn run_store_worker(
                     .as_ref()
                     .is_err_and(|error| !matches!(error, ManifestStoreError::Model(_)));
                 if result.as_ref().is_ok() {
-                    inspection.update_store(store.inspection());
+                    inspection.update_store(&store.inspection());
                 }
                 let _ = response.send(result);
                 if terminal {
@@ -786,7 +832,7 @@ pub(crate) fn run_store_worker(
                 let result = flush_pending(&mut store, &mut pending, &ingress, &inspection);
                 let _ = response.send(result);
                 if result.is_ok() {
-                    inspection.update(store.inspection(), RuntimeHealth::Stopped);
+                    inspection.update(&store.inspection(), RuntimeHealth::Stopped);
                 }
                 return;
             }
@@ -834,7 +880,7 @@ fn flush_pending(
     };
     // Inspection must name the committed manifest before any covered receipt
     // can wake and observe runtime state.
-    inspection.update_store(store.inspection());
+    inspection.update_store(&store.inspection());
     let completed = pending
         .iter()
         .map(|entry| DurableBatchEntry {
@@ -857,7 +903,7 @@ fn rotation_required(store: &ManifestStore, options: &StoreOptions, opened_at: I
     let active = store.inspection().active();
     active.active_bytes() >= options.journal_limits.max_active_bytes()
         || active.active_records() >= options.journal_limits.max_active_records()
-        || opened_at.elapsed() >= options.group_commit.rotation_age
+        || (active.active_records() > 0 && opened_at.elapsed() >= options.group_commit.rotation_age)
 }
 
 fn fail_worker(ingress: &IngressShared, inspection: &InspectionShared) {

@@ -1,17 +1,19 @@
-# Manifest V1/V2 and registry snapshot format
+# Manifest V1/V2/V3 and registry snapshot format
 
 M02-PR02a introduced Manifest V1 as the committed description of the
 generation-one active Journal V1 range, mechanical checkpoint cutoff, and
 complete canonical registry. M02-PR02b preserves those exact V1 bytes and adds
-Manifest V2 as the root of one bounded Retry State V1 snapshot. All integers are
-big-endian. Every checksum uses the Journal V1 CRC-32C parameters.
+Manifest V2 as the root of one bounded Retry State V1 snapshot. M02-PR02c
+preserves the exact 128-byte V1/V2 records and adds 160-byte Manifest V3 as the
+commit point for one successor active generation and Generation Catalog V1. All
+integers are big-endian. Every checksum uses the Journal V1 CRC-32C parameters.
 
 ## Ownership and fixed inventory
 
 One mutable open retains both `store-v1.lock`, which is never renamed, and the
 existing active-journal lock. The stable lock is acquired before manifest
-selection or mutation. The nonrecursive inventory is bounded at exactly 14
-recognized entries:
+selection or mutation. The nonrecursive inventory is hard-capped at 85 recognized
+files. Legacy V1/V2 names remain:
 
 - `store-v1.lock`;
 - `active-journal-v1.och` and `active-journal-v1.checkpoint`;
@@ -21,6 +23,13 @@ recognized entries:
 - `manifest-v1.staging`, `series-registry-v1.staging`, and
   `retry-state-v1.staging`.
 
+M02-PR02c additionally recognizes only deterministic successor active/checkpoint
+pairs, three Generation Catalog V1 finals plus one staging name, up to 64 sealed
+raw-Journal finals plus one staging name, and one fixed rotation-intent name. The
+exact patterns are defined by [Journal V1](journal-v1-format.md),
+[Generation Catalog V1](generation-catalog-v1-format.md), and
+[sealed raw Journal V1](sealed-journal-v1-format.md).
+
 Unknown files, non-files, excessive entries, invalid nonzero artifacts, and
 present staging artifacts fail closed. Errors expose operation, standard error
 kind, and optional OS error only; paths are not public evidence. Open performs a
@@ -28,12 +37,16 @@ read-only bounded inventory pass before lock creation, then repeats it under the
 stable lock. A newly created lock entry is directory-synchronized before
 readiness.
 
-The two manifest, three registry, and three retry finals are reusable bounded
-slots. A registry or retry candidate can replace only a slot unreferenced by
-both valid manifests. A new manifest replaces only the older alternate while an
-independently valid current manifest remains. After a manifest commits, retry
-slots not referenced by either valid manifest are removed and that removal is
-directory-synchronized; broad repair of interrupted evidence remains absent.
+The two manifest, three registry, three retry, and three catalog finals are
+reusable bounded slots. A registry, retry, or catalog candidate can replace only
+a slot unreferenced by both valid manifests. A new manifest replaces only the
+older alternate while an independently valid current manifest remains. After a
+manifest commits, retry and catalog slots not referenced by either prospective
+valid manifest are removed and that removal is directory-synchronized. A crash
+before catalog cleanup may leave only a canonically decoded strict prefix of a
+referenced newer catalog; open verifies that exact relation and all root evidence
+before removing it idempotently. A future, forked, unrelated, or otherwise
+unreferenced catalog refuses; broad repair remains absent.
 
 ## Active-header compatibility fence
 
@@ -43,7 +56,7 @@ unsigned `1` to unsigned `2`; magic, length, and `StoreId` are unchanged. Every
 Journal V1 admission frame remains version 1 and byte-for-byte unchanged. The
 old `JournalHeaderV1` decoder rejects version 2, so a PR01b1 binary fails closed
 after upgrade. A PR02a binary likewise rejects Manifest V2 or the expanded retry
-artifact inventory.
+artifact inventory; pre-PR02c binaries reject Manifest V3 and generation artifacts.
 
 Under the stable lock and retained journal lock, premanifest bootstrap accepts a
 valid V1 or V2 journal header. A nonempty recovered journal requires an exact
@@ -55,16 +68,17 @@ store requires the same proof.
 
 ## Shared manifest fields
 
-Each manifest slot is exactly 128 bytes. V1 and V2 share bytes 0..92:
+V1 and V2 remain exactly 128 bytes. V3 is exactly 160 bytes. All three share
+bytes 0..92:
 
 | Offset | Length | Field | Contract |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | ASCII `OCHMAN01` |
-| 8 | 2 | version | unsigned `1` or `2` |
-| 10 | 2 | record length | unsigned `128` |
+| 8 | 2 | version | unsigned `1`, `2`, or `3` |
+| 10 | 2 | record length | unsigned `128` for V1/V2; `160` for V3 |
 | 12 | 16 | store identity | validated UUIDv7 bytes |
 | 28 | 8 | manifest generation | positive |
-| 36 | 8 | journal generation | exactly `1` |
+| 36 | 8 | journal generation | exactly `1` for V1/V2; greater than `1` for V3 |
 | 44 | 8 | checkpoint generation | positive mechanical generation |
 | 52 | 8 | durable append sequence | zero only at genesis |
 | 60 | 8 | durable end offset | exact checkpoint frame boundary |
@@ -90,6 +104,26 @@ Manifest V1 also uses the checksum at bytes 124..128. Its original bytes and
 decoder remain unchanged. V2 requires the referenced retry artifact to match
 slot, generation, length, checksum, `StoreId`, and configured capacities exactly.
 
+Manifest V3 preserves bytes 0..124 with V2 retry fields and assigns the remaining
+36 bytes as follows:
+
+| Offset | Length | Field | Contract |
+| ---: | ---: | --- | --- |
+| 124 | 8 | active exclusive sequence floor | positive; at or below active cutoff |
+| 132 | 1 | catalog slot | `0..3` |
+| 133 | 3 | reserved | zero |
+| 136 | 8 | catalog generation | positive |
+| 144 | 8 | catalog artifact length | `1..4,164` |
+| 152 | 4 | catalog complete-byte checksum | CRC-32C over complete catalog artifact |
+| 156 | 4 | manifest checksum | CRC-32C over bytes 0..156 |
+
+An empty V3 active has append sequence equal to its floor and end offset exactly
+28. A nonempty active has a greater sequence and frame-boundary end. V3 binds the
+exact active generation, local checkpoint generation/end, global sequence
+floor/cutoff, registry, retry snapshot, and catalog. Public `ManifestCommit`
+retains that floor and optional full catalog identity; legacy commits retain zero
+floor and no catalog.
+
 Genesis has manifest, registry, and retry generation one and publishes an empty
 Retry State V1 snapshot before Manifest V2. With two manifest slots, the current
 candidate is the greater of exactly consecutive generations. A lone manifest is
@@ -97,8 +131,9 @@ accepted only at generation one. Equal, skipped, invalid, or ambiguous nonzero
 candidates refuse. Manifest sequences may remain V1, transition once from V1 to
 retry generation one, preserve one exact retry reference across registry-only
 commits, or advance that reference by exactly one generation to a different
-slot. V2 cannot regress to V1. The selected cutoff must equal the active
-checkpoint exactly.
+slot. V2 cannot regress to V1. V3 requires exact successor generation/catalog
+progression and cannot regress to V1/V2. The selected cutoff must equal the
+active checkpoint exactly.
 
 A legacy valid Manifest V1 remains openable with empty in-memory retry tiers and
 no retry reference. Open does not scan or backfill its retained Journal V1
@@ -165,13 +200,44 @@ For an append barrier, durable order is:
 2. refuse the caller-supplied pending range in constant time unless its positive
    count is at most 4,096 and exactly equals the append-sequence delta, then
    derive the FIFO retry candidate and anticipated manifest commit;
-3. count, write, synchronize, read back, decode, and exact-compare Retry State V1;
+3. count, write, synchronize, read back, decode, and exact-compare Retry State V1/V2;
 4. rename it over a retry slot unreferenced by both manifests and synchronize the
    directory;
-5. publish Manifest V2 naming the cutoff, registry, and retry snapshot;
+5. publish Manifest V2/V3 naming the cutoff, registry, and retry snapshot;
 6. clean now-unreferenced retry slots and synchronize that removal;
 7. install the immutable retry projection and complete all covered receipts in
    one bounded runtime transition, then wake waiters.
+
+Rotation occurs only after that ordinary durable receipt batch has completed. Its
+commit order is:
+
+1. require an exact nonempty manifest/checkpoint cutoff and no unpublished append;
+2. persist, synchronize, read back, and directory-sync the fixed 96-byte intent;
+3. stream-build, synchronize, fully verify, rename, directory-sync, and verify
+   the immutable raw-Journal seal;
+4. exclusively create, synchronize, and read back the empty successor at the
+   prior global sequence cutoff;
+5. publish and verify the next Generation Catalog V1 slot while preserving the
+   current retry snapshot when no retry semantics changed;
+6. publish and directory-sync alternate Manifest V3 last as the commit point;
+7. adopt the successor, then narrowly remove predecessor duplicates, intent, and
+   now-unreferenced catalog/retry slots.
+
+The intent is never authority. Before the V3 commit, exact derivative candidates
+are removed and the prior manifest remains authoritative. After it, catalog,
+successor, registry, and retry evidence are verified under V3 before redundant
+predecessor evidence is removed. Missing, mismatched, or ambiguous evidence
+refuses unchanged; there is no broad fallback or repair.
+
+The retained manifest pair independently proves every catalog advance after the
+intent is gone. The appended entry must exactly describe the older manifest's
+journal generation, sequence floor/cutoff, durable end and artifact length, and
+registry generation. The newer root must be the next manifest generation, keep
+the older registry and retry references unchanged, and name an empty checked
+successor journal: generation `older + 1`, sequence floor and cutoff equal to the
+older cutoff sequence, 28-byte end, and checkpoint generation `1`. This law
+applies both to the first `None -> Catalog V1` transition and every later exact
+one-entry catalog advance.
 
 A write, artifact-sync, readback, rename, directory-sync, transition refusal,
 generation/slot exhaustion, cleanup failure, or any other error after journal
@@ -183,9 +249,9 @@ queue, decoded-history backfill, or raw manifest/path/descriptor API.
 
 ## Deliberate limits
 
-This slice adds only the bounded two-tier retry projection specified in
-[Retry State V1](retry-state-v1-format.md). Latest remains volatile and empty
-after reopen. Rotation/sealing, successor journal generations, immutable
-segments, broad recovery/convergence, disk-pressure policy, query, rollups,
-retention, and an unbounded or time-based retry horizon remain separate
-successors recorded in the [PR02b continuation](continuation-m02-pr02b.md).
+This authority now includes the bounded two-tier retry projection, raw-Journal
+rotation/sealing, Generation Catalog V1, and Manifest V3. Latest remains volatile
+and empty after reopen. Final native segments, sealed-history queries, broad
+recovery/convergence, reclamation, disk-pressure policy, rollups, retention, and
+an unbounded or time-based retry horizon remain separate successors recorded in
+the [PR02c continuation](continuation-m02-pr02c.md).

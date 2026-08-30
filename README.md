@@ -8,10 +8,10 @@ independent deterministic contract evidence, and one filesystem-backed runtime
 path with exact byte reservation, a dedicated blocking writer, Journal V1 append,
 group barriers, crash-safe manifest-backed durable receipts, bounded canonical
 registry persistence/bootstrap, a bounded durable replay/guard horizon, bounded
-reopen evidence, and volatile latest-observation snapshots. It does **not** yet
-provide successor rotation,
-unbounded or time-based retry, immutable history, current/held-value, or query
-behavior.
+successor rotation and raw-Journal sealing, bounded reopen evidence, and volatile
+latest-observation snapshots. It does **not** yet provide final native segments,
+retention/reclamation, unbounded or time-based retry, current/held-value, or
+query behavior.
 
 ## Current status
 
@@ -31,8 +31,11 @@ artifacts. Its synchronous fixed 16-command ingress accepts only complete
 preserves FIFO across protected/normal/bulk resource classes, and coalesces only
 equivalent outstanding retries. Handled receipts identify an append after its
 volatile publication decision; distinct durable receipts are released only after
-the group barrier covers that append in the journal, checkpoint, Retry State V1,
-and committed Manifest V2. Completed equivalents replay their original exact
+the group barrier covers that append in the journal, checkpoint, Retry State
+V1/V2, and committed Manifest V2/V3. At a safe nonempty size/count/age boundary,
+the sole writer completes ordinary durability, seals the raw Journal V1 bytes,
+commits an empty successor through Generation Catalog V1 and Manifest V3, and
+then continues the same global append sequence. Completed equivalents replay their original exact
 handled/durable proof while the FIFO outcome tier retains them; overflow becomes
 a bounded expired/conflict guard, and only eviction from both tiers makes a key
 fresh. Public lifecycle and bind requests cross a fixed 16-request
@@ -46,24 +49,32 @@ final barrier, seals latest, and joins. Drop signals fail-stop without blocking;
 a fixed reaper owns the eventual blocking-thread join.
 
 `och-store` owns fixed store-scoped Journal V1 framing and hostile bounded decode,
-plus the fixed generation-one active journal/checkpoint, a never-renamed stable
-store lock, the retained journal lock, two reusable Manifest V1/V2 slots, three
-reusable complete registry slots, and three reusable Retry State V1 slots. It
+the legacy generation-one names plus deterministic successor active pairs, a
+never-renamed stable store lock, generation-scoped journal locks, two reusable
+Manifest V1/V2/V3 slots, three reusable complete registry and retry slots, three
+Generation Catalog V1 slots, and at most 64 immutable sealed raw-Journal
+generations. It
 restores registry state only through public core lifecycle replay, requires exact
 historical declarations for recovered and new admission bytes, and commits a
 manifest only after the mechanical cutoff. Reopen exposes decoded records only
 as non-authorizing evidence, restores only the manifest-referenced retry
-projection, and does not rebuild latest. A durable receipt proves the manifest
-names the active journal/checkpoint cutoff under the stated platform contract;
-it is not an immutable-history or universal physical-power-loss claim.
+projection, and does not rebuild latest. Normal open reads bounded catalog/header
+metadata rather than every sealed payload byte. Each V3 root binds the exact
+active successor/floor to the last sealed catalog entry; consecutive catalogs
+append one entry to an identical prefix, and extra recognized generation files
+refuse. A verified strict-prefix catalog left by an ordinary postcommit cleanup
+interruption is the sole narrow redundant-catalog exception. A durable receipt proves the
+manifest names the exact active generation/cutoff and retains its original commit
+across later rotation under the stated platform contract; it is not a final
+queryable-segment or universal physical-power-loss claim.
 
 The current workspace contains:
 
 | Package | Role | Purpose |
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model, bounded series declaration authority, and a measurement-only example |
-| [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, durable retry replay/guard classification, writer-serialized registry control, manifest-backed receipts, and volatile latest snapshots |
-| [`och-store`](crates/och-store/) | native | Journal V1, bounded active artifacts, stable locking, canonical registry and retry snapshots, manifests, and reopen inspection |
+| [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, durable retry replay/guard classification, automatic safe-boundary rotation, writer-serialized registry control, manifest-backed receipts, and volatile latest snapshots |
+| [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
 `och-core` has no dependencies. `och-store` depends inward on `och-core`, and
@@ -148,14 +159,22 @@ through nextest rather than being repeated with `cargo test`.
   specifies the bounded durable two-tier retry authority transition.
 - [M02-PR02b continuation](docs/continuation-m02-pr02b.md) records exact retry
   publication, atomic runtime handoff, compatibility, evidence, and successors.
+- [M02-PR02c implementation brief](docs/implementation-brief-m02-pr02c.md)
+  specifies the bounded rotation/seal authority transition and exclusions.
+- [M02-PR02c continuation](docs/continuation-m02-pr02c.md) records exact
+  generation, convergence, compatibility, evidence, and successor boundaries.
 - [Journal V1 format](docs/journal-v1-format.md) defines the exact version-one
   header, frame, payload, active-artifact, checkpoint, byte-order, bound,
   checksum, and refusal contracts.
-- [Manifest V1/V2 format](docs/manifest-v1-format.md) defines the fixed inventory,
+- [Manifest V1/V2/V3 format](docs/manifest-v1-format.md) defines the fixed inventory,
   header fence, manifest and registry bytes, retry reference, publication order,
   bounds, and strict-reopen contract.
-- [Retry State V1 format](docs/retry-state-v1-format.md) defines exact durable
+- [Retry State V1/V2 format](docs/retry-state-v1-format.md) defines exact durable
   replay/guard bytes, capacities, canonical ordering, and refusal law.
+- [Generation Catalog V1](docs/generation-catalog-v1-format.md) defines the fixed
+  bounded sealed-generation inventory and reference law.
+- [Sealed raw Journal V1](docs/sealed-journal-v1-format.md) defines the immutable
+  pre-segment artifact and streaming verification contract.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

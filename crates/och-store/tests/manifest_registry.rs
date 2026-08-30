@@ -443,6 +443,173 @@ fn one_replay_retry_and_manifest_v2_match_the_primitive_oracle_exactly() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn rotation_manifest_catalog_seal_and_retry_v2_match_primitive_oracles_exactly() {
+    let directory = TestDirectory::new("rotation-oracles");
+    let first_admission = support::no_change_admission_with_retry_key("rotation-first");
+    let declaration = first_admission.declaration().clone();
+    let first = frame(first_admission, 1);
+    let mut store = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::CreateNew,
+        registry_options(),
+    ))
+    .expect("create rotation oracle store");
+    store
+        .register(
+            declaration.series_id(),
+            declaration.binding().clone(),
+            declaration.payload().clone(),
+            declaration.evidence().clone(),
+        )
+        .expect("register rotation oracle declaration");
+    let first_end = store.append(&first).expect("append first oracle frame");
+    let (first_commit, _) = store
+        .sync_pending(&[PendingRetryOutcome::new(
+            first.admission().retry().clone(),
+            1,
+            first_end,
+        )])
+        .expect("commit first oracle frame");
+    let expected_sealed =
+        manifest_oracle::sealed_raw_journal_v1(support::uuid_bytes(1), &[first.bytes()]);
+    let rotated = store.rotate().expect("commit oracle rotation");
+    let catalog_reference = rotated
+        .generation_catalog()
+        .expect("rotation commits catalog identity");
+    let sealed_name = "sealed-journal-v1-g00000000000000000001.och";
+    let sealed = fs::read(directory.path().join(sealed_name)).expect("read sealed raw journal");
+    assert_eq!(sealed, expected_sealed);
+    let catalog_name = format!(
+        "generation-catalog-v1-slot-{}.och",
+        catalog_reference.slot()
+    );
+    let catalog = fs::read(directory.path().join(catalog_name)).expect("read generation catalog");
+    let expected_catalog = manifest_oracle::generation_catalog_v1(
+        support::uuid_bytes(1),
+        catalog_reference.generation(),
+        &[manifest_oracle::CatalogEntry {
+            journal_generation: 1,
+            sequence_floor: 0,
+            sequence_cutoff: 1,
+            end_offset: first_end,
+            registry_generation: rotated.registry_generation(),
+            artifact_length: sealed.len() as u64,
+            artifact_checksum: manifest_oracle::checksum(&sealed),
+        }],
+    );
+    assert_eq!(catalog, expected_catalog);
+    assert_eq!(catalog_reference.length(), catalog.len() as u64);
+    assert_eq!(
+        catalog_reference.checksum(),
+        manifest_oracle::checksum(&catalog)
+    );
+
+    let second_admission = support::no_change_admission_with_retry_key("rotation-second");
+    let second = frame(second_admission, 2);
+    let second_end = store
+        .append(&second)
+        .expect("append successor oracle frame");
+    let (second_commit, retry_state) = store
+        .sync_pending(&[PendingRetryOutcome::new(
+            second.admission().retry().clone(),
+            2,
+            second_end,
+        )])
+        .expect("commit successor oracle frame");
+    assert_eq!(retry_state.replay().len(), 2);
+    assert_eq!(retry_state.replay()[0].manifest_commit(), first_commit);
+    assert_eq!(second_commit.generation_catalog(), Some(catalog_reference));
+    let retry_reference = second_commit.retry_state().expect("V2 retry identity");
+    drop(store);
+
+    let retry_name = format!("retry-state-v1-slot-{}.och", retry_reference.slot());
+    let retry_bytes = fs::read(directory.path().join(retry_name)).expect("read Retry State V2");
+    let oracle_catalog = manifest_oracle::CatalogReference {
+        slot: catalog_reference.slot(),
+        generation: catalog_reference.generation(),
+        length: catalog_reference.length(),
+        checksum: catalog_reference.checksum(),
+    };
+    let oracle_outcomes = retry_state
+        .replay()
+        .iter()
+        .map(|outcome| {
+            let qualification = outcome.qualification();
+            let commit = outcome.manifest_commit();
+            let cutoff = commit.durable_cutoff();
+            let retry = commit.retry_state().expect("retained retry identity");
+            manifest_oracle::RetryV2Outcome {
+                series: *qualification.series_id().as_bytes(),
+                producer: *qualification.producer_id().as_bytes(),
+                key: qualification.key().as_str(),
+                content_format: qualification.content().format().as_str(),
+                content_version: qualification.content().version().get(),
+                digest: *qualification.content().sha256(),
+                append_sequence: outcome.append_sequence(),
+                end_offset: outcome.end_offset(),
+                manifest_generation: commit.manifest_generation(),
+                registry_slot: commit.registry_slot(),
+                registry_generation: commit.registry_generation(),
+                journal_generation: cutoff.journal().generation(),
+                checkpoint_generation: cutoff.checkpoint_generation(),
+                cutoff_sequence: cutoff.append_sequence(),
+                cutoff_end: cutoff.end_offset(),
+                retry_slot: retry.slot(),
+                retry_generation: retry.generation(),
+                sequence_floor: commit.sequence_floor(),
+                catalog: commit.generation_catalog().map(|_| oracle_catalog),
+            }
+        })
+        .collect::<Vec<_>>();
+    let retry_options = RetryPersistenceOptions::new(2, 2).expect("oracle retry options");
+    let expected_retry = manifest_oracle::retry_v2(
+        support::uuid_bytes(1),
+        retry_reference.generation(),
+        u32::try_from(retry_options.replay_capacity()).expect("replay capacity fits u32"),
+        u32::try_from(retry_options.guard_capacity()).expect("guard capacity fits u32"),
+        &oracle_outcomes,
+    );
+    assert_eq!(retry_bytes, expected_retry);
+
+    let registry_name = format!(
+        "series-registry-v1-slot-{}.och",
+        second_commit.registry_slot()
+    );
+    let registry_bytes = fs::read(directory.path().join(registry_name)).expect("read registry");
+    let manifest_name = if (second_commit.manifest_generation() - 1).is_multiple_of(2) {
+        MANIFEST_SLOT_0_FILE_NAME
+    } else {
+        MANIFEST_SLOT_1_FILE_NAME
+    };
+    let manifest_bytes = fs::read(directory.path().join(manifest_name)).expect("read Manifest V3");
+    let cutoff = second_commit.durable_cutoff();
+    assert_eq!(
+        manifest_bytes,
+        manifest_oracle::manifest_v3(
+            support::uuid_bytes(1),
+            second_commit.manifest_generation(),
+            cutoff.journal().generation(),
+            cutoff.checkpoint_generation(),
+            cutoff.append_sequence(),
+            cutoff.end_offset(),
+            second_commit.registry_slot(),
+            second_commit.registry_generation(),
+            &registry_bytes,
+            retry_reference.slot(),
+            retry_reference.generation(),
+            &expected_retry,
+            second_commit.sequence_floor(),
+            oracle_catalog,
+        )
+    );
+
+    for forbidden in ["och_store", "och_core", "encode_manifest", "encode_catalog"] {
+        assert!(!ORACLE_SOURCE.contains(forbidden));
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn reopen_rejects_checksummed_retry_state_inconsistent_with_current_or_older_manifest_root() {
     for hostile_current in [true, false] {
         let directory = TestDirectory::new(if hostile_current {

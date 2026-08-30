@@ -18,7 +18,10 @@ mechanical durable cutoff evidence around it. M02-PR02a again leaves core
 unchanged while persisting the complete bounded `SeriesRegistry` snapshot and
 making one manifest the outer committed cutoff. M02-PR02b also leaves core
 unchanged: `och-store` persists the exact core `RetryQualification` comparison
-inputs inside a bounded two-tier runtime persistence policy. All pre-existing exact value,
+inputs inside a bounded two-tier runtime persistence policy. M02-PR02c again
+leaves core unchanged while `och-store` rotates active generations, seals exact
+raw Journal V1 bytes, and carries original commit evidence across generations.
+All pre-existing exact value,
 time, quality, order, collection, gap/no-change, envelope, and retry semantics
 remain unchanged. The model is native
 Historian authority rather than a serialization of a Studio, Engine, transport,
@@ -214,18 +217,22 @@ inspection and deterministic re-encoding. It deliberately cannot construct or
 convert into `CanonicalAdmission`, bind new evidence, resolve missing declaration
 history, mutate a registry, or be submitted to runtime.
 
-M02-PR01b1 places those frames in one fixed generation-one active journal paired
-with a two-slot mechanical checkpoint. M02-PR02a adds a stable store lock, a
+M02-PR01b1 first placed those frames in one fixed generation-one active journal
+paired with a two-slot mechanical checkpoint. M02-PR02a adds a stable store lock, a
 header-v2 compatibility fence in the unchanged 28-byte layout, two manifest
 slots, and three complete registry snapshot slots. M02-PR02b adds Manifest V2
 within the same 128-byte slots and three reusable Retry State V1 slots.
+M02-PR02c preserves every old byte and adds deterministic successor active pairs,
+raw-Journal seals, Generation Catalog V1, 160-byte Manifest V3, and Retry State
+V2 only when a retained replay outcome carries generation/catalog identity.
 Admission-frame bytes remain
 Journal V1. The runtime computes the exact frame size
 without allocating, reserves count and bytes atomically, then allocates and
-encodes under that retained reservation. The sole blocking writer assigns append
-sequence and validates frame and declaration StoreId against the journal header.
+encodes under that retained reservation. The sole blocking writer assigns one
+store-global append sequence across active generations and validates frame and
+declaration StoreId against the journal header.
 Durable order is append, volatile publication, journal sync, alternate checkpoint
-write, checkpoint sync, retry snapshot publication, Manifest V2 publication
+write, checkpoint sync, retry snapshot publication, Manifest V2/V3 publication
 naming that exact cutoff and the current registry/retry snapshots, then one
 atomic runtime projection/receipt transition and waiter wake. The checkpoint
 retains only store and journal identity, slot generation, append sequence, end
@@ -244,14 +251,25 @@ bootstrap empty. New binding uses the current active registry, while append
 requires exact equality with `resolve(series, revision)` and therefore preserves
 already-issued historical evidence after correction or retirement. Returned
 reopen records remain `DecodedAdmissionV1` inspection evidence and do not rebuild
-volatile latest. A referenced Retry State V1 snapshot, rather than decoded
+volatile latest. A referenced Retry State V1/V2 snapshot, rather than decoded
 journal history, restores the bounded completed-retry projection. A legacy
 Manifest V1 restores empty retry tiers and deliberately receives no backfill.
-Persistence remains bounded to this active generation and manifest cutoff;
-rotation, immutable history, broad recovery, latest projection, and an unbounded
-or time-based durable retry horizon remain absent. Exact bytes and publication
-law are specified in [Manifest V1/V2](manifest-v1-format.md) and
-[Retry State V1](retry-state-v1-format.md).
+Rotation applies only to an exact fully durable nonempty active range. It creates
+an empty successor whose exclusive sequence floor is the prior inclusive cutoff;
+offset and checkpoint generations restart locally, while every returned receipt
+keeps its original `ManifestCommit`. Catalog entries preserve historical range,
+registry-generation, length, checksum, and raw-Journal format evidence. Normal
+open requires the active generation/floor to be the exact checked successor of
+the last catalog entry and consecutive catalog roots to preserve an identical
+prefix and append one entry. Active/checkpoint pairs and sealed finals must match
+the selected root; a verified strict-prefix catalog left by ordinary postcommit
+cleanup interruption is the sole narrow redundancy. Open does not reinterpret
+sealed payloads or make them queryable. Final native
+segments, reclamation, broad recovery, latest projection, and an unbounded or
+time-based durable retry horizon remain absent. Exact law is specified in
+[Manifest V1/V2/V3](manifest-v1-format.md), [Retry State V1/V2](retry-state-v1-format.md),
+[Generation Catalog V1](generation-catalog-v1-format.md), and
+[sealed raw Journal V1](sealed-journal-v1-format.md).
 
 ### Values and content
 
@@ -349,6 +367,13 @@ durable append sequence only, and replay, conflict, or expired hits never refres
 it. The sole blocking store writer mutates this projection; runtime ingress holds
 only the immutable committed snapshot installed atomically with the receipts it
 covers.
+
+M02-PR02c changes neither classification nor FIFO horizon. Retry State V2 extends
+only persisted replay evidence so outcomes may span journal generations. Global
+append order remains strict; end offsets and checkpoint generations compare only
+within their owning generation. Older outcomes must be covered by the exact
+catalog referenced from the current Manifest V3, and their embedded original
+commit is never rewritten merely because rotation occurred.
 
 ## Evidence ownership
 

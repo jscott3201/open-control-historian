@@ -1,18 +1,22 @@
-//! Bounded durable retry projection and Retry State V1 codec.
+//! Bounded durable retry projection and compatible Retry State V1/V2 codec.
 
 use crate::codec::{Cursor, Encoder, crc32c, decode_retry, encode_retry};
-use crate::{ACTIVE_JOURNAL_GENERATION, DurableCutoff, JournalV1Error, ManifestCommit};
+use crate::{
+    ACTIVE_JOURNAL_GENERATION, DurableCutoff, GenerationCatalogReference,
+    GenerationCatalogSnapshot, JournalV1Error, ManifestCommit,
+};
 use och_core::{RetryClassification, RetryQualification, StoreId};
 use std::error::Error;
 use std::fmt;
 
 /// Hard maximum replay plus guard entries in one durable retry projection.
 pub const MAX_PERSISTED_RETRY_ENTRIES: usize = 4_096;
-/// Hard maximum bytes in one Retry State V1 artifact.
+/// Hard maximum bytes in one Retry State V1 or V2 artifact.
 pub const MAX_RETRY_STATE_BYTES: usize = 2 * 1_024 * 1_024;
 
 pub(crate) const RETRY_MAGIC: [u8; 8] = *b"OCHRET01";
 pub(crate) const RETRY_VERSION: u16 = 1;
+pub(crate) const RETRY_V2_VERSION: u16 = 2;
 pub(crate) const RETRY_HEADER_LEN: usize = 64;
 const RETRY_HEADER_LEN_U16: u16 = 64;
 const RETRY_CRC_LEN: usize = 4;
@@ -380,12 +384,21 @@ impl RetryStateSnapshot {
             guard: guard.into_boxed_slice(),
         };
         validate_state(&candidate)?;
-        validate_root(&candidate, committed)?;
+        validate_root(&candidate, committed, None)?;
         Ok(candidate)
     }
 
+    #[cfg(test)]
     pub(crate) fn validates_root(&self, root: ManifestCommit) -> bool {
-        validate_root(self, root).is_ok()
+        validate_root(self, root, None).is_ok()
+    }
+
+    pub(crate) fn validates_root_with_catalog(
+        &self,
+        root: ManifestCommit,
+        catalog: &GenerationCatalogSnapshot,
+    ) -> bool {
+        validate_root(self, root, Some(catalog)).is_ok()
     }
 }
 
@@ -415,8 +428,17 @@ pub(crate) fn encode_retry_state_with_limit(
 ) -> Result<Vec<u8>, RetryStateCodecError> {
     validate_state(snapshot)?;
     let reference = snapshot.reference.ok_or(RetryStateCodecError::Invalid)?;
+    let version = if snapshot
+        .replay
+        .iter()
+        .any(|outcome| outcome.committed.generation_catalog().is_some())
+    {
+        RETRY_V2_VERSION
+    } else {
+        RETRY_VERSION
+    };
     let mut counter = Encoder::counting();
-    encode_payload(&mut counter, snapshot)?;
+    encode_payload(&mut counter, snapshot, version)?;
     let payload_len = counter.len();
     let total = RETRY_HEADER_LEN
         .checked_add(payload_len)
@@ -426,14 +448,14 @@ pub(crate) fn encode_retry_state_with_limit(
         return Err(RetryStateCodecError::Invalid);
     }
     let mut payload = Encoder::new();
-    encode_payload(&mut payload, snapshot)?;
+    encode_payload(&mut payload, snapshot, version)?;
     let payload = payload.finish();
     if payload.len() != payload_len {
         return Err(RetryStateCodecError::Invalid);
     }
     let mut bytes = vec![0_u8; total];
     bytes[..8].copy_from_slice(&RETRY_MAGIC);
-    bytes[8..10].copy_from_slice(&RETRY_VERSION.to_be_bytes());
+    bytes[8..10].copy_from_slice(&version.to_be_bytes());
     bytes[10..12].copy_from_slice(&RETRY_HEADER_LEN_U16.to_be_bytes());
     bytes[12..28].copy_from_slice(snapshot.store_id.as_bytes());
     bytes[28..36].copy_from_slice(&reference.generation.to_be_bytes());
@@ -472,6 +494,7 @@ pub(crate) fn encode_retry_state_with_limit(
 fn encode_payload(
     encoder: &mut Encoder,
     snapshot: &RetryStateSnapshot,
+    version: u16,
 ) -> Result<(), RetryStateCodecError> {
     for outcome in &snapshot.replay {
         encode_retry(encoder, &outcome.qualification).map_err(invalid_journal)?;
@@ -491,6 +514,21 @@ fn encode_payload(
         encoder.u8(retry.slot());
         encoder.bytes(&[0; 7]);
         encoder.u64(retry.generation());
+        if version == RETRY_V2_VERSION {
+            encoder.u64(commit.sequence_floor());
+            match commit.generation_catalog() {
+                Some(catalog) => {
+                    encoder.u8(1);
+                    encoder.u8(catalog.slot());
+                    encoder.bytes(&[0; 6]);
+                    encoder.u64(catalog.generation());
+                    encoder.u64(catalog.length());
+                    encoder.u32(catalog.checksum());
+                    encoder.bytes(&[0; 12]);
+                }
+                None => encoder.bytes(&[0; 40]),
+            }
+        }
     }
     for entry in &snapshot.guard {
         encode_retry(encoder, &entry.qualification).map_err(invalid_journal)?;
@@ -510,10 +548,13 @@ pub(crate) fn decode_retry_state_at_slot(
         || bytes.len() < RETRY_HEADER_LEN + RETRY_CRC_LEN
         || bytes.len() > MAX_RETRY_STATE_BYTES
         || bytes[..8] != RETRY_MAGIC
-        || u16::from_be_bytes(bytes[8..10].try_into().unwrap_or_default()) != RETRY_VERSION
         || u16::from_be_bytes(bytes[10..12].try_into().unwrap_or_default()) != RETRY_HEADER_LEN_U16
         || bytes[60..64].iter().any(|byte| *byte != 0)
     {
+        return Err(RetryStateCodecError::Invalid);
+    }
+    let version = u16::from_be_bytes(bytes[8..10].try_into().unwrap_or_default());
+    if version != RETRY_VERSION && version != RETRY_V2_VERSION {
         return Err(RetryStateCodecError::Invalid);
     }
     let checksum_offset = bytes.len() - RETRY_CRC_LEN;
@@ -593,6 +634,51 @@ pub(crate) fn decode_retry_state_at_slot(
             return Err(RetryStateCodecError::Invalid);
         }
         let retry_generation = cursor.u64().map_err(invalid_journal)?;
+        let (sequence_floor, catalog) = if version == RETRY_V2_VERSION {
+            let sequence_floor = cursor.u64().map_err(invalid_journal)?;
+            let present = cursor.u8().map_err(invalid_journal)?;
+            let catalog_slot = cursor.u8().map_err(invalid_journal)?;
+            if cursor
+                .take(6)
+                .map_err(invalid_journal)?
+                .iter()
+                .any(|byte| *byte != 0)
+            {
+                return Err(RetryStateCodecError::Invalid);
+            }
+            let catalog_generation = cursor.u64().map_err(invalid_journal)?;
+            let catalog_length = cursor.u64().map_err(invalid_journal)?;
+            let catalog_checksum = cursor.u32().map_err(invalid_journal)?;
+            if cursor
+                .take(12)
+                .map_err(invalid_journal)?
+                .iter()
+                .any(|byte| *byte != 0)
+            {
+                return Err(RetryStateCodecError::Invalid);
+            }
+            let catalog = match present {
+                0 if catalog_slot == 0
+                    && catalog_generation == 0
+                    && catalog_length == 0
+                    && catalog_checksum == 0 =>
+                {
+                    None
+                }
+                1 if catalog_slot < 3 && catalog_generation > 0 && catalog_length > 0 => {
+                    Some(GenerationCatalogReference::new(
+                        catalog_slot,
+                        catalog_generation,
+                        catalog_length,
+                        catalog_checksum,
+                    ))
+                }
+                _ => return Err(RetryStateCodecError::Invalid),
+            };
+            (sequence_floor, catalog)
+        } else {
+            (0, None)
+        };
         let cutoff = DurableCutoff::from_manifest(
             store_id,
             journal_generation,
@@ -600,12 +686,14 @@ pub(crate) fn decode_retry_state_at_slot(
             cutoff_sequence,
             cutoff_end,
         );
-        let committed = ManifestCommit::from_parts(
+        let committed = ManifestCommit::from_generation_parts(
             manifest_generation,
             registry_generation,
             registry_slot,
             cutoff,
             Some(RetryStateReference::new(retry_slot, retry_generation)),
+            sequence_floor,
+            catalog,
         );
         replay.push(RetryReplayOutcome {
             qualification,
@@ -643,6 +731,7 @@ pub(crate) fn decode_retry_state_at_slot(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_state(snapshot: &RetryStateSnapshot) -> Result<(), RetryStateCodecError> {
     if snapshot.replay.len() > snapshot.options.replay_capacity
         || snapshot.guard.len() > snapshot.options.guard_capacity
@@ -663,6 +752,7 @@ fn validate_state(snapshot: &RetryStateSnapshot) -> Result<(), RetryStateCodecEr
         previous = entry.append_sequence;
     }
     let mut previous_end = 0_u64;
+    let mut previous_journal = 0_u64;
     let mut previous_manifest = 0_u64;
     let mut previous_registry = 0_u64;
     let mut previous_checkpoint = 0_u64;
@@ -685,7 +775,7 @@ fn validate_state(snapshot: &RetryStateSnapshot) -> Result<(), RetryStateCodecEr
             .retry_state()
             .ok_or(RetryStateCodecError::Invalid)?;
         if cutoff.journal().store_id() != snapshot.store_id
-            || cutoff.journal().generation() != ACTIVE_JOURNAL_GENERATION
+            || cutoff.journal().generation() == 0
             || cutoff.checkpoint_generation() == 0
             || cutoff.append_sequence() == 0
             || cutoff.end_offset() == 0
@@ -699,10 +789,13 @@ fn validate_state(snapshot: &RetryStateSnapshot) -> Result<(), RetryStateCodecEr
             || retry.generation() == 0
             || outcome.committed.manifest_generation() < outcome.committed.registry_generation()
             || outcome.committed.manifest_generation() < retry.generation()
-            || outcome.end_offset <= previous_end
+            || (cutoff.journal().generation() == previous_journal
+                && outcome.end_offset <= previous_end)
+            || cutoff.journal().generation() < previous_journal
             || outcome.committed.manifest_generation() < previous_manifest
             || outcome.committed.registry_generation() < previous_registry
-            || cutoff.checkpoint_generation() < previous_checkpoint
+            || (cutoff.journal().generation() == previous_journal
+                && cutoff.checkpoint_generation() < previous_checkpoint)
             || cutoff.append_sequence() < previous_cutoff_sequence
             || retry.generation() < previous_retry_generation
             || snapshot
@@ -711,8 +804,21 @@ fn validate_state(snapshot: &RetryStateSnapshot) -> Result<(), RetryStateCodecEr
         {
             return Err(RetryStateCodecError::Invalid);
         }
+        if cutoff.journal().generation() == ACTIVE_JOURNAL_GENERATION {
+            if outcome.committed.sequence_floor() != 0
+                || outcome.committed.generation_catalog().is_some()
+            {
+                return Err(RetryStateCodecError::Invalid);
+            }
+        } else if outcome.committed.sequence_floor() == 0
+            || outcome.committed.generation_catalog().is_none()
+            || cutoff.append_sequence() < outcome.committed.sequence_floor()
+        {
+            return Err(RetryStateCodecError::Invalid);
+        }
         previous = outcome.append_sequence;
         previous_end = outcome.end_offset;
+        previous_journal = cutoff.journal().generation();
         previous_manifest = outcome.committed.manifest_generation();
         previous_registry = outcome.committed.registry_generation();
         previous_checkpoint = cutoff.checkpoint_generation();
@@ -738,15 +844,24 @@ fn validate_state(snapshot: &RetryStateSnapshot) -> Result<(), RetryStateCodecEr
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_root(
     snapshot: &RetryStateSnapshot,
     root: ManifestCommit,
+    catalog: Option<&GenerationCatalogSnapshot>,
 ) -> Result<(), RetryStateCodecError> {
     validate_state(snapshot)?;
     let root_reference = root.retry_state().ok_or(RetryStateCodecError::Invalid)?;
     let root_cutoff = root.durable_cutoff();
     if snapshot.reference != Some(root_reference)
         || snapshot.store_id != root_cutoff.journal().store_id()
+        || (root_cutoff.journal().generation() == ACTIVE_JOURNAL_GENERATION
+            && (root.sequence_floor() != 0 || root.generation_catalog().is_some()))
+        || (root_cutoff.journal().generation() > ACTIVE_JOURNAL_GENERATION
+            && (root.sequence_floor() == 0
+                || root.generation_catalog().is_none()
+                || root_cutoff.append_sequence() < root.sequence_floor()))
+        || catalog.is_some_and(|catalog| catalog.reference() != root.generation_catalog())
     {
         return Err(RetryStateCodecError::Invalid);
     }
@@ -757,9 +872,19 @@ fn validate_root(
             Err(RetryStateCodecError::Invalid)
         };
     };
+    let newest_generation = newest.committed.durable_cutoff().journal().generation();
+    let newest_covered = if newest_generation == root_cutoff.journal().generation() {
+        newest.end_offset == root_cutoff.end_offset()
+    } else {
+        root_cutoff.append_sequence() == root.sequence_floor()
+            && newest_generation < root_cutoff.journal().generation()
+            && catalog.map_or(root.generation_catalog().is_some(), |catalog| {
+                catalog.covers_commit(newest_generation, newest.append_sequence, newest.end_offset)
+            })
+    };
     if (!snapshot.guard.is_empty() && snapshot.replay.len() != snapshot.options.replay_capacity)
         || newest.append_sequence != root_cutoff.append_sequence()
-        || newest.end_offset != root_cutoff.end_offset()
+        || !newest_covered
         || newest.committed.retry_state() != Some(root_reference)
     {
         return Err(RetryStateCodecError::Invalid);
@@ -797,10 +922,21 @@ fn validate_root(
             || commit.registry_generation() > root.registry_generation()
             || (commit.registry_generation() == root.registry_generation()
                 && commit.registry_slot() != root.registry_slot())
-            || cutoff.journal() != root_cutoff.journal()
-            || cutoff.checkpoint_generation() > root_cutoff.checkpoint_generation()
+            || cutoff.journal().store_id() != root_cutoff.journal().store_id()
+            || cutoff.journal().generation() > root_cutoff.journal().generation()
+            || (cutoff.journal().generation() == root_cutoff.journal().generation()
+                && cutoff.checkpoint_generation() > root_cutoff.checkpoint_generation())
             || cutoff.append_sequence() > root_cutoff.append_sequence()
-            || cutoff.end_offset() > root_cutoff.end_offset()
+            || (cutoff.journal().generation() == root_cutoff.journal().generation()
+                && cutoff.end_offset() > root_cutoff.end_offset())
+            || (cutoff.journal().generation() < root_cutoff.journal().generation()
+                && catalog.map_or(root.generation_catalog().is_none(), |catalog| {
+                    !catalog.covers_commit(
+                        cutoff.journal().generation(),
+                        outcome.append_sequence,
+                        outcome.end_offset,
+                    )
+                }))
             || reference.generation() > root_reference.generation()
             || (commit.manifest_generation() == root.manifest_generation() && commit != root)
         {
@@ -879,13 +1015,21 @@ fn validate_commit_progression(
     }
     let prior_cutoff = prior.durable_cutoff();
     let current_cutoff = current.durable_cutoff();
+    let crosses_generation =
+        current_cutoff.journal().generation() != prior_cutoff.journal().generation();
     if prior_reference.generation().checked_add(1) != Some(current_reference.generation())
         || current_reference.slot() == prior_reference.slot()
         || current.manifest_generation() <= prior.manifest_generation()
-        || prior_cutoff.checkpoint_generation().checked_add(1)
-            != Some(current_cutoff.checkpoint_generation())
         || current_cutoff.append_sequence() <= prior_cutoff.append_sequence()
-        || current_cutoff.end_offset() <= prior_cutoff.end_offset()
+        || (!crosses_generation
+            && (prior_cutoff.checkpoint_generation().checked_add(1)
+                != Some(current_cutoff.checkpoint_generation())
+                || current_cutoff.end_offset() <= prior_cutoff.end_offset()))
+        || (crosses_generation
+            && (prior_cutoff.journal().generation().checked_add(1)
+                != Some(current_cutoff.journal().generation())
+                || current.sequence_floor() != prior_cutoff.append_sequence()
+                || current.generation_catalog().is_none()))
         || current.registry_generation() < prior.registry_generation()
         || (current.registry_generation() == prior.registry_generation()
             && current.registry_slot() != prior.registry_slot())
@@ -1243,5 +1387,96 @@ mod tests {
             ),
             Err(RetryStateCodecError::Invalid)
         );
+    }
+
+    #[test]
+    fn retry_v2_round_trips_exact_commits_and_refuses_hostile_catalog_extension_fields() {
+        let store_id = test_support::store_id(1);
+        let options = RetryPersistenceOptions::new(2, 2).expect("retry options");
+        let first_reference = RetryStateReference::new(1, 2);
+        let root_reference = RetryStateReference::new(2, 3);
+        let first_commit = ManifestCommit::from_parts(
+            3,
+            2,
+            1,
+            DurableCutoff::from_manifest(store_id, 1, 2, 1, 400),
+            Some(first_reference),
+        );
+        let catalog = GenerationCatalogReference::new(0, 1, 132, 7);
+        let root = ManifestCommit::from_generation_parts(
+            5,
+            2,
+            1,
+            DurableCutoff::from_manifest(store_id, 2, 2, 2, 500),
+            Some(root_reference),
+            1,
+            Some(catalog),
+        );
+        let first_qualification = qualification("v2-first");
+        let second_qualification = qualification("v2-second");
+        let snapshot = RetryStateSnapshot {
+            store_id,
+            options,
+            reference: Some(root_reference),
+            replay: vec![
+                RetryReplayOutcome {
+                    qualification: first_qualification.clone(),
+                    append_sequence: 1,
+                    end_offset: 400,
+                    committed: first_commit,
+                },
+                RetryReplayOutcome {
+                    qualification: second_qualification.clone(),
+                    append_sequence: 2,
+                    end_offset: 500,
+                    committed: root,
+                },
+            ]
+            .into_boxed_slice(),
+            guard: Box::new([]),
+        };
+        let canonical = encode_retry_state(&snapshot).expect("Retry State V2 bytes");
+        assert_eq!(&canonical[8..10], &RETRY_V2_VERSION.to_be_bytes());
+        assert_eq!(
+            decode_retry_state_at_slot(&canonical, 2, store_id, options)
+                .expect("Retry State V2 decode")
+                .1,
+            snapshot
+        );
+        let first_extension = RETRY_HEADER_LEN + qualification_len(&first_qualification) + 88;
+        let second_extension = first_extension + 48 + qualification_len(&second_qualification) + 88;
+        assert_eq!(canonical[first_extension + 8], 0);
+        assert_eq!(canonical[second_extension + 8], 1);
+
+        for (offset, length, value) in [
+            (first_extension + 8, 1_usize, 1_u8),
+            (first_extension + 10, 1, 1),
+            (second_extension, 8, 0),
+            (second_extension + 8, 1, 2),
+            (second_extension + 9, 1, 3),
+            (second_extension + 10, 1, 1),
+            (second_extension + 16, 8, 0),
+            (second_extension + 24, 8, 0),
+            (second_extension + 36, 1, 1),
+        ] {
+            let mut hostile = canonical.clone();
+            hostile[offset..offset + length].fill(value);
+            repair_checksum(&mut hostile);
+            assert!(
+                decode_retry_state_at_slot(&hostile, 2, store_id, options).is_err(),
+                "hostile Retry State V2 field at {offset} must refuse"
+            );
+        }
+        let mut unknown_version = canonical.clone();
+        unknown_version[8..10].copy_from_slice(&3_u16.to_be_bytes());
+        repair_checksum(&mut unknown_version);
+        assert!(decode_retry_state_at_slot(&unknown_version, 2, store_id, options).is_err());
+        let mut trailing = canonical.clone();
+        trailing.push(0);
+        assert!(decode_retry_state_at_slot(&trailing, 2, store_id, options).is_err());
+        let mut checksum = canonical;
+        let last = checksum.len() - 1;
+        checksum[last] ^= 1;
+        assert!(decode_retry_state_at_slot(&checksum, 2, store_id, options).is_err());
     }
 }

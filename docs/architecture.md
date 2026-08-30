@@ -11,7 +11,10 @@ the store-scoped runtime input, M02-PR01b0 froze Journal V1 semantic framing, an
 M02-PR01b1 connected that single path to one bounded active-journal durable
 vertical, M02-PR02a roots its range, mechanical cutoff, and complete canonical
 registry history in one bounded manifest, and M02-PR02b roots a bounded durable
-retry replay/guard projection in Manifest V2:
+retry replay/guard projection in Manifest V2. M02-PR02c adds one bounded
+store-owned rotation/seal transition: Generation Catalog V1 and Manifest V3 bind
+immutable raw-Journal generations while the same global append sequence continues
+in deterministic successor active journals:
 
 ```text
 default workspace selection
@@ -19,8 +22,9 @@ default workspace selection
         v
   och-runtime (native) ----> och-store (native) ----> och-core (native)
   Tokio coordinator            active journal              ^
-  16 slots + byte bounds       Journal V1 + checkpoint      |
+  16 slots + byte bounds       Journal V1 + checkpoints     |
   one control gate             manifest + registry/retry    |
+  safe-boundary rotation       catalog + raw seals          |
        |                                                    |
        v                                      future adapters (not created yet)
   tokio rt + sync only
@@ -96,22 +100,33 @@ payload against both the fixed 8 MiB maximum and a caller-selected lower limit
 before any field allocation. It produces only store-owned non-authorizing
 inspection evidence, never a registry-issued declaration or `CanonicalAdmission`.
 
-The store also owns one bounded fixed inventory in an existing directory: a
-never-renamed stable store lock, the retained read/write journal lock, the
-generation-one active journal, a fixed two-slot mechanical checkpoint, two
-reusable Manifest V1/V2 slots, three reusable complete registry slots, and three
-reusable Retry State V1 slots. Manifest
+The store also owns one bounded recognized inventory in an existing directory: a
+never-renamed stable store lock, one retained read/write lock for the current
+generation, the legacy generation-one active pair or one deterministic successor
+pair, two reusable Manifest V1/V2/V3 slots, three reusable complete registry and
+retry slots, three Generation Catalog V1 slots, one fixed rotation intent, fixed
+staging names, and at most 64 immutable raw-Journal sealed artifacts. Manifest
 stores use active-header version 2 in the unchanged 28-byte layout; every
 admission frame remains Journal V1. An old header-v1 decoder rejects the fence.
 Create-new synchronizes active genesis, an empty registry snapshot, an empty
-retry snapshot, and Manifest V2 generation one before readiness. The sole blocking writer assigns strict
-append sequences, explicitly seeks to journal end, and validates both frame and
+retry snapshot, and Manifest V2 generation one before readiness. The sole
+blocking writer assigns one store-global strict append sequence across all
+generations, explicitly seeks to journal end, and validates both frame and
 declaration StoreId against the header. A barrier performs journal sync, writes
 the alternate CRC-protected checkpoint slot, then synchronizes that checkpoint
-publishes/verifies the bounded retry candidate, and publishes a manifest naming
+publishes/verifies the bounded Retry State V1/V2 candidate, and publishes a manifest naming
 the exact cutoff, registry, and retry snapshot before exposing durability. The
 checkpoint contains only store/journal identity, slot generation, append
 sequence, end offset, and checksum; it is not registry or retry authority.
+
+At a safe nonempty size/count/age boundary, runtime first completes the ordinary
+durable receipt batch. Store then persists a non-authoritative intent, streams the
+exact fully durable active bytes into an immutable raw-Journal artifact, verifies
+framing/declarations/range/length/checksum, creates and synchronizes an empty
+successor at the prior global sequence floor, publishes the next bounded catalog,
+and publishes Manifest V3 last. Only then does it adopt the successor and clean
+the redundant predecessor/intent. Catalog capacity is exactly 64 and never
+reclaims or overwrites sealed history.
 
 Open-existing acquires the stable lock before selection or mutation, validates a
 bounded non-recursive inventory, selects only strict consecutive manifest
@@ -120,14 +135,25 @@ lifecycle replay, and requires exact snapshot re-encoding. The selected manifest
 cutoff must equal the mechanical checkpoint, and every recovered declaration
 must resolve exactly from retained history. A nonempty premanifest store requires
 an explicit matching snapshot; exact header-only V1/V2 stores may bootstrap
-empty. Manifest V2 restores only its referenced canonical retry snapshot. A
+empty. Manifest V2/V3 restores only its referenced canonical retry snapshot. A
 legacy Manifest V1 restores empty retry tiers without scanning or backfilling
 retained Journal V1 records; its first new durable append establishes V2. Decoded
 evidence never authorizes registry or retry state, and latest restarts empty.
-`och-store` still owns no runtime scheduling, successor rotation, immutable
-segment, broad recovery, latest projection, or query behavior. The exact format
-and strict publication contracts are in [Manifest V1/V2](manifest-v1-format.md)
-and [Retry State V1](retry-state-v1-format.md).
+Normal open validates bounded catalog bytes and sealed length/header metadata,
+not every sealed payload byte. A narrow exact-intent path converges only to the
+prior root before Manifest V3 or the new root after it; missing or mismatched
+evidence refuses unchanged. Each V3 root binds the active generation and floor
+to the checked successor and cutoff of its last sealed entry, and consecutive
+catalog roots must preserve the exact older prefix and append one entry. Active
+pairs and sealed finals must equal the selected root apart from narrowly
+verified intent redundancy. A strict catalog prefix left by interruption after
+ordinary manifest adoption is verified and removed; forked or unrelated
+catalogs refuse. `och-store` still owns no final native segment
+encoding, broad recovery, reclamation, latest projection, or query behavior.
+Exact contracts are in [Manifest V1/V2/V3](manifest-v1-format.md),
+[Retry State V1/V2](retry-state-v1-format.md),
+[Generation Catalog V1](generation-catalog-v1-format.md), and
+[sealed raw Journal V1](sealed-journal-v1-format.md).
 
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`
@@ -226,14 +252,15 @@ caller-owned volatile memory, not runtime history.
 The blocking worker preserves FIFO and groups handled appends until the first of
 configured time, record, or byte bounds, explicit/immediate demand, protected
 demand, or shutdown. Durable order is append, volatile publication, journal
-sync, alternate checkpoint slot write, checkpoint sync, exact Retry State V1
-count/write/sync/readback/publication, Manifest V2 publication naming the exact
+sync, alternate checkpoint slot write, checkpoint sync, exact Retry State V1/V2
+count/write/sync/readback/publication, Manifest V2/V3 publication naming the exact
 cutoff and current registry/retry slots, atomic ingress projection/receipt batch
 transition, then waiter wake.
 
-A durable receipt names store, fixed journal generation, append sequence, frame
+A durable receipt names store, exact journal generation, append sequence, frame
 end, mechanical checkpoint generation, manifest generation, registry
-generation/slot, and optional retry generation/slot. A legacy V1 open truthfully
+generation/slot, optional retry generation/slot, sequence floor, and optional
+catalog identity. Rotation never rewrites an already returned receipt. A legacy V1 open truthfully
 reports no retry reference. A timeout never
 synchronizes while the newest append still awaits the coordinator's publication
 acknowledgement; after acknowledgement an elapsed deadline may flush immediately.
@@ -259,8 +286,8 @@ and is never recomputed from admission or envelope content.
 ## Intentionally absent
 
 There is currently no async/blocking admission wait, eviction, subscription/wait
-API, mutable read guard, active-generation successor publication, rotation
-handoff, immutable segment, unbounded/time-based retry, manifest-backed latest
+API, mutable read guard, final native segment format, sealed-history read/query
+API, retention/reclamation, unbounded/time-based retry, manifest-backed latest
 reconstruction, broad recovery event model, query
 engine, network service, SQL layer, cloud/object provider, embedded database,
 memory mapping, Studio/Engine link, adapter, or donor-code compatibility layer.
@@ -284,3 +311,5 @@ The manifest-rooted canonical registry transition and its exact successor ledger
 are recorded by [M02-PR02a](continuation-m02-pr02a.md).
 The manifest-rooted durable retry horizon and its exact compatibility boundary
 are recorded by [M02-PR02b](continuation-m02-pr02b.md).
+The bounded raw-Journal rotation/seal transition and its exact successor boundary
+are recorded by [M02-PR02c](continuation-m02-pr02c.md).
