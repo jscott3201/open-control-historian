@@ -1,6 +1,6 @@
 use crate::ingress::{
-    AdmissionPriority, AppendIdentity, BarrierDemand, ByteReservationLimits, IngressShared,
-    MAX_OUTSTANDING_COMMANDS,
+    AdmissionPriority, AppendIdentity, BarrierDemand, ByteReservationLimits, DurableBatchEntry,
+    IngressShared, MAX_OUTSTANDING_COMMANDS,
 };
 use och_core::{
     CanonicalAdmission, CollectionEnvelope, DeclarationEvidence, DeclarationRevision,
@@ -10,7 +10,8 @@ use och_core::{
 use och_store::{
     ActiveJournalError, ActiveJournalInspection, ActiveJournalLimits, ActiveJournalOpenMode,
     ManifestCommit, ManifestStore, ManifestStoreConfig, ManifestStoreError,
-    ManifestStoreInspection, PreparedAdmissionV1, RecoveredAdmissionV1, RegistryPersistenceOptions,
+    ManifestStoreInspection, PendingRetryOutcome, PreparedAdmissionV1, RecoveredAdmissionV1,
+    RegistryPersistenceOptions, RetryPersistenceOptions, RetryStateSnapshot,
 };
 use std::fmt;
 use std::path::PathBuf;
@@ -91,6 +92,7 @@ pub struct StoreOptions {
     byte_limits: ByteReservationLimits,
     group_commit: GroupCommitPolicy,
     registry: RegistryPersistenceOptions,
+    retry: RetryPersistenceOptions,
     #[cfg(test)]
     cleanup_on_reap: bool,
 }
@@ -101,6 +103,7 @@ impl StoreOptions {
     /// # Errors
     ///
     /// Refuses invalid directory/options or group bytes above global reservations.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         directory: PathBuf,
         store_id: StoreId,
@@ -109,6 +112,7 @@ impl StoreOptions {
         byte_limits: ByteReservationLimits,
         group_commit: GroupCommitPolicy,
         registry: RegistryPersistenceOptions,
+        retry: RetryPersistenceOptions,
     ) -> Result<Self, StoreOptionsError> {
         let directory_length = directory.as_os_str().as_encoded_bytes().len();
         if directory_length == 0 || directory_length > och_store::MAX_STORE_DIRECTORY_BYTES {
@@ -120,6 +124,7 @@ impl StoreOptions {
             mode,
             journal_limits,
             registry.clone(),
+            retry,
         )
         .map_err(StoreOptionsError::Store)?;
         if group_commit.max_bytes > byte_limits.max_outstanding_bytes() {
@@ -133,6 +138,7 @@ impl StoreOptions {
             byte_limits,
             group_commit,
             registry,
+            retry,
             #[cfg(test)]
             cleanup_on_reap: false,
         })
@@ -174,6 +180,12 @@ impl StoreOptions {
         &self.registry
     }
 
+    /// Returns bounded durable retry persistence options.
+    #[must_use]
+    pub const fn retry(&self) -> RetryPersistenceOptions {
+        self.retry
+    }
+
     pub(crate) fn manifest_config(&self) -> Result<ManifestStoreConfig, ManifestStoreError> {
         ManifestStoreConfig::new(
             self.directory.clone(),
@@ -181,6 +193,7 @@ impl StoreOptions {
             self.mode,
             self.journal_limits,
             self.registry.clone(),
+            self.retry,
         )
     }
 
@@ -201,6 +214,7 @@ impl fmt::Debug for StoreOptions {
             .field("byte_limits", &self.byte_limits)
             .field("group_commit", &self.group_commit)
             .field("registry", &self.registry)
+            .field("retry", &self.retry)
             .finish_non_exhaustive()
     }
 }
@@ -445,6 +459,7 @@ impl InspectionShared {
 pub(crate) struct WorkerReady {
     pub(crate) inspection: ManifestStoreInspection,
     pub(crate) recovered: Vec<RecoveredAdmissionV1>,
+    pub(crate) retry: RetryStateSnapshot,
 }
 
 pub(crate) struct AppendResult {
@@ -463,6 +478,8 @@ pub(crate) enum WorkerMessage {
         priority: AdmissionPriority,
         barrier: BarrierDemand,
         frame_bytes: usize,
+        qualification: Box<och_core::RetryQualification>,
+        append: AppendIdentity,
     },
     Barrier {
         response: oneshot::Sender<Result<(), ManifestStoreError>>,
@@ -484,6 +501,8 @@ pub(crate) enum WorkerMessage {
 struct PendingDurable {
     slot: usize,
     bytes: usize,
+    qualification: och_core::RetryQualification,
+    append: AppendIdentity,
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
@@ -522,6 +541,7 @@ pub(crate) fn run_store_worker(
         .send(Ok(WorkerReady {
             inspection: store.inspection(),
             recovered: store.recovered_records().to_vec(),
+            retry: store.retry_state_snapshot(),
         }))
         .is_err()
     {
@@ -634,6 +654,8 @@ pub(crate) fn run_store_worker(
                 priority,
                 barrier,
                 frame_bytes,
+                qualification,
+                append,
             }) => {
                 if unpublished.take() != Some((slot, frame_bytes)) {
                     fail_worker(&ingress, &inspection);
@@ -645,6 +667,8 @@ pub(crate) fn run_store_worker(
                 pending.push(PendingDurable {
                     slot,
                     bytes: frame_bytes,
+                    qualification: *qualification,
+                    append,
                 });
                 let pending_bytes = pending.iter().map(|entry| entry.bytes).sum::<usize>();
                 let forced = priority == AdmissionPriority::Protected
@@ -791,7 +815,17 @@ fn flush_pending(
     if pending.is_empty() {
         return Ok(());
     }
-    let committed = match store.sync_pending() {
+    let retry_pending = pending
+        .iter()
+        .map(|entry| {
+            PendingRetryOutcome::new(
+                entry.qualification.clone(),
+                entry.append.append_sequence(),
+                entry.append.end_offset(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let (committed, retry) = match store.sync_pending(&retry_pending) {
         Ok(committed) => committed,
         Err(error) => {
             fail_worker(ingress, inspection);
@@ -801,14 +835,21 @@ fn flush_pending(
     // Inspection must name the committed manifest before any covered receipt
     // can wake and observe runtime state.
     inspection.update_store(store.inspection());
-    for entry in pending.drain(..) {
-        if !ingress.complete_durable(entry.slot, committed) {
-            fail_worker(ingress, inspection);
-            return Err(ManifestStoreError::Active(
-                ActiveJournalError::InvalidLayout,
-            ));
-        }
+    let completed = pending
+        .iter()
+        .map(|entry| DurableBatchEntry {
+            slot: entry.slot,
+            qualification: entry.qualification.clone(),
+            append: entry.append,
+        })
+        .collect::<Vec<_>>();
+    if !ingress.complete_durable_batch(&completed, committed, retry) {
+        fail_worker(ingress, inspection);
+        return Err(ManifestStoreError::Active(
+            ActiveJournalError::InvalidLayout,
+        ));
     }
+    pending.clear();
     Ok(())
 }
 

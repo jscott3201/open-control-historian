@@ -21,14 +21,16 @@ source/capture provenance, collection, gap/no-change, envelope, canonical
 admission, and retry-comparison semantics. M02-PR01a established the reviewed
 store-scoped runtime command boundary, and M02-PR01b0 established the reviewed
 Journal V1 semantic frame format. M02-PR01b1 established their active-journal
-durable successor, and M02-PR02a now makes a bounded manifest the committed
-description of its active range, mechanical cutoff, and complete canonical
-registry history. `och-runtime` depends inward on `och-store`, opens one explicitly
+durable successor, M02-PR02a makes a bounded manifest the committed description
+of its active range, mechanical cutoff, and complete canonical registry history,
+and M02-PR02b adds its bounded durable retry horizon. `och-runtime` depends
+inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05
 `CanonicalAdmission` evidence, reserves exact encoded bytes before allocation,
 and sends FIFO work to one dedicated blocking writer thread. Handled and durable
 receipt stages are distinct; the latter is released only after journal sync,
-checkpoint sync, and manifest publication cover the append. Public register,
+checkpoint sync, Retry State V1 publication, and Manifest V2 publication cover
+the append. Public register,
 revise, retire, and active bind requests first cross a fixed nonblocking
 control-admission bound, then share the sole writer ordering authority with
 append publication. A fixed reaper owns the eventual writer join after
@@ -37,18 +39,21 @@ nonblocking Drop.
 `och-store` owns Journal V1 bytes, the header-v2 old-writer fence, stable
 never-renamed store lock, retained journal lock, fixed active-artifact
 create/open, bounded scan and append, double-slot mechanical checkpoint,
-two-slot manifest, three-slot complete registry snapshots, strict bootstrap, and
-publication. It restores snapshots only by public `SeriesRegistry` replay and
+two-slot Manifest V1/V2 authority, three-slot complete registry snapshots,
+three-slot durable retry snapshots, strict bootstrap, and publication. It
+restores registry snapshots only by public `SeriesRegistry` replay and
 requires every decoded journal declaration to match retained historical
 authority; decoded records never authorize registry state. `och-runtime` retains
 the fixed 16-command count window, exact bounded
-byte reservations through durability, outstanding-only retry coalescing, a
+byte reservations through durability, outstanding retry coalescing, a bounded
+FIFO durable replay tier followed by an expired/conflict guard tier, a
 separately fixed 16-series volatile latest registry, store-scoped immutable
 snapshots, group barriers, graceful drain/final barrier/seal/join, and
 nonblocking fail-stop Drop. The blocking writer owns the one non-cloneable live
 `SeriesRegistry`; runtime code gains no declaration/source interpretation
-semantics and exposes no mutable registry handle. Latest state restarts empty and
-completed retries are not restored. Successor rotation, long-term retry, query,
+semantics and exposes no mutable registry handle. Latest state restarts empty;
+completed retry outcomes restore only within the configured two-tier horizon.
+Successor rotation, unbounded or time-based retry, query,
 adapters, manifest-backed latest projection, and broad recovery remain absent.
 Published observations never imply current or held values.
 

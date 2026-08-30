@@ -9,8 +9,9 @@ M00-PR04 added bounded canonical series declaration authority, M00-PR05 added
 bounded source/capture provenance and canonical admission, M02-PR01a established
 the store-scoped runtime input, M02-PR01b0 froze Journal V1 semantic framing, and
 M02-PR01b1 connected that single path to one bounded active-journal durable
-vertical, and M02-PR02a roots its range, mechanical cutoff, and complete
-canonical registry history in one bounded manifest:
+vertical, M02-PR02a roots its range, mechanical cutoff, and complete canonical
+registry history in one bounded manifest, and M02-PR02b roots a bounded durable
+retry replay/guard projection in Manifest V2:
 
 ```text
 default workspace selection
@@ -19,7 +20,7 @@ default workspace selection
   och-runtime (native) ----> och-store (native) ----> och-core (native)
   Tokio coordinator            active journal              ^
   16 slots + byte bounds       Journal V1 + checkpoint      |
-  one control gate             manifest + registry slots    |
+  one control gate             manifest + registry/retry    |
        |                                                    |
        v                                      future adapters (not created yet)
   tokio rt + sync only
@@ -51,8 +52,10 @@ the frame. Under the existing state authority it applies closed/store/retry/coun
 and protected/normal/bulk byte-capacity rules, retains the slot and reservation,
 then allocates and encodes outside the lock and verifies the exact length.
 Priorities reserve capacity and may demand a barrier but never reorder semantic
-FIFO. Equivalent outstanding retries share handled and durable stages; no
-completed retry outcome is seeded from reopen evidence. A separate synchronous
+FIFO. Equivalent outstanding retries share handled and durable stages. Completed
+equivalents replay the original exact proof from the immutable committed replay
+tier; replay overflow becomes a non-replayable guard, and only FIFO eviction from
+both bounded tiers makes the key fresh. A separate synchronous
 read handle captures immutable store-scoped snapshots of at most 16 nominal
 series. Multiple runtimes are independent; the retained file lock excludes a
 second active writer for the same artifacts. Tokio remains admitted only on the
@@ -67,7 +70,8 @@ bounded writer channel, so no second ordering authority exists. Lifecycle and
 bind callers must first obtain one of 16 nonblocking control-admission permits;
 the permit is held through gate acquisition and the writer response, making
 cancellation reclaim capacity without an unbounded mutex-waiter population. Retry
-classification reads the admission's exact `RetryQualification`, while volatile
+classification reads the admission's exact `RetryQualification` against
+outstanding work and the immutable committed retry projection, while volatile
 publication reads only its validated envelope. The exact `SeriesMetadata` bind
 remains a runtime-local read optimization invariant and cannot authorize a
 declaration or reinterpret an old revision. Source/declaration evidence stays
@@ -95,15 +99,17 @@ inspection evidence, never a registry-issued declaration or `CanonicalAdmission`
 The store also owns one bounded fixed inventory in an existing directory: a
 never-renamed stable store lock, the retained read/write journal lock, the
 generation-one active journal, a fixed two-slot mechanical checkpoint, two
-reusable manifest slots, and three reusable complete registry slots. Manifest
+reusable Manifest V1/V2 slots, three reusable complete registry slots, and three
+reusable Retry State V1 slots. Manifest
 stores use active-header version 2 in the unchanged 28-byte layout; every
 admission frame remains Journal V1. An old header-v1 decoder rejects the fence.
-Create-new synchronizes active genesis, an empty registry snapshot, and manifest
-generation one before readiness. The sole blocking writer assigns strict
+Create-new synchronizes active genesis, an empty registry snapshot, an empty
+retry snapshot, and Manifest V2 generation one before readiness. The sole blocking writer assigns strict
 append sequences, explicitly seeks to journal end, and validates both frame and
 declaration StoreId against the header. A barrier performs journal sync, writes
 the alternate CRC-protected checkpoint slot, then synchronizes that checkpoint
-and publishes a manifest naming the exact cutoff before exposing durability. The
+publishes/verifies the bounded retry candidate, and publishes a manifest naming
+the exact cutoff, registry, and retry snapshot before exposing durability. The
 checkpoint contains only store/journal identity, slot generation, append
 sequence, end offset, and checksum; it is not registry or retry authority.
 
@@ -114,11 +120,14 @@ lifecycle replay, and requires exact snapshot re-encoding. The selected manifest
 cutoff must equal the mechanical checkpoint, and every recovered declaration
 must resolve exactly from retained history. A nonempty premanifest store requires
 an explicit matching snapshot; exact header-only V1/V2 stores may bootstrap
-empty. Decoded evidence never authorizes registry state, and latest restarts
-empty. `och-store` still owns no runtime scheduling, successor rotation,
-immutable segment, durable retry, broad recovery, latest projection, or query
-behavior. The exact format and strict publication contract are in
-[Manifest V1](manifest-v1-format.md).
+empty. Manifest V2 restores only its referenced canonical retry snapshot. A
+legacy Manifest V1 restores empty retry tiers without scanning or backfilling
+retained Journal V1 records; its first new durable append establishes V2. Decoded
+evidence never authorizes registry or retry state, and latest restarts empty.
+`och-store` still owns no runtime scheduling, successor rotation, immutable
+segment, broad recovery, latest projection, or query behavior. The exact format
+and strict publication contracts are in [Manifest V1/V2](manifest-v1-format.md)
+and [Retry State V1](retry-state-v1-format.md).
 
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`
@@ -186,10 +195,13 @@ publication swap, receipt assignment, reservation release, stop, and shutdown;
 no guard crosses an await. A fixed slot table and FIFO index ring bound queued plus
 in-flight-and-pending-durability distinct work at 16. Exact encoded bytes are
 counted before allocation and held under the configured global/class ceilings.
-Equivalent retries share one two-stage state and do not retain the duplicate
-admission. Closure takes precedence, then the exact runtime StoreId is enforced
-before retry comparison and count/byte capacity. The outstanding retry window
-ends only at durable completion or terminal stop; it has no restart horizon.
+Equivalent outstanding retries share one two-stage state and do not retain the
+duplicate admission. Closure takes precedence, then the exact runtime StoreId and
+Journal V1 framing are enforced before outstanding retry, durable replay/guard,
+and count/byte capacity. The outstanding tier ends only at durable completion or
+terminal stop. At a successful barrier, one mutex-held batch transition installs
+the writer-committed immutable retry projection, resolves every covered receipt,
+releases reservations, and only then wakes waiters.
 
 Only an envelope with at least one observation and explicit positions on all its
 observations is publication-eligible. Core validation makes the final observation
@@ -214,13 +226,15 @@ caller-owned volatile memory, not runtime history.
 The blocking worker preserves FIFO and groups handled appends until the first of
 configured time, record, or byte bounds, explicit/immediate demand, protected
 demand, or shutdown. Durable order is append, volatile publication, journal
-sync, alternate checkpoint slot write, checkpoint sync, manifest publication
-naming the exact cutoff and current registry slot, then `Durable` receipt
-assignment and reservation release.
+sync, alternate checkpoint slot write, checkpoint sync, exact Retry State V1
+count/write/sync/readback/publication, Manifest V2 publication naming the exact
+cutoff and current registry/retry slots, atomic ingress projection/receipt batch
+transition, then waiter wake.
 
 A durable receipt names store, fixed journal generation, append sequence, frame
-end, mechanical checkpoint generation, manifest generation, and registry
-generation/slot. A timeout never
+end, mechanical checkpoint generation, manifest generation, registry
+generation/slot, and optional retry generation/slot. A legacy V1 open truthfully
+reports no retry reference. A timeout never
 synchronizes while the newest append still awaits the coordinator's publication
 acknowledgement; after acknowledgement an elapsed deadline may flush immediately.
 The receipt claims only the active artifacts under the documented platform
@@ -246,7 +260,7 @@ and is never recomputed from admission or envelope content.
 
 There is currently no async/blocking admission wait, eviction, subscription/wait
 API, mutable read guard, active-generation successor publication, rotation
-handoff, immutable segment, durable long-term retry cache, manifest-backed latest
+handoff, immutable segment, unbounded/time-based retry, manifest-backed latest
 reconstruction, broad recovery event model, query
 engine, network service, SQL layer, cloud/object provider, embedded database,
 memory mapping, Studio/Engine link, adapter, or donor-code compatibility layer.
@@ -268,3 +282,5 @@ The complete generation-one active-journal durable vertical and its PR02 handoff
 are recorded by [M02-PR01b1](continuation-m02-pr01b1.md).
 The manifest-rooted canonical registry transition and its exact successor ledger
 are recorded by [M02-PR02a](continuation-m02-pr02a.md).
+The manifest-rooted durable retry horizon and its exact compatibility boundary
+are recorded by [M02-PR02b](continuation-m02-pr02b.md).

@@ -7,9 +7,11 @@ declaration authority, source/capture provenance and admission boundary,
 independent deterministic contract evidence, and one filesystem-backed runtime
 path with exact byte reservation, a dedicated blocking writer, Journal V1 append,
 group barriers, crash-safe manifest-backed durable receipts, bounded canonical
-registry persistence/bootstrap, bounded reopen evidence, and volatile
-latest-observation snapshots. It does **not** yet provide successor rotation,
-long-term retry, immutable history, current/held-value, or query behavior.
+registry persistence/bootstrap, a bounded durable replay/guard horizon, bounded
+reopen evidence, and volatile latest-observation snapshots. It does **not** yet
+provide successor rotation,
+unbounded or time-based retry, immutable history, current/held-value, or query
+behavior.
 
 ## Current status
 
@@ -29,8 +31,11 @@ artifacts. Its synchronous fixed 16-command ingress accepts only complete
 preserves FIFO across protected/normal/bulk resource classes, and coalesces only
 equivalent outstanding retries. Handled receipts identify an append after its
 volatile publication decision; distinct durable receipts are released only after
-the group barrier covers that append in the journal, checkpoint, and committed
-manifest. Public lifecycle and bind requests cross a fixed 16-request
+the group barrier covers that append in the journal, checkpoint, Retry State V1,
+and committed Manifest V2. Completed equivalents replay their original exact
+handled/durable proof while the FIFO outcome tier retains them; overflow becomes
+a bounded expired/conflict guard, and only eviction from both tiers makes a key
+fresh. Public lifecycle and bind requests cross a fixed 16-request
 nonblocking admission bound before sharing the same control gate and sole writer
 as append publication. New bindings require the current active declaration,
 while append validates the admission's exact retained historical declaration.
@@ -42,22 +47,23 @@ a fixed reaper owns the eventual blocking-thread join.
 
 `och-store` owns fixed store-scoped Journal V1 framing and hostile bounded decode,
 plus the fixed generation-one active journal/checkpoint, a never-renamed stable
-store lock, the retained journal lock, two reusable manifest slots, and three
-reusable complete registry slots. It restores registry state only through public
-core lifecycle replay, requires exact historical declarations for recovered and
-new admission bytes, and commits a manifest only after the mechanical cutoff.
-Reopen exposes decoded records only as non-authorizing evidence and does not seed
-durable retry or rebuild latest. A durable receipt proves the manifest names the
-active journal/checkpoint cutoff under the stated platform contract; it is not
-an immutable-history or universal physical-power-loss claim.
+store lock, the retained journal lock, two reusable Manifest V1/V2 slots, three
+reusable complete registry slots, and three reusable Retry State V1 slots. It
+restores registry state only through public core lifecycle replay, requires exact
+historical declarations for recovered and new admission bytes, and commits a
+manifest only after the mechanical cutoff. Reopen exposes decoded records only
+as non-authorizing evidence, restores only the manifest-referenced retry
+projection, and does not rebuild latest. A durable receipt proves the manifest
+names the active journal/checkpoint cutoff under the stated platform contract;
+it is not an immutable-history or universal physical-power-loss claim.
 
 The current workspace contains:
 
 | Package | Role | Purpose |
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model, bounded series declaration authority, and a measurement-only example |
-| [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, writer-serialized registry control, manifest-backed receipts, and volatile latest snapshots |
-| [`och-store`](crates/och-store/) | native | Journal V1, bounded active artifacts, stable locking, canonical registry snapshots, manifests, and reopen inspection |
+| [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, durable retry replay/guard classification, writer-serialized registry control, manifest-backed receipts, and volatile latest snapshots |
+| [`och-store`](crates/och-store/) | native | Journal V1, bounded active artifacts, stable locking, canonical registry and retry snapshots, manifests, and reopen inspection |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
 `och-core` has no dependencies. `och-store` depends inward on `och-core`, and
@@ -138,12 +144,18 @@ through nextest rather than being repeated with `cargo test`.
   specifies the manifest-rooted canonical registry authority transition.
 - [M02-PR02a continuation](docs/continuation-m02-pr02a.md) records the delivered
   header fence, bootstrap, commit ordering, evidence, and successor ledger.
+- [M02-PR02b implementation brief](docs/implementation-brief-m02-pr02b.md)
+  specifies the bounded durable two-tier retry authority transition.
+- [M02-PR02b continuation](docs/continuation-m02-pr02b.md) records exact retry
+  publication, atomic runtime handoff, compatibility, evidence, and successors.
 - [Journal V1 format](docs/journal-v1-format.md) defines the exact version-one
   header, frame, payload, active-artifact, checkpoint, byte-order, bound,
   checksum, and refusal contracts.
-- [Manifest V1 format](docs/manifest-v1-format.md) defines the fixed inventory,
-  header fence, manifest and registry bytes, publication order, bounds, and
-  strict-reopen contract.
+- [Manifest V1/V2 format](docs/manifest-v1-format.md) defines the fixed inventory,
+  header fence, manifest and registry bytes, retry reference, publication order,
+  bounds, and strict-reopen contract.
+- [Retry State V1 format](docs/retry-state-v1-format.md) defines exact durable
+  replay/guard bytes, capacities, canonical ordering, and refusal law.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

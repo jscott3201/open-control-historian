@@ -4,7 +4,8 @@ use crate::latest::{
 };
 use och_core::{CanonicalAdmission, RetryClassification, RetryQualification, StoreId};
 use och_store::{
-    DurableCutoff, JournalIdentity, JournalV1Error, ManifestCommit, PreparedAdmissionV1,
+    DurableCutoff, JournalIdentity, JournalV1Error, ManifestCommit, PendingRetryOutcome,
+    PreparedAdmissionV1, RetryPersistenceOptions, RetryStateMatch, RetryStateSnapshot,
     admission_frame_len_v1,
 };
 use std::error::Error;
@@ -175,9 +176,13 @@ pub struct HistorianIngress {
 }
 
 impl HistorianIngress {
-    pub(crate) fn new_with_limits(store_id: StoreId, byte_limits: ByteReservationLimits) -> Self {
+    pub(crate) fn new_with_limits(
+        store_id: StoreId,
+        byte_limits: ByteReservationLimits,
+        retry_options: RetryPersistenceOptions,
+    ) -> Self {
         Self {
-            shared: Arc::new(IngressShared::new(store_id, byte_limits)),
+            shared: Arc::new(IngressShared::new(store_id, byte_limits, retry_options)),
         }
     }
 
@@ -186,6 +191,7 @@ impl HistorianIngress {
         Self::new_with_limits(
             store_id,
             ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("test byte limits"),
+            RetryPersistenceOptions::default(),
         )
     }
 
@@ -256,6 +262,8 @@ pub enum SubmissionDisposition {
     Queued,
     /// The incoming admission was discarded and the first command's receipt shared.
     Coalesced,
+    /// A committed durable outcome was returned without new work.
+    Replayed,
 }
 
 /// A successful admission result and shared two-stage receipt.
@@ -308,6 +316,8 @@ pub enum TrySubmitErrorKind {
     Full,
     /// The same retry scope and key carry different content.
     RetryConflict,
+    /// The exact retry remains in the non-replayable durable guard tier.
+    RetryExpired,
 }
 
 /// A sanitized immediate-admission failure retaining the incoming command.
@@ -373,7 +383,8 @@ impl fmt::Display for TrySubmitError {
             TrySubmitErrorKind::Encoding => "canonical admission cannot be framed",
             TrySubmitErrorKind::ByteCapacity => "encoded-byte admission capacity is full",
             TrySubmitErrorKind::Full => "historian ingress is full",
-            TrySubmitErrorKind::RetryConflict => "outstanding retry conflict",
+            TrySubmitErrorKind::RetryConflict => "retained retry conflict",
+            TrySubmitErrorKind::RetryExpired => "durable retry outcome has expired",
         })
     }
 }
@@ -450,7 +461,7 @@ impl DurableCommit {
         self.committed.durable_cutoff()
     }
 
-    /// Returns the manifest generation and registry state committing this append.
+    /// Returns the manifest, registry, and optional retry state committing this append.
     #[must_use]
     pub const fn manifest_commit(self) -> ManifestCommit {
         self.committed
@@ -633,10 +644,14 @@ pub(crate) struct IngressShared {
 }
 
 impl IngressShared {
-    fn new(store_id: StoreId, byte_limits: ByteReservationLimits) -> Self {
+    fn new(
+        store_id: StoreId,
+        byte_limits: ByteReservationLimits,
+        retry_options: RetryPersistenceOptions,
+    ) -> Self {
         Self {
             store_id,
-            state: Mutex::new(IngressState::new(store_id, byte_limits)),
+            state: Mutex::new(IngressState::new(store_id, byte_limits, retry_options)),
             notify: Notify::new(),
         }
     }
@@ -725,6 +740,45 @@ impl IngressShared {
                 }
                 RetryClassification::Distinct => {}
             }
+        }
+        match state.retry.classify(command.admission.retry()) {
+            RetryStateMatch::Replay(outcome) => {
+                let append = AppendIdentity::new(
+                    outcome.manifest_commit().durable_cutoff().journal(),
+                    outcome.append_sequence(),
+                    outcome.end_offset(),
+                );
+                let committed = DurableCommit {
+                    append,
+                    committed: outcome.manifest_commit(),
+                };
+                let terminal = Arc::new(ReceiptTerminal::new());
+                if !terminal.resolve_handled(append) || !terminal.resolve_durable(committed) {
+                    drop(state);
+                    return Err(TrySubmitError::new(TrySubmitErrorKind::Closed, command));
+                }
+                drop(state);
+                drop(command);
+                return Ok(Submission {
+                    disposition: SubmissionDisposition::Replayed,
+                    receipt: Receipt { terminal },
+                });
+            }
+            RetryStateMatch::Expired => {
+                drop(state);
+                return Err(TrySubmitError::new(
+                    TrySubmitErrorKind::RetryExpired,
+                    command,
+                ));
+            }
+            RetryStateMatch::Conflict => {
+                drop(state);
+                return Err(TrySubmitError::new(
+                    TrySubmitErrorKind::RetryConflict,
+                    command,
+                ));
+            }
+            RetryStateMatch::Fresh => {}
         }
         if state.active_count() == MAX_OUTSTANDING_COMMANDS {
             drop(state);
@@ -862,6 +916,20 @@ impl IngressShared {
 
     pub(crate) fn notified(&self) -> impl Future<Output = ()> + '_ {
         self.notify.notified()
+    }
+
+    pub(crate) fn install_opened_retry(&self, retry: RetryStateSnapshot) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.active_count() != 0
+            || retry.store_id() != self.store_id
+            || retry.options() != state.retry.options()
+        {
+            return false;
+        }
+        state.retry = retry;
+        true
     }
 
     pub(crate) fn take_next(self: &Arc<Self>) -> NextWork {
@@ -1011,7 +1079,12 @@ impl IngressShared {
         true
     }
 
-    pub(crate) fn complete_durable(&self, slot_index: usize, committed: ManifestCommit) -> bool {
+    pub(crate) fn complete_durable_batch(
+        &self,
+        entries: &[DurableBatchEntry],
+        committed: ManifestCommit,
+        retry: RetryStateSnapshot,
+    ) -> bool {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
@@ -1022,41 +1095,98 @@ impl IngressShared {
                 return false;
             }
         };
-        let Some(slot) = state.slots.get_mut(slot_index).and_then(Option::take) else {
-            return false;
-        };
-        let Some(append) = slot.append else {
-            state.slots[slot_index] = Some(slot);
-            return false;
-        };
         let cutoff = committed.durable_cutoff();
-        if slot.phase != SlotPhase::AwaitingDurability
-            || append.journal != cutoff.journal()
-            || append.append_sequence > cutoff.append_sequence()
-            || append.end_offset > cutoff.end_offset()
+        if entries.is_empty()
+            || retry.store_id() != self.store_id
+            || retry.options() != state.retry.options()
+            || retry.reference() != committed.retry_state()
         {
-            state.slots[slot_index] = Some(slot);
             let notifications = state.stop_all();
             drop(state);
             notifications.wake();
             return false;
         }
-        state.reserved_bytes = state.reserved_bytes.saturating_sub(slot.reservation);
-        if !slot
-            .terminal
-            .resolve_durable(DurableCommit { append, committed })
+        let transition = entries
+            .iter()
+            .map(|entry| {
+                PendingRetryOutcome::new(
+                    entry.qualification.clone(),
+                    entry.append.append_sequence(),
+                    entry.append.end_offset(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !state
+            .retry
+            .verifies_transition(&retry, &transition, committed)
         {
-            state.slots[slot_index] = Some(slot);
             let notifications = state.stop_all();
             drop(state);
             notifications.wake();
             return false;
         }
-        let terminal = slot.terminal;
+        for entry in entries {
+            let Some(slot) = state.slots.get(entry.slot).and_then(Option::as_ref) else {
+                let notifications = state.stop_all();
+                drop(state);
+                notifications.wake();
+                return false;
+            };
+            let Some(append) = slot.append else {
+                let notifications = state.stop_all();
+                drop(state);
+                notifications.wake();
+                return false;
+            };
+            if slot.phase != SlotPhase::AwaitingDurability
+                || append != entry.append
+                || slot.qualification != entry.qualification
+                || append.journal != cutoff.journal()
+                || append.append_sequence > cutoff.append_sequence()
+                || append.end_offset > cutoff.end_offset()
+                || slot.terminal.durable().is_some()
+            {
+                let notifications = state.stop_all();
+                drop(state);
+                notifications.wake();
+                return false;
+            }
+        }
+        // Projection installation and every terminal transition occur while the
+        // ingress mutex is held. Waiters are woken only after the whole batch is
+        // internally committed.
+        state.retry = retry;
+        let mut notifications = TerminalNotifications::new();
+        for entry in entries {
+            let Some(slot) = state.slots[entry.slot].take() else {
+                let stopped = state.stop_all();
+                drop(state);
+                stopped.wake();
+                return false;
+            };
+            let append = slot.append.expect("prevalidated durable append");
+            state.reserved_bytes = state.reserved_bytes.saturating_sub(slot.reservation);
+            if !slot
+                .terminal
+                .resolve_durable(DurableCommit { append, committed })
+            {
+                let stopped = state.stop_all();
+                drop(state);
+                stopped.wake();
+                return false;
+            }
+            notifications.push(slot.terminal);
+        }
         drop(state);
-        terminal.notify.notify_waiters();
+        notifications.wake();
         self.notify.notify_one();
         true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_retry(&self) -> Option<RetryStateSnapshot> {
+        let state = self.state.lock().ok()?;
+        Some(state.retry.clone())
     }
 
     pub(crate) fn pending_counts(&self) -> (usize, usize) {
@@ -1200,6 +1330,12 @@ struct Slot {
     append: Option<AppendIdentity>,
 }
 
+pub(crate) struct DurableBatchEntry {
+    pub(crate) slot: usize,
+    pub(crate) qualification: RetryQualification,
+    pub(crate) append: AppendIdentity,
+}
+
 struct IngressState {
     closed: bool,
     slots: Vec<Option<Slot>>,
@@ -1208,10 +1344,15 @@ struct IngressState {
     byte_limits: ByteReservationLimits,
     reserved_bytes: usize,
     barrier_requested: bool,
+    retry: RetryStateSnapshot,
 }
 
 impl IngressState {
-    fn new(store_id: StoreId, byte_limits: ByteReservationLimits) -> Self {
+    fn new(
+        store_id: StoreId,
+        byte_limits: ByteReservationLimits,
+        retry_options: RetryPersistenceOptions,
+    ) -> Self {
         let mut slots = Vec::with_capacity(MAX_OUTSTANDING_COMMANDS);
         slots.resize_with(MAX_OUTSTANDING_COMMANDS, || None);
         Self {
@@ -1222,6 +1363,7 @@ impl IngressState {
             byte_limits,
             reserved_bytes: 0,
             barrier_requested: false,
+            retry: RetryStateSnapshot::empty(store_id, retry_options),
         }
     }
 
@@ -1320,6 +1462,7 @@ mod tests {
         let shared = IngressShared::new(
             StoreId::from_bytes(uuid_bytes(1)).expect("store UUIDv7"),
             ByteReservationLimits::new(1_024, 0, 0).expect("byte limits"),
+            och_store::RetryPersistenceOptions::new(2, 2).expect("retry limits"),
         );
         let terminal = Arc::new(ReceiptTerminal::new());
         let qualification = RetryQualification::new(

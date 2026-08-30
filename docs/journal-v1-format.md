@@ -23,7 +23,7 @@ version, identity variant, truncation, and trailing input fail closed. The V2
 header changes only the version field; all admission frames remain format version
 one. `JournalHeaderV1` rejects V2, so a premanifest writer fails closed after a
 store is upgraded. V1/V2 bootstrap and committed publication are specified in
-[Manifest V1](manifest-v1-format.md).
+[Manifest V1/V2](manifest-v1-format.md).
 
 ## Independent admission frame
 

@@ -87,7 +87,11 @@ impl HistorianRuntime {
     ) -> Result<Self, StartError> {
         let executor = Handle::try_current().map_err(|_| StartError::NoActiveRuntime)?;
         let store_id = store_options.store_id();
-        let ingress = HistorianIngress::new_with_limits(store_id, store_options.byte_limits());
+        let ingress = HistorianIngress::new_with_limits(
+            store_id,
+            store_options.byte_limits(),
+            store_options.retry(),
+        );
         let inspection = InspectionShared::new();
         let stop = Arc::new(AtomicBool::new(false));
         let (store_sender, store_receiver) = sync_channel(MAX_OUTSTANDING_COMMANDS);
@@ -347,6 +351,7 @@ impl HistorianRuntime {
                 256, 512,
             ))
             .expect("test registry persistence options"),
+            och_store::RetryPersistenceOptions::new(8, 8).expect("test retry persistence options"),
         )
         .expect("test store options")
         .with_test_cleanup();
@@ -674,6 +679,12 @@ async fn run_writer(
             return WriterExit::StoreFault;
         }
     };
+    if store_ready.retry.reference() != store_ready.inspection.committed().retry_state()
+        || !ingress.install_opened_retry(store_ready.retry.clone())
+    {
+        let _ = readiness.send(Err(StartError::WorkerExitedBeforeReadiness));
+        return WriterExit::StoreFault;
+    }
 
     #[cfg(test)]
     let initialization_failed = match options.initialization_gate.take() {
@@ -803,6 +814,7 @@ async fn writer_loop(
                 let Ok(Ok(AppendResult { admission, append })) = append_rx.await else {
                     return WriterExit::StoreFault;
                 };
+                let qualification = admission.retry().clone();
                 let Ok(preparation) = work.prepare_publication(&admission) else {
                     return WriterExit::PublicationFault;
                 };
@@ -837,6 +849,8 @@ async fn writer_loop(
                         priority,
                         barrier,
                         frame_bytes,
+                        qualification: Box::new(qualification),
+                        append,
                     },
                 )
                 .is_err()
@@ -1067,6 +1081,24 @@ mod tests {
         byte_limits: ByteReservationLimits,
         group: GroupCommitPolicy,
     ) -> StoreOptions {
+        durable_options_with_retry(
+            directory,
+            store,
+            mode,
+            byte_limits,
+            group,
+            och_store::RetryPersistenceOptions::new(2, 2).expect("test retry persistence options"),
+        )
+    }
+
+    fn durable_options_with_retry(
+        directory: PathBuf,
+        store: StoreId,
+        mode: och_store::ActiveJournalOpenMode,
+        byte_limits: ByteReservationLimits,
+        group: GroupCommitPolicy,
+        retry: och_store::RetryPersistenceOptions,
+    ) -> StoreOptions {
         StoreOptions::new(
             directory,
             store,
@@ -1081,6 +1113,7 @@ mod tests {
             group,
             och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(16, 64))
                 .expect("test registry persistence options"),
+            retry,
         )
         .expect("test durable options")
     }
@@ -1518,6 +1551,7 @@ mod tests {
             .expect("reopen journal limits"),
             och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(256, 512))
                 .expect("reopen registry options"),
+            och_store::RetryPersistenceOptions::new(2, 2).expect("reopen retry options"),
         )
         .expect("reopen configuration");
         let reopened = och_store::ManifestStore::open(config)
@@ -1583,6 +1617,15 @@ mod tests {
                 .await
                 .expect("writer should report readiness");
             assert_eq!(probe.state_initialized.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                runtime
+                    .ingress()
+                    .shared()
+                    .current_retry()
+                    .expect("installed startup retry projection")
+                    .reference(),
+                runtime.inspection().committed().retry_state()
+            );
             complete_bounded(runtime.shutdown())
                 .await
                 .expect("ready writer should shut down");
@@ -2128,15 +2171,478 @@ mod tests {
 
             let after_terminal = ingress
                 .try_submit(command("window", 4, 40))
-                .expect("qualification after terminal completion should be new work");
-            assert_eq!(after_terminal.disposition(), SubmissionDisposition::Queued);
+                .expect("qualification after durability should replay");
             assert_eq!(
-                complete_bounded(after_terminal.into_receipt().wait()).await,
+                after_terminal.disposition(),
+                SubmissionDisposition::Replayed
+            );
+            assert!(matches!(
+                complete_bounded(after_terminal.into_receipt().wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("retry-window runtime should shut down");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn durable_retry_horizon_replays_guards_and_expires_fifo_without_refresh() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let runtime = complete_bounded(open_durable_test(durable_options(
+                directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("retry byte limits"),
+                group_policy(
+                    std::time::Duration::from_secs(5),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                ),
+            )))
+            .await
+            .expect("open retry horizon runtime");
+            let ingress = runtime.ingress();
+            let submit_durable = |key: &'static str, digest: u8| {
+                let ingress = ingress.clone();
+                async move {
+                    let submission = ingress
+                        .try_submit(IngressCommand::with_policy(
+                            command(key, digest, u128::from(digest)).into_admission(),
+                            AdmissionPriority::Normal,
+                            BarrierDemand::Immediate,
+                        ))
+                        .expect("fresh horizon command");
+                    assert_eq!(submission.disposition(), SubmissionDisposition::Queued);
+                    let DurableOutcome::Durable(commit) =
+                        complete_bounded(submission.into_receipt().wait_durable()).await
+                    else {
+                        panic!("fresh horizon command should become durable");
+                    };
+                    commit
+                }
+            };
+
+            let a = submit_durable("horizon-a", 1).await;
+            let b = submit_durable("horizon-b", 2).await;
+            let latest_before_replay = runtime
+                .read_handle()
+                .snapshot()
+                .expect("latest before replay");
+            let replay_a = ingress
+                .try_submit(command("horizon-a", 1, 99))
+                .expect("oldest replay hit");
+            assert_eq!(replay_a.disposition(), SubmissionDisposition::Replayed);
+            let replay_a = replay_a.into_receipt();
+            assert_eq!(
+                complete_bounded(replay_a.clone().wait_handled()).await,
+                HandledOutcome::WriterHandled(a.append())
+            );
+            let DurableOutcome::Durable(replayed_a) =
+                complete_bounded(replay_a.wait_durable()).await
+            else {
+                panic!("replay must be immediately durable");
+            };
+            assert_eq!(replayed_a, a);
+            assert_eq!(
+                runtime
+                    .read_handle()
+                    .snapshot()
+                    .expect("latest after replay"),
+                latest_before_replay,
+                "replay cannot republish latest"
+            );
+            let replay_conflict = ingress
+                .try_submit(command("horizon-a", 9, 100))
+                .expect_err("changed replay content conflicts");
+            assert_eq!(replay_conflict.kind(), TrySubmitErrorKind::RetryConflict);
+            assert_eq!(
+                replay_conflict.into_command().admission().retry(),
+                command("horizon-a", 9, 100).admission().retry()
+            );
+
+            let _c = submit_durable("horizon-c", 3).await;
+            let projected = ingress
+                .shared()
+                .current_retry()
+                .expect("committed retry projection");
+            assert_eq!(projected.replay().len(), 2);
+            assert_eq!(projected.guard().len(), 1);
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("shutdown first horizon runtime");
+
+            let reopened = complete_bounded(open_durable_test(durable_options(
+                directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::OpenExisting,
+                ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                    .expect("reopen retry byte limits"),
+                group_policy(
+                    std::time::Duration::from_secs(5),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                ),
+            )))
+            .await
+            .expect("reopen retry horizon runtime");
+            let ingress = reopened.ingress();
+            let latest_after_reopen = reopened
+                .read_handle()
+                .snapshot()
+                .expect("latest after horizon reopen");
+            assert!(latest_after_reopen.is_empty());
+            let replay_b = ingress
+                .try_submit(command("horizon-b", 2, 101))
+                .expect("replay tier restores after reopen");
+            assert_eq!(replay_b.disposition(), SubmissionDisposition::Replayed);
+            assert_eq!(
+                complete_bounded(replay_b.into_receipt().wait_durable()).await,
+                DurableOutcome::Durable(b)
+            );
+            assert_eq!(
+                reopened
+                    .read_handle()
+                    .snapshot()
+                    .expect("latest after reopened replay"),
+                latest_after_reopen
+            );
+            let expired_a = ingress
+                .try_submit(command("horizon-a", 1, 100))
+                .expect_err("promoted replay remains guarded after reopen");
+            assert_eq!(expired_a.kind(), TrySubmitErrorKind::RetryExpired);
+            assert_eq!(
+                expired_a.into_command().admission().retry(),
+                command("horizon-a", 1, 100).admission().retry()
+            );
+            assert_eq!(
+                ingress
+                    .try_submit(command("horizon-a", 9, 101))
+                    .expect_err("guard changed content conflicts")
+                    .kind(),
+                TrySubmitErrorKind::RetryConflict
+            );
+
+            let submit_durable = |key: &'static str, digest: u8| {
+                let ingress = ingress.clone();
+                async move {
+                    let submission = ingress
+                        .try_submit(IngressCommand::with_policy(
+                            command(key, digest, u128::from(digest)).into_admission(),
+                            AdmissionPriority::Normal,
+                            BarrierDemand::Immediate,
+                        ))
+                        .expect("fresh reopened horizon command");
+                    assert_eq!(submission.disposition(), SubmissionDisposition::Queued);
+                    assert!(matches!(
+                        complete_bounded(submission.into_receipt().wait_durable()).await,
+                        DurableOutcome::Durable(_)
+                    ));
+                }
+            };
+            let _d = submit_durable("horizon-d", 4).await;
+            // This second hit must not refresh A ahead of B in the guard FIFO.
+            assert_eq!(
+                ingress
+                    .try_submit(command("horizon-a", 1, 102))
+                    .expect_err("guard hit remains expired")
+                    .kind(),
+                TrySubmitErrorKind::RetryExpired
+            );
+            let _e = submit_durable("horizon-e", 5).await;
+            complete_bounded(reopened.shutdown())
+                .await
+                .expect("shutdown reopened horizon runtime");
+
+            let final_runtime = complete_bounded(open_durable_test(durable_options(
+                directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::OpenExisting,
+                ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                    .expect("final retry byte limits"),
+                group_policy(
+                    std::time::Duration::from_secs(5),
+                    MAX_OUTSTANDING_COMMANDS,
+                    64 * 1_024 * 1_024,
+                ),
+            )))
+            .await
+            .expect("final reopen retry horizon runtime");
+            let fresh_a = final_runtime
+                .ingress()
+                .try_submit(IngressCommand::with_policy(
+                    command("horizon-a", 1, 103).into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Immediate,
+                ))
+                .expect("A is fresh only after replay and guard eviction");
+            assert_eq!(fresh_a.disposition(), SubmissionDisposition::Queued);
+            assert!(matches!(
+                complete_bounded(fresh_a.into_receipt().wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
+
+            complete_bounded(final_runtime.shutdown())
+                .await
+                .expect("shutdown final horizon runtime");
+            fs::remove_dir_all(directory).expect("remove retry horizon directory");
+        });
+    }
+
+    #[test]
+    fn original_replay_commit_survives_manifest_slot_reuse_and_reopen_exactly() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                .expect("retention byte limits");
+            let group = group_policy(
+                std::time::Duration::from_secs(5),
+                MAX_OUTSTANDING_COMMANDS,
+                64 * 1_024 * 1_024,
+            );
+            let retry =
+                och_store::RetryPersistenceOptions::new(8, 8).expect("retention retry options");
+            let runtime = complete_bounded(open_durable_test(durable_options_with_retry(
+                directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                bytes,
+                group,
+                retry,
+            )))
+            .await
+            .expect("open retained-outcome runtime");
+            let ingress = runtime.ingress();
+            let durable = |key: &'static str, digest: u8| {
+                let ingress = ingress.clone();
+                async move {
+                    let submission = ingress
+                        .try_submit(IngressCommand::with_policy(
+                            command(key, digest, u128::from(digest)).into_admission(),
+                            AdmissionPriority::Normal,
+                            BarrierDemand::Immediate,
+                        ))
+                        .expect("retained outcome submission");
+                    let DurableOutcome::Durable(commit) =
+                        complete_bounded(submission.into_receipt().wait_durable()).await
+                    else {
+                        panic!("retained outcome should become durable");
+                    };
+                    commit
+                }
+            };
+            let original = durable("retained-original", 21).await;
+            let _ = durable("retained-2", 22).await;
+            let _ = durable("retained-3", 23).await;
+            let _ = durable("retained-4", 24).await;
+            assert!(
+                runtime.inspection().committed().manifest_generation()
+                    >= original.manifest_commit().manifest_generation() + 3
+            );
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("shutdown retained-outcome runtime");
+
+            let reopened = complete_bounded(open_durable_test(durable_options_with_retry(
+                directory.clone(),
+                store_id(1),
+                och_store::ActiveJournalOpenMode::OpenExisting,
+                bytes,
+                group,
+                retry,
+            )))
+            .await
+            .expect("reopen retained-outcome runtime");
+            let latest_before = reopened
+                .read_handle()
+                .snapshot()
+                .expect("empty latest before retained replay");
+            let replay = reopened
+                .ingress()
+                .try_submit(command("retained-original", 21, 999))
+                .expect("original retained replay after reopen");
+            assert_eq!(replay.disposition(), SubmissionDisposition::Replayed);
+            let DurableOutcome::Durable(actual) =
+                complete_bounded(replay.into_receipt().wait_durable()).await
+            else {
+                panic!("retained replay should be durable");
+            };
+            assert_eq!(actual, original);
+            assert_eq!(
+                reopened
+                    .read_handle()
+                    .snapshot()
+                    .expect("latest after retained replay"),
+                latest_before
+            );
+            complete_bounded(reopened.shutdown())
+                .await
+                .expect("shutdown reopened retained runtime");
+            fs::remove_dir_all(directory).expect("remove retained outcome directory");
+        });
+    }
+
+    #[test]
+    fn durable_replay_precedes_count_saturation_without_refresh_or_new_work() {
+        harness().block_on(async {
+            let probe = Arc::new(LifecycleProbe::default());
+            let (open_publication, publication_gate) = oneshot::channel();
+            let mut writer_options = options(&probe, TestBehavior::Normal);
+            writer_options.publication_gate = Some(publication_gate);
+            writer_options.publication_gate_after = 1;
+            let runtime = complete_bounded(HistorianRuntime::start_with_options(
+                store_id(1),
+                writer_options,
+            ))
+            .await
+            .expect("open count saturation runtime");
+            let ingress = runtime.ingress();
+            let first = ingress
+                .try_submit(IngressCommand::with_policy(
+                    command("count-replay", 31, 0).into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Immediate,
+                ))
+                .expect("queue durable count replay seed");
+            assert!(matches!(
+                complete_bounded(first.into_receipt().wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
+
+            let held = ingress
+                .try_submit(command("count-held-00", 40, 1))
+                .expect("queue publication-held command")
+                .into_receipt();
+            wait_until(|| ingress.test_counts() == (1, 0, 1)).await;
+            let mut queued = Vec::new();
+            for index in 1_u8..16 {
+                queued.push(
+                    ingress
+                        .try_submit(command(
+                            &format!("count-held-{index:02}"),
+                            40_u8.saturating_add(index),
+                            u128::from(index),
+                        ))
+                        .expect("fill exact count window")
+                        .into_receipt(),
+                );
+            }
+            assert_eq!(ingress.test_counts().0, MAX_OUTSTANDING_COMMANDS);
+            let replay = ingress
+                .try_submit(command("count-replay", 31, 999))
+                .expect("durable replay precedes full window");
+            assert_eq!(replay.disposition(), SubmissionDisposition::Replayed);
+            assert!(matches!(
+                complete_bounded(replay.into_receipt().wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
+            assert_eq!(
+                ingress
+                    .try_submit(command("count-replay", 32, 1_000))
+                    .expect_err("durable conflict precedes full window")
+                    .kind(),
+                TrySubmitErrorKind::RetryConflict
+            );
+            assert_eq!(
+                ingress
+                    .try_submit(command("count-overflow", 90, 2_000))
+                    .expect_err("distinct work sees full window")
+                    .kind(),
+                TrySubmitErrorKind::Full
+            );
+            open_publication.send(()).expect("release publication gate");
+            assert_eq!(
+                complete_bounded(held.wait()).await,
                 ReceiptOutcome::WriterHandled
             );
             complete_bounded(runtime.shutdown())
                 .await
-                .expect("retry-window runtime should shut down");
+                .expect("shutdown count saturation runtime");
+            for receipt in queued {
+                assert!(matches!(
+                    complete_bounded(receipt.wait_durable()).await,
+                    DurableOutcome::Durable(_)
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn durable_replay_precedes_exact_byte_saturation() {
+        harness().block_on(async {
+            let probe = Arc::new(LifecycleProbe::default());
+            let (open_publication, publication_gate) = oneshot::channel();
+            let mut writer_options = options(&probe, TestBehavior::Normal);
+            writer_options.publication_gate = Some(publication_gate);
+            writer_options.publication_gate_after = 1;
+            let directory = test_directory();
+            let held_command = command("byte-new-00", 52, 1);
+            let exact_bytes = och_store::admission_frame_len_v1(held_command.admission())
+                .expect("measure held byte frame");
+            let byte_limits =
+                ByteReservationLimits::new(exact_bytes, 0, 0).expect("exact byte limit");
+            let group = group_policy(
+                std::time::Duration::from_secs(5),
+                MAX_OUTSTANDING_COMMANDS,
+                exact_bytes,
+            );
+            let runtime = complete_bounded(HistorianRuntime::open_inner(
+                durable_options(
+                    directory.clone(),
+                    store_id(1),
+                    och_store::ActiveJournalOpenMode::CreateNew,
+                    byte_limits,
+                    group,
+                ),
+                writer_options,
+            ))
+            .await
+            .expect("open byte saturation runtime");
+            runtime
+                .apply_registry(default_test_registry_operation(store_id(1)))
+                .await
+                .expect("seed byte saturation registry");
+            let ingress = runtime.ingress();
+            let seed = ingress
+                .try_submit(IngressCommand::with_policy(
+                    command("byte-old-00", 51, 0).into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Immediate,
+                ))
+                .expect("queue byte replay seed");
+            assert!(matches!(
+                complete_bounded(seed.into_receipt().wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
+            let held = ingress
+                .try_submit(held_command)
+                .expect("queue exact byte-held command")
+                .into_receipt();
+            wait_until(|| ingress.test_counts() == (1, 0, 1)).await;
+            let replay = ingress
+                .try_submit(command("byte-old-00", 51, 99))
+                .expect("replay precedes byte saturation");
+            assert_eq!(replay.disposition(), SubmissionDisposition::Replayed);
+            assert_eq!(
+                ingress
+                    .try_submit(command("byte-new-01", 53, 2))
+                    .expect_err("fresh work sees exact byte saturation")
+                    .kind(),
+                TrySubmitErrorKind::ByteCapacity
+            );
+            open_publication
+                .send(())
+                .expect("release byte publication gate");
+            assert!(matches!(
+                complete_bounded(held.wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("shutdown byte saturation runtime");
+            fs::remove_dir_all(directory).expect("remove byte saturation directory");
         });
     }
 
@@ -3580,7 +4086,7 @@ mod tests {
     }
 
     #[test]
-    fn handled_and_durable_stages_reopen_without_restart_retry_authority() {
+    fn handled_and_durable_stages_reopen_with_restart_retry_authority() {
         harness().block_on(async {
             let directory = test_directory();
             let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("byte limits");
@@ -3667,15 +4173,15 @@ mod tests {
                     AdmissionPriority::Normal,
                     BarrierDemand::Immediate,
                 ))
-                .expect("restart does not seed completed retry cache");
-            assert_eq!(equivalent.disposition(), SubmissionDisposition::Queued);
+                .expect("restart restores completed retry projection");
+            assert_eq!(equivalent.disposition(), SubmissionDisposition::Replayed);
             let DurableOutcome::Durable(second) =
                 complete_bounded(equivalent.into_receipt().wait_durable()).await
             else {
-                panic!("second active-scope admission should become durable");
+                panic!("restored active-scope admission should replay durably");
             };
-            assert_eq!(second.append().append_sequence(), 2);
-            assert_eq!(second.durable_cutoff().checkpoint_generation(), 3);
+            assert_eq!(second.append().append_sequence(), 1);
+            assert_eq!(second.durable_cutoff().checkpoint_generation(), 2);
             complete_bounded(reopened.shutdown())
                 .await
                 .expect("reopened runtime shutdown");
@@ -3698,7 +4204,11 @@ mod tests {
             );
             let limits = ByteReservationLimits::new(frame_bytes * 3, frame_bytes, frame_bytes)
                 .expect("nested class law");
-            let ingress = HistorianIngress::new_with_limits(store_id(1), limits);
+            let ingress = HistorianIngress::new_with_limits(
+                store_id(1),
+                limits,
+                och_store::RetryPersistenceOptions::new(2, 2).expect("retry options"),
+            );
             let first_receipt = ingress
                 .try_submit(IngressCommand::with_policy(
                     first.into_admission(),
@@ -4419,6 +4929,7 @@ mod tests {
                 group,
                 och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(16, 64))
                     .expect("path-bound registry options"),
+                och_store::RetryPersistenceOptions::default(),
             )
             .is_ok(),
             "exact path bound is retained"
@@ -4433,6 +4944,7 @@ mod tests {
                 group,
                 och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(16, 64))
                     .expect("path-bound registry options"),
+                och_store::RetryPersistenceOptions::default(),
             ),
             Err(StoreOptionsError::Store(
                 och_store::ManifestStoreError::InvalidOptions
@@ -4480,6 +4992,8 @@ mod tests {
                             256, 512,
                         ))
                         .expect("reopen registry options"),
+                        och_store::RetryPersistenceOptions::new(2, 2)
+                            .expect("reopen retry options"),
                     )
                     .expect("reopen config");
                     match och_store::ManifestStore::open(config) {

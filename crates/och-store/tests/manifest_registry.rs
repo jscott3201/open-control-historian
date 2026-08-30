@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Manifest-rooted registry, bootstrap, lifecycle, and hostile-byte evidence.
+//! Manifest-rooted registry/retry, bootstrap, lifecycle, and hostile-byte evidence.
 
 #[path = "support/manifest_oracle.rs"]
 mod manifest_oracle;
@@ -12,10 +12,12 @@ use och_core::{
 use och_store::{
     ACTIVE_JOURNAL_FILE_NAME, ActiveJournal, ActiveJournalConfig, ActiveJournalLimits,
     ActiveJournalOpenMode, AppendSequenceV1, JOURNAL_V1_HEADER_LEN, JournalHeaderV1,
-    JournalHeaderV2, MANIFEST_SLOT_0_FILE_NAME, MANIFEST_STAGING_FILE_NAME,
-    MAX_ADMISSION_PAYLOAD_V1, ManifestStore, ManifestStoreConfig, ManifestStoreError,
-    PreparedAdmissionV1, REGISTRY_SLOT_0_FILE_NAME, REGISTRY_STAGING_FILE_NAME,
-    RegistryPersistenceOptions, STORE_LOCK_FILE_NAME,
+    JournalHeaderV2, MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME,
+    MANIFEST_STAGING_FILE_NAME, MAX_ADMISSION_PAYLOAD_V1, ManifestStore, ManifestStoreConfig,
+    ManifestStoreError, PendingRetryOutcome, PreparedAdmissionV1, REGISTRY_SLOT_0_FILE_NAME,
+    REGISTRY_STAGING_FILE_NAME, RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME,
+    RETRY_SLOT_2_FILE_NAME, RegistryPersistenceOptions, RetryPersistenceOptions,
+    STORE_LOCK_FILE_NAME,
 };
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -81,6 +83,7 @@ fn manifest_config(
         mode,
         journal_limits(),
         registry,
+        RetryPersistenceOptions::new(2, 2).expect("bounded retry limits"),
     )
     .expect("valid manifest config")
 }
@@ -186,6 +189,16 @@ fn genesis_bytes_match_the_independent_primitive_oracle() {
             .expect("oracle revision bound"),
     );
     assert_eq!(registry, expected_registry);
+    let retry =
+        fs::read(directory.path().join(RETRY_SLOT_0_FILE_NAME)).expect("read empty retry bytes");
+    let retry_options = RetryPersistenceOptions::new(2, 2).expect("oracle retry options");
+    let expected_retry = manifest_oracle::empty_retry(
+        support::uuid_bytes(1),
+        1,
+        u32::try_from(retry_options.replay_capacity()).expect("oracle replay capacity"),
+        u32::try_from(retry_options.guard_capacity()).expect("oracle guard capacity"),
+    );
+    assert_eq!(retry, expected_retry);
     let manifest = fs::read(directory.path().join(MANIFEST_SLOT_0_FILE_NAME))
         .expect("read genesis manifest bytes");
     assert_eq!(
@@ -199,6 +212,9 @@ fn genesis_bytes_match_the_independent_primitive_oracle() {
             0,
             1,
             &expected_registry,
+            0,
+            1,
+            &expected_retry,
         )
     );
 
@@ -207,6 +223,351 @@ fn genesis_bytes_match_the_independent_primitive_oracle() {
             !ORACLE_SOURCE.contains(forbidden),
             "primitive oracle must not contain {forbidden}"
         );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn legacy_v1_reopen_does_not_backfill_and_first_new_durability_publishes_v2() {
+    let directory = TestDirectory::new("legacy-v1-retry");
+    let admission = support::no_change_admission();
+    let declaration = admission.declaration();
+    let first_frame = frame(admission.clone(), 1);
+    let mut store = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::CreateNew,
+        registry_options(),
+    ))
+    .expect("create V2 fixture store");
+    let (_, registry_commit) = store
+        .register(
+            declaration.series_id(),
+            declaration.binding().clone(),
+            declaration.payload().clone(),
+            declaration.evidence().clone(),
+        )
+        .expect("register V1 fixture declaration");
+    let end_offset = store
+        .append(&first_frame)
+        .expect("append V1 fixture record");
+    let (durable, _) = store
+        .sync_pending(&[PendingRetryOutcome::new(
+            first_frame.admission().retry().clone(),
+            1,
+            end_offset,
+        )])
+        .expect("commit V2 fixture record");
+    assert_eq!(durable.manifest_generation(), 3);
+    drop(store);
+
+    let registry_name = match registry_commit.registry_slot() {
+        0 => REGISTRY_SLOT_0_FILE_NAME,
+        1 => och_store::REGISTRY_SLOT_1_FILE_NAME,
+        2 => och_store::REGISTRY_SLOT_2_FILE_NAME,
+        _ => panic!("validated registry slot"),
+    };
+    let registry_bytes =
+        fs::read(directory.path().join(registry_name)).expect("read fixture registry bytes");
+    let store_bytes = support::uuid_bytes(1);
+    let legacy_older = manifest_oracle::manifest_v1(
+        store_bytes,
+        2,
+        registry_commit.durable_cutoff().checkpoint_generation(),
+        0,
+        JOURNAL_V1_HEADER_LEN as u64,
+        registry_commit.registry_slot(),
+        registry_commit.registry_generation(),
+        &registry_bytes,
+    );
+    let legacy_current = manifest_oracle::manifest_v1(
+        store_bytes,
+        3,
+        durable.durable_cutoff().checkpoint_generation(),
+        1,
+        end_offset,
+        durable.registry_slot(),
+        durable.registry_generation(),
+        &registry_bytes,
+    );
+    fs::write(
+        directory.path().join(MANIFEST_SLOT_1_FILE_NAME),
+        legacy_older,
+    )
+    .expect("write older legacy manifest");
+    fs::write(
+        directory.path().join(MANIFEST_SLOT_0_FILE_NAME),
+        legacy_current,
+    )
+    .expect("write current legacy manifest");
+    for name in [
+        RETRY_SLOT_0_FILE_NAME,
+        RETRY_SLOT_1_FILE_NAME,
+        RETRY_SLOT_2_FILE_NAME,
+    ] {
+        match fs::remove_file(directory.path().join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove retry fixture: {error}"),
+        }
+    }
+
+    let mut legacy = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::OpenExisting,
+        registry_options(),
+    ))
+    .expect("open exact legacy V1 pair");
+    assert_eq!(legacy.inspection().committed().retry_state(), None);
+    assert!(legacy.retry_state_snapshot().replay().is_empty());
+    assert!(legacy.retry_state_snapshot().guard().is_empty());
+    assert_eq!(legacy.recovered_records().len(), 1);
+
+    let second_frame = frame(admission, 2);
+    let second_end = legacy
+        .append(&second_frame)
+        .expect("legacy key is fresh without backfill");
+    let (transition, restored) = legacy
+        .sync_pending(&[PendingRetryOutcome::new(
+            second_frame.admission().retry().clone(),
+            2,
+            second_end,
+        )])
+        .expect("first new durability transitions to V2");
+    assert!(transition.retry_state().is_some());
+    assert_eq!(restored.replay().len(), 1);
+    assert_eq!(restored.replay()[0].append_sequence(), 2);
+    drop(legacy);
+
+    let reopened = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::OpenExisting,
+        registry_options(),
+    ))
+    .expect("mixed V1/V2 manifest pair reopens");
+    assert_eq!(reopened.retry_state_snapshot(), restored);
+}
+
+#[test]
+fn one_replay_retry_and_manifest_v2_match_the_primitive_oracle_exactly() {
+    let directory = TestDirectory::new("retry-oracle");
+    let admission = support::no_change_admission();
+    let declaration = admission.declaration().clone();
+    let prepared = frame(admission, 1);
+    let mut store = ManifestStore::open(manifest_config(
+        &directory,
+        ActiveJournalOpenMode::CreateNew,
+        registry_options(),
+    ))
+    .expect("create retry oracle store");
+    store
+        .register(
+            declaration.series_id(),
+            declaration.binding().clone(),
+            declaration.payload().clone(),
+            declaration.evidence().clone(),
+        )
+        .expect("register retry oracle declaration");
+    let end_offset = store.append(&prepared).expect("append retry oracle frame");
+    let (commit, state) = store
+        .sync_pending(&[PendingRetryOutcome::new(
+            prepared.admission().retry().clone(),
+            1,
+            end_offset,
+        )])
+        .expect("commit retry oracle outcome");
+    assert_eq!(state.replay().len(), 1);
+    let retry_reference = commit.retry_state().expect("V2 retry reference");
+    drop(store);
+
+    let retry_name = match retry_reference.slot() {
+        0 => RETRY_SLOT_0_FILE_NAME,
+        1 => RETRY_SLOT_1_FILE_NAME,
+        2 => RETRY_SLOT_2_FILE_NAME,
+        _ => panic!("validated retry slot"),
+    };
+    let retry_bytes =
+        fs::read(directory.path().join(retry_name)).expect("read one-outcome retry bytes");
+    let qualification = prepared.admission().retry();
+    let options = RetryPersistenceOptions::new(2, 2).expect("oracle retry options");
+    let expected_retry = manifest_oracle::retry_with_one_replay(
+        support::uuid_bytes(1),
+        retry_reference.generation(),
+        u32::try_from(options.replay_capacity()).expect("oracle replay capacity"),
+        u32::try_from(options.guard_capacity()).expect("oracle guard capacity"),
+        *qualification.series_id().as_bytes(),
+        *qualification.producer_id().as_bytes(),
+        qualification.key().as_str(),
+        qualification.content().format().as_str(),
+        qualification.content().version().get(),
+        *qualification.content().sha256(),
+        1,
+        end_offset,
+        commit.manifest_generation(),
+        commit.registry_slot(),
+        commit.registry_generation(),
+        commit.durable_cutoff().checkpoint_generation(),
+        commit.durable_cutoff().append_sequence(),
+        commit.durable_cutoff().end_offset(),
+        retry_reference.slot(),
+        retry_reference.generation(),
+    );
+    assert_eq!(retry_bytes, expected_retry);
+
+    let registry_name = match commit.registry_slot() {
+        0 => REGISTRY_SLOT_0_FILE_NAME,
+        1 => och_store::REGISTRY_SLOT_1_FILE_NAME,
+        2 => och_store::REGISTRY_SLOT_2_FILE_NAME,
+        _ => panic!("validated registry slot"),
+    };
+    let registry_bytes =
+        fs::read(directory.path().join(registry_name)).expect("read oracle registry bytes");
+    let manifest_bytes = fs::read(directory.path().join(MANIFEST_SLOT_0_FILE_NAME))
+        .expect("read oracle V2 manifest bytes");
+    assert_eq!(
+        manifest_bytes,
+        manifest_oracle::manifest(
+            support::uuid_bytes(1),
+            commit.manifest_generation(),
+            commit.durable_cutoff().checkpoint_generation(),
+            commit.durable_cutoff().append_sequence(),
+            commit.durable_cutoff().end_offset(),
+            commit.registry_slot(),
+            commit.registry_generation(),
+            &registry_bytes,
+            retry_reference.slot(),
+            retry_reference.generation(),
+            &expected_retry,
+        )
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn reopen_rejects_checksummed_retry_state_inconsistent_with_current_or_older_manifest_root() {
+    for hostile_current in [true, false] {
+        let directory = TestDirectory::new(if hostile_current {
+            "retry-current-root"
+        } else {
+            "retry-older-root"
+        });
+        let admission = support::no_change_admission();
+        let declaration = admission.declaration().clone();
+        let prepared = frame(admission, 1);
+        let mut store = ManifestStore::open(manifest_config(
+            &directory,
+            ActiveJournalOpenMode::CreateNew,
+            registry_options(),
+        ))
+        .expect("create root validation store");
+        store
+            .register(
+                declaration.series_id(),
+                declaration.binding().clone(),
+                declaration.payload().clone(),
+                declaration.evidence().clone(),
+            )
+            .expect("register root validation declaration");
+        let end_offset = store
+            .append(&prepared)
+            .expect("append root validation frame");
+        let (commit, _) = store
+            .sync_pending(&[PendingRetryOutcome::new(
+                prepared.admission().retry().clone(),
+                1,
+                end_offset,
+            )])
+            .expect("commit root validation outcome");
+        drop(store);
+
+        if hostile_current {
+            let retry_reference = commit.retry_state().expect("current retry reference");
+            let retry_name = match retry_reference.slot() {
+                0 => RETRY_SLOT_0_FILE_NAME,
+                1 => RETRY_SLOT_1_FILE_NAME,
+                2 => RETRY_SLOT_2_FILE_NAME,
+                _ => panic!("validated retry slot"),
+            };
+            let retry_path = directory.path().join(retry_name);
+            let mut retry = fs::read(&retry_path).expect("read current retry bytes");
+            let qualification = prepared.admission().retry();
+            let qualification_len = 16
+                + 16
+                + 4
+                + qualification.key().as_str().len()
+                + 4
+                + qualification.content().format().as_str().len()
+                + 16
+                + 32;
+            let manifest_generation_offset = 64 + qualification_len + 16;
+            retry[manifest_generation_offset..manifest_generation_offset + 8].copy_from_slice(
+                &commit
+                    .manifest_generation()
+                    .checked_add(1)
+                    .expect("bounded future generation")
+                    .to_be_bytes(),
+            );
+            rewrite_trailing_crc(&mut retry);
+            fs::write(&retry_path, &retry).expect("write checksummed future retry outcome");
+
+            let manifest_path = directory.path().join(MANIFEST_SLOT_0_FILE_NAME);
+            let mut manifest = fs::read(&manifest_path).expect("read current manifest bytes");
+            manifest[112..116].copy_from_slice(&crc32c(&retry).to_be_bytes());
+            rewrite_trailing_crc(&mut manifest);
+            fs::write(manifest_path, manifest).expect("root future retry from current manifest");
+        } else {
+            let retry_path = directory.path().join(RETRY_SLOT_0_FILE_NAME);
+            let qualification = prepared.admission().retry();
+            let retry = manifest_oracle::retry_with_one_replay(
+                support::uuid_bytes(1),
+                1,
+                2,
+                2,
+                *qualification.series_id().as_bytes(),
+                *qualification.producer_id().as_bytes(),
+                qualification.key().as_str(),
+                qualification.content().format().as_str(),
+                qualification.content().version().get(),
+                *qualification.content().sha256(),
+                1,
+                end_offset,
+                2,
+                commit.registry_slot(),
+                commit.registry_generation(),
+                commit.durable_cutoff().checkpoint_generation(),
+                1,
+                end_offset,
+                0,
+                1,
+            );
+            fs::write(&retry_path, &retry).expect("write future outcome under older root");
+
+            let manifest_path = directory.path().join(MANIFEST_SLOT_1_FILE_NAME);
+            let mut manifest = fs::read(&manifest_path).expect("read older manifest bytes");
+            assert_eq!(u64::from_be_bytes(manifest[28..36].try_into().unwrap()), 2);
+            manifest[104..112].copy_from_slice(
+                &u64::try_from(retry.len())
+                    .expect("bounded hostile retry length")
+                    .to_be_bytes(),
+            );
+            manifest[112..116].copy_from_slice(&crc32c(&retry).to_be_bytes());
+            rewrite_trailing_crc(&mut manifest);
+            fs::write(manifest_path, manifest).expect("root hostile older retry snapshot");
+        }
+
+        let before = exact_file_inventory(directory.path());
+        let Err(error) = ManifestStore::open(manifest_config(
+            &directory,
+            ActiveJournalOpenMode::OpenExisting,
+            registry_options(),
+        )) else {
+            panic!("root-inconsistent retry must refuse on reopen");
+        };
+        assert_eq!(
+            error,
+            ManifestStoreError::InvalidRetry,
+            "hostile current case: {hostile_current}"
+        );
+        assert_eq!(exact_file_inventory(directory.path()), before);
     }
 }
 
@@ -228,6 +589,7 @@ fn foreign_store_registry_referenced_by_valid_manifest_refuses_unchanged() {
         ActiveJournalOpenMode::CreateNew,
         journal_limits(),
         registry_options(),
+        RetryPersistenceOptions::new(2, 2).expect("bounded retry limits"),
     )
     .expect("valid foreign manifest config");
     let foreign = ManifestStore::open(foreign_config).expect("create foreign manifest store");
@@ -462,10 +824,17 @@ fn lifecycle_commits_restart_and_historical_admission_survives_retirement() {
         Err(ManifestStoreError::Model(ModelError::SeriesRetired))
     );
 
-    store
+    let end_offset = store
         .append(&initial_frame)
         .expect("retained revision-one declaration remains admissible");
-    let durable = store.sync_pending().expect("manifest-backed durability");
+    let pending = [PendingRetryOutcome::new(
+        initial_frame.admission().retry().clone(),
+        initial_frame.append_sequence().get(),
+        end_offset,
+    )];
+    let (durable, _) = store
+        .sync_pending(&pending)
+        .expect("manifest-backed durability");
     assert_eq!(durable.manifest_generation(), 5);
     assert_eq!(durable.registry_generation(), 4);
     let snapshot = store.registry_snapshot();
@@ -563,12 +932,15 @@ fn unknown_historical_declaration_and_core_capacity_refuse_unchanged() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn hostile_manifest_registry_inventory_and_cutoff_refuse_without_repair() {
     for (name, target, offset) in [
         ("manifest-version", MANIFEST_SLOT_0_FILE_NAME, 9_usize),
         ("manifest-checksum", MANIFEST_SLOT_0_FILE_NAME, 127_usize),
         ("registry-version", REGISTRY_SLOT_0_FILE_NAME, 9_usize),
         ("registry-checksum", REGISTRY_SLOT_0_FILE_NAME, 67_usize),
+        ("retry-version", RETRY_SLOT_0_FILE_NAME, 9_usize),
+        ("retry-checksum", RETRY_SLOT_0_FILE_NAME, 67_usize),
     ] {
         let directory = TestDirectory::new(name);
         let store = ManifestStore::open(manifest_config(
@@ -588,7 +960,9 @@ fn hostile_manifest_registry_inventory_and_cutoff_refuse_without_repair() {
                 ActiveJournalOpenMode::OpenExisting,
                 registry_options(),
             )),
-            Err(ManifestStoreError::InvalidManifest | ManifestStoreError::InvalidRegistry)
+            Err(ManifestStoreError::InvalidManifest
+                | ManifestStoreError::InvalidRegistry
+                | ManifestStoreError::InvalidRetry)
         ));
     }
 
@@ -619,6 +993,7 @@ fn hostile_manifest_registry_inventory_and_cutoff_refuse_without_repair() {
         "unknown.och",
         MANIFEST_STAGING_FILE_NAME,
         REGISTRY_STAGING_FILE_NAME,
+        och_store::RETRY_STAGING_FILE_NAME,
     ] {
         let directory = TestDirectory::new("inventory");
         let store = ManifestStore::open(manifest_config(
@@ -644,6 +1019,50 @@ fn hostile_manifest_registry_inventory_and_cutoff_refuse_without_repair() {
             Err(error) if error == expected
         ));
     }
+
+    let unreferenced = TestDirectory::new("unreferenced-retry");
+    let store = ManifestStore::open(manifest_config(
+        &unreferenced,
+        ActiveJournalOpenMode::CreateNew,
+        registry_options(),
+    ))
+    .expect("create unreferenced retry fixture");
+    drop(store);
+    fs::copy(
+        unreferenced.path().join(RETRY_SLOT_0_FILE_NAME),
+        unreferenced.path().join(RETRY_SLOT_1_FILE_NAME),
+    )
+    .expect("copy valid but unreferenced retry snapshot");
+    assert!(matches!(
+        ManifestStore::open(manifest_config(
+            &unreferenced,
+            ActiveJournalOpenMode::OpenExisting,
+            registry_options(),
+        )),
+        Err(ManifestStoreError::InvalidRetry)
+    ));
+
+    let mismatch = TestDirectory::new("retry-options-mismatch");
+    let store = ManifestStore::open(manifest_config(
+        &mismatch,
+        ActiveJournalOpenMode::CreateNew,
+        registry_options(),
+    ))
+    .expect("create retry options fixture");
+    drop(store);
+    let mismatch_config = ManifestStoreConfig::new(
+        mismatch.path().to_path_buf(),
+        support::store_id(1),
+        ActiveJournalOpenMode::OpenExisting,
+        journal_limits(),
+        registry_options(),
+        RetryPersistenceOptions::new(1, 1).expect("other valid retry options"),
+    )
+    .expect("construct mismatched retry options");
+    assert!(matches!(
+        ManifestStore::open(mismatch_config),
+        Err(ManifestStoreError::InvalidRetry)
+    ));
 }
 
 #[test]
