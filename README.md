@@ -9,7 +9,9 @@ path with exact byte reservation, a dedicated blocking writer, Journal V1 append
 group barriers, crash-safe manifest-backed durable receipts, bounded canonical
 registry persistence, a bounded durable replay/guard horizon, bounded
 successor rotation and raw-Journal sealing, bounded reopen evidence, and volatile
-latest-observation snapshots. It does **not** yet provide final native segments,
+latest-observation snapshots. Current-V1 reopen may also commit one bounded report
+while removing only a proven terminal invalid/torn active suffix; valid post-root
+frames and ambiguity refuse unchanged. It does **not** yet provide final native segments,
 retention/reclamation, unbounded or time-based retry, current/held-value, or
 query behavior.
 
@@ -52,9 +54,8 @@ a fixed reaper owns the eventual blocking-thread join.
 framing and hostile bounded decode, generation-one names plus deterministic
 successor active pairs, a never-renamed stable store lock, generation-scoped
 journal locks, two reusable 160-byte Manifest V1 slots, three reusable complete
-registry and retry slots, three
-Generation Catalog V1 slots, and at most 64 immutable sealed raw-Journal
-generations. It
+registry and retry slots, three Generation Catalog V1 slots, three Recovery State
+V1 report slots, and at most 64 immutable sealed raw-Journal generations. It
 restores registry state only through public core lifecycle replay, requires exact
 historical declarations for recovered and new admission bytes, and commits a
 manifest only after the mechanical cutoff. Reopen exposes decoded records only
@@ -67,15 +68,19 @@ refuse. A verified strict-prefix catalog left by an ordinary postcommit cleanup
 interruption is the sole narrow redundant-catalog exception. A durable receipt proves the
 manifest names the exact active generation/cutoff and retains its original commit
 across later rotation under the stated platform contract; it is not a final
-queryable-segment or universal physical-power-loss claim.
+queryable-segment or universal physical-power-loss claim. Recovery first proves
+the selected current root and every registry, retry, catalog/seal,
+active/checkpoint, declaration, and report relationship under both retained
+locks. A successful recovery remains runtime `Healthy`; inspection exposes the
+latest committed report as event history, not proof it occurred during that open.
 
 The current workspace contains:
 
 | Package | Role | Purpose |
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model, bounded series declaration authority, and a measurement-only example |
-| [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, durable retry replay/guard classification, automatic safe-boundary rotation, writer-serialized registry control, manifest-backed receipts, and volatile latest snapshots |
-| [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
+| [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, durable retry replay/guard classification, automatic safe-boundary rotation, recovery-report inspection, writer-serialized registry control, manifest-backed receipts, and volatile latest snapshots |
+| [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, conservative terminal-suffix recovery, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
 `och-core` has no dependencies. `och-store` depends inward on `och-core`, and
@@ -170,7 +175,7 @@ through nextest rather than being repeated with `cargo test`.
 - [M02 durable-format reset brief](docs/implementation-brief-m02-v1-durable-format-reset.md)
   records the current-only authority transition and exclusions.
 - [M02 durable-format reset continuation](docs/continuation-m02-v1-durable-format-reset.md)
-  records implementation evidence, bounds, and deferred recovery work.
+  records implementation evidence, bounds, and the then-deferred recovery handoff.
 - [Journal V1 format](docs/journal-v1-format.md) defines the exact version-one
   header, frame, payload, active-artifact, checkpoint, byte-order, bound,
   checksum, and refusal contracts.
@@ -183,6 +188,11 @@ through nextest rather than being repeated with `cargo test`.
   bounded sealed-generation inventory and reference law.
 - [Sealed raw Journal V1](docs/sealed-journal-v1-format.md) defines the immutable
   pre-segment artifact and streaming verification contract.
+- [Recovery State V1](docs/recovery-state-v1-format.md) defines the exact durable
+  report bytes, manifest reference, convergence law, and diagnostic semantics.
+- [M02-PR03a implementation brief](docs/implementation-brief-m02-pr03a.md) and
+  [continuation](docs/continuation-m02-pr03a.md) record conservative current-V1
+  recovery evidence and the remaining deferrals.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

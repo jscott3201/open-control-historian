@@ -25,8 +25,9 @@ durable successor, M02-PR02a makes a bounded manifest the committed description
 of its active range, mechanical cutoff, and complete canonical registry history,
 M02-PR02b adds its bounded durable retry horizon, M02-PR02c adds bounded
 active-journal rotation, immutable raw-Journal sealing, and Generation Catalog V1,
-and the durable-format reset makes each artifact family current-only V1 behind a
-fixed Store Format V1 epoch marker. `och-runtime` depends
+the durable-format reset makes each artifact family current-only V1 behind a
+fixed Store Format V1 epoch marker, and M02-PR03a adds one manifest-rooted
+current-V1 conservative recovery transaction. `och-runtime` depends
 inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05
 `CanonicalAdmission` evidence, reserves exact encoded bytes before allocation,
@@ -44,8 +45,9 @@ never-renamed store lock, generation-scoped retained journal locks, deterministi
 active-artifact create/open, bounded scan/append/rotation, double-slot mechanical
 checkpoints, two-slot 160-byte Manifest V1 authority, three-slot complete registry
 snapshots, three-slot durable retry snapshots, three-slot Generation Catalog V1,
-at most 64 immutable raw-Journal sealed generations, strict current genesis, narrow
-rotation convergence, and publication. It
+three-slot Recovery State V1 event evidence, at most 64 immutable raw-Journal
+sealed generations, strict current genesis, narrow rotation and terminal-suffix
+recovery convergence, and publication. It
 restores registry snapshots only by public `SeriesRegistry` replay and
 requires every decoded journal declaration to match retained historical
 authority; decoded records never authorize registry state. Markerless, historical,
@@ -63,9 +65,13 @@ completed retry outcomes restore only within the configured two-tier horizon.
 The sole writer automatically rotates a nonempty generation at safe
 size/count/age boundaries only after ordinary durability completes; one
 store-global append sequence continues while offsets/checkpoint generations reset
-per generation. Final native segments, retention/reclamation, unbounded or
-time-based retry, query, adapters, manifest-backed latest projection, and broad
-recovery remain absent.
+per generation. Recovery removes and synchronizes only a proven terminal
+invalid/torn suffix beyond the selected manifest cutoff after all authority is
+validated; valid post-root frames and ambiguity refuse unchanged. The latest
+committed report is durable event history and never registry, retry, latest,
+receipt, or declaration authority. Final native segments, retention/reclamation,
+unbounded or time-based retry, query, adapters, manifest-backed latest projection,
+disk-pressure/degraded operation, stale-restore custody, and broad repair remain absent.
 Published observations never imply current or held values.
 
 The ignored `_roadmap/` directory is local and unpublished.

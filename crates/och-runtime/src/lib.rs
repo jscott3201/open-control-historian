@@ -191,6 +191,15 @@ impl HistorianRuntime {
             .snapshot(&self.ingress.shared(), &self.initial_inspection)
     }
 
+    /// Returns the latest manifest-bound durable recovery event, if any.
+    ///
+    /// This is the latest retained event and is not proof that recovery happened
+    /// during this runtime open.
+    #[must_use]
+    pub fn latest_recovery(&self) -> Option<och_store::RecoveryReport> {
+        self.inspection().latest_recovery()
+    }
+
     /// Returns bounded decoded reopen evidence without authorizing it.
     #[must_use]
     pub fn recovered_records(&self) -> &[RecoveredAdmissionV1] {
@@ -1054,6 +1063,7 @@ mod tests {
     };
     use std::fs;
     use std::future::{Future, poll_fn};
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::process::{Command, Stdio};
@@ -5226,6 +5236,75 @@ mod tests {
                 .await
                 .expect("inspection shutdown");
             fs::remove_dir_all(directory).expect("remove inspection directory");
+        });
+    }
+
+    #[test]
+    fn committed_recovery_report_reaches_runtime_inspection_with_healthy_status() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let bytes = ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                .expect("recovery runtime byte limits");
+            let options_for = |mode| {
+                durable_options(
+                    directory.clone(),
+                    store_id(1),
+                    mode,
+                    bytes,
+                    group_policy(
+                        std::time::Duration::from_millis(2),
+                        MAX_OUTSTANDING_COMMANDS,
+                        64 * 1_024 * 1_024,
+                    ),
+                )
+            };
+            let runtime = complete_bounded(HistorianRuntime::open(options_for(
+                och_store::ActiveJournalOpenMode::CreateNew,
+            )))
+            .await
+            .expect("create recovery runtime fixture");
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("shutdown recovery runtime fixture");
+            let mut journal = fs::OpenOptions::new()
+                .append(true)
+                .open(directory.join(och_store::ACTIVE_JOURNAL_FILE_NAME))
+                .expect("open runtime suffix");
+            journal
+                .write_all(b"OCHF\0\x01\x01\0\0")
+                .expect("write runtime suffix");
+            journal.sync_all().expect("sync runtime suffix");
+            drop(journal);
+
+            let recovered = complete_bounded(HistorianRuntime::open(options_for(
+                och_store::ActiveJournalOpenMode::OpenExisting,
+            )))
+            .await
+            .expect("runtime recovery succeeds");
+            let inspection = recovered.inspection();
+            let report = inspection
+                .latest_recovery()
+                .expect("runtime recovery report");
+            assert_eq!(inspection.health(), RuntimeHealth::Healthy);
+            assert_eq!(recovered.latest_recovery(), Some(report));
+            assert_eq!(report.removed_bytes(), 9);
+            let committed = inspection.committed();
+            complete_bounded(recovered.shutdown())
+                .await
+                .expect("shutdown recovered runtime");
+
+            let reopened = complete_bounded(HistorianRuntime::open(options_for(
+                och_store::ActiveJournalOpenMode::OpenExisting,
+            )))
+            .await
+            .expect("clean runtime reopen retains report");
+            assert_eq!(reopened.inspection().health(), RuntimeHealth::Healthy);
+            assert_eq!(reopened.inspection().committed(), committed);
+            assert_eq!(reopened.latest_recovery(), Some(report));
+            complete_bounded(reopened.shutdown())
+                .await
+                .expect("shutdown clean reopened runtime");
+            fs::remove_dir_all(directory).expect("remove runtime recovery directory");
         });
     }
 

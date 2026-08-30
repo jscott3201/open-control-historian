@@ -8,7 +8,8 @@
 //! mechanical active artifacts. [`ManifestStore`] composes it with stable
 //! locking, bounded registry/retry/catalog snapshots, immutable raw-Journal
 //! sealing, successor rotation, and a manifest-backed durable cutoff. The crate
-//! owns no runtime scheduling, final segment encoding, or query behavior.
+//! also owns one manifest-rooted conservative terminal-suffix recovery event.
+//! It owns no runtime scheduling, final segment encoding, or query behavior.
 
 mod active;
 mod codec;
@@ -16,6 +17,7 @@ mod decoded;
 mod error;
 mod generation;
 mod manifest;
+mod recovery;
 mod retry;
 
 #[cfg(test)]
@@ -45,12 +47,18 @@ pub use generation::{
 pub use manifest::{
     MANIFEST_SLOT_0_FILE_NAME, MANIFEST_SLOT_1_FILE_NAME, MANIFEST_STAGING_FILE_NAME,
     MAX_PERSISTED_REGISTRY_REVISIONS, MAX_PERSISTED_REGISTRY_SERIES, MAX_REGISTRY_SNAPSHOT_BYTES,
-    ManifestCommit, ManifestIoEvidence, ManifestIoOperation, ManifestStore, ManifestStoreConfig,
-    ManifestStoreError, ManifestStoreInspection, REGISTRY_SLOT_0_FILE_NAME,
-    REGISTRY_SLOT_1_FILE_NAME, REGISTRY_SLOT_2_FILE_NAME, REGISTRY_STAGING_FILE_NAME,
-    RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME, RETRY_SLOT_2_FILE_NAME,
-    RETRY_STAGING_FILE_NAME, RegistryPersistenceOptions, STORE_FORMAT_FILE_NAME, STORE_FORMAT_LEN,
-    STORE_FORMAT_MAGIC, STORE_FORMAT_STAGING_FILE_NAME, STORE_FORMAT_VERSION, STORE_LOCK_FILE_NAME,
+    ManifestCommit, ManifestIoEvidence, ManifestIoOperation, ManifestOpenClassification,
+    ManifestStore, ManifestStoreConfig, ManifestStoreError, ManifestStoreInspection,
+    REGISTRY_SLOT_0_FILE_NAME, REGISTRY_SLOT_1_FILE_NAME, REGISTRY_SLOT_2_FILE_NAME,
+    REGISTRY_STAGING_FILE_NAME, RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME,
+    RETRY_SLOT_2_FILE_NAME, RETRY_STAGING_FILE_NAME, RegistryPersistenceOptions,
+    STORE_FORMAT_FILE_NAME, STORE_FORMAT_LEN, STORE_FORMAT_MAGIC, STORE_FORMAT_STAGING_FILE_NAME,
+    STORE_FORMAT_VERSION, STORE_LOCK_FILE_NAME,
+};
+pub use recovery::{
+    RECOVERY_SLOT_0_FILE_NAME, RECOVERY_SLOT_1_FILE_NAME, RECOVERY_SLOT_2_FILE_NAME,
+    RECOVERY_STAGING_FILE_NAME, RECOVERY_STATE_LEN, RECOVERY_STATE_MAGIC, RECOVERY_STATE_VERSION,
+    RecoveryAction, RecoveryClassification, RecoveryReport,
 };
 pub use retry::{
     MAX_PERSISTED_RETRY_ENTRIES, MAX_RETRY_STATE_BYTES, PendingRetryOutcome, RetryGuardEntry,

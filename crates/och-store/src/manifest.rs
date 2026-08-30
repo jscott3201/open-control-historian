@@ -1,8 +1,8 @@
 //! Bounded manifest-rooted active journal and canonical registry persistence.
 
 use crate::active::{
-    ActiveJournal, ActiveJournalConfig, active_checkpoint_file_name, active_journal_file_name,
-    preflight_manifest_genesis,
+    ActiveJournal, ActiveJournalConfig, ActiveRecoveryPlan, ManifestRootOpenError,
+    active_checkpoint_file_name, active_journal_file_name, preflight_manifest_genesis,
 };
 use crate::codec::{
     Cursor, Encoder, crc32c, decode_declaration, decode_declaration_evidence, encode_declaration,
@@ -17,6 +17,10 @@ use crate::generation::{
     parse_active_checkpoint_generation_name, parse_active_journal_generation_name,
     parse_sealed_generation_name, sealed_journal_file_name,
 };
+use crate::recovery::{
+    RECOVERY_SLOT_NAMES, RecoveryArtifact, RecoveryCodecError, RecoveryReference,
+    decode_recovery_state, encode_recovery_state,
+};
 use crate::retry::{
     RetryArtifactReference, RetryStateCodecError, decode_retry_state_at_slot, encode_retry_state,
 };
@@ -27,7 +31,8 @@ use crate::{
 };
 use crate::{
     MAX_PERSISTED_RETRY_ENTRIES, MAX_RETRY_STATE_BYTES, PendingRetryOutcome,
-    RetryPersistenceOptions, RetryStateReference, RetryStateSnapshot,
+    RECOVERY_STAGING_FILE_NAME, RECOVERY_STATE_LEN, RecoveryReport, RetryPersistenceOptions,
+    RetryStateReference, RetryStateSnapshot,
 };
 use och_core::{
     CollectionEnvelope, DeclarationEvidence, DeclarationRevision, DeclaredCollectionEnvelope,
@@ -101,7 +106,7 @@ const RETRY_SLOT_NAMES: [&str; 3] = [
     RETRY_SLOT_1_FILE_NAME,
     RETRY_SLOT_2_FILE_NAME,
 ];
-const MAX_INVENTORY_ENTRIES: usize = 87;
+const MAX_INVENTORY_ENTRIES: usize = 91;
 
 #[cfg(test)]
 std::thread_local! {
@@ -313,6 +318,66 @@ impl fmt::Display for ManifestStoreError {
 
 impl Error for ManifestStoreError {}
 
+/// Additive path- and content-free classification of a store-open refusal.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManifestOpenClassification {
+    /// Supplied options or hard bounds were invalid.
+    InvalidOptions,
+    /// Durable evidence is outside the current Store Format V1 epoch.
+    UnsupportedFormat,
+    /// A stable or active writer lock is already retained.
+    AlreadyOpen,
+    /// The bounded directory inventory is unsafe or inconsistent.
+    InvalidInventory,
+    /// Current durable authority is corrupt, ambiguous, or scope-mismatched.
+    CorruptAuthority,
+    /// A bounded publication is incomplete and cannot be guessed.
+    InterruptedPublication,
+    /// A fixed durable capacity or generation bound was exhausted.
+    Capacity,
+    /// The live authority was already terminally faulted.
+    Faulted,
+    /// Canonical model semantics refused the request.
+    Model,
+    /// A path-free filesystem operation failed.
+    Io,
+}
+
+impl ManifestStoreError {
+    /// Returns an additive sanitized open/corruption classification.
+    ///
+    /// The original error remains the exact source authority. This view carries
+    /// no paths, payloads, canonical content, handles, or unbounded strings.
+    #[must_use]
+    pub const fn open_classification(self) -> ManifestOpenClassification {
+        match self {
+            Self::InvalidOptions => ManifestOpenClassification::InvalidOptions,
+            Self::UnsupportedStoreFormat => ManifestOpenClassification::UnsupportedFormat,
+            Self::AlreadyOpen | Self::Active(ActiveJournalError::AlreadyOpen) => {
+                ManifestOpenClassification::AlreadyOpen
+            }
+            Self::InvalidInventory => ManifestOpenClassification::InvalidInventory,
+            Self::InterruptedPublication => ManifestOpenClassification::InterruptedPublication,
+            Self::GenerationCatalogFull | Self::GenerationExhausted => {
+                ManifestOpenClassification::Capacity
+            }
+            Self::Faulted | Self::Active(ActiveJournalError::Faulted) => {
+                ManifestOpenClassification::Faulted
+            }
+            Self::Model(_) => ManifestOpenClassification::Model,
+            Self::Io(_) | Self::Active(ActiveJournalError::Io(_)) => ManifestOpenClassification::Io,
+            Self::InvalidManifest
+            | Self::InvalidRegistry
+            | Self::InvalidRetry
+            | Self::InvalidGeneration
+            | Self::StoreMismatch
+            | Self::HistoricalDeclarationMismatch
+            | Self::Active(_) => ManifestOpenClassification::CorruptAuthority,
+        }
+    }
+}
+
 impl From<ActiveJournalError> for ManifestStoreError {
     fn from(error: ActiveJournalError) -> Self {
         Self::Active(error)
@@ -420,6 +485,7 @@ pub struct ManifestStoreInspection {
     active: ActiveJournalInspection,
     committed: ManifestCommit,
     generations: GenerationInventory,
+    recovery: Option<RecoveryReport>,
 }
 
 impl ManifestStoreInspection {
@@ -440,6 +506,15 @@ impl ManifestStoreInspection {
     pub const fn generations(self) -> GenerationInventory {
         self.generations
     }
+
+    /// Returns the latest manifest-bound durable recovery event, if any.
+    ///
+    /// This is retained event evidence, not proof that recovery occurred during
+    /// the current open.
+    #[must_use]
+    pub const fn latest_recovery(self) -> Option<RecoveryReport> {
+        self.recovery
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -456,6 +531,7 @@ struct ManifestRecord {
     registry: RegistryReference,
     cutoff: DurableCutoff,
     retry: RetryArtifactReference,
+    recovery: Option<RecoveryReference>,
     sequence_floor: u64,
     catalog: Option<GenerationCatalogReference>,
 }
@@ -483,6 +559,7 @@ pub struct ManifestStore {
     registry: SeriesRegistry,
     retry: RetryStateSnapshot,
     catalog: GenerationCatalogSnapshot,
+    recovery_report: Option<RecoveryReport>,
     manifest_slots: [Option<ManifestRecord>; 2],
     current_slot: usize,
     current: ManifestRecord,
@@ -499,6 +576,7 @@ impl ManifestStore {
     ///
     /// Returns a bounded path-free refusal for format, lock, inventory,
     /// identity, cutoff, registry, or I/O failure.
+    #[allow(clippy::too_many_lines)]
     pub fn open(config: ManifestStoreConfig) -> Result<Self, ManifestStoreError> {
         let directory = open_directory(&config.directory)?;
         let preflight = preflight_store_format(&config)?;
@@ -525,12 +603,17 @@ impl ManifestStore {
             return Err(ManifestStoreError::UnsupportedStoreFormat);
         }
         let mut inventory = inspect_inventory(&config.directory)?;
-        if (inventory.staging || inventory.rotation_staging) && !inventory.rotation_intent {
+        if (inventory.registry_staging || inventory.retry_staging || inventory.rotation_staging)
+            && !inventory.rotation_intent
+        {
             return Err(ManifestStoreError::InterruptedPublication);
         }
         let mut manifest_slots = read_manifest_slots(&config.directory, config.store_id)?;
         let mut committed_intent = None;
         if inventory.rotation_intent {
+            let recovery_inventory = read_recovery_inventory(&config.directory, config.store_id)?;
+            validate_recovery_manifest_progression(manifest_slots, &recovery_inventory)?;
+            validate_no_pending_recovery(manifest_slots, &recovery_inventory)?;
             let (_, current) = select_current_manifest(manifest_slots)?
                 .ok_or(ManifestStoreError::InvalidGeneration)?;
             let intent = read_rotation_intent(&config.directory, config.store_id)?;
@@ -588,6 +671,12 @@ impl ManifestStore {
                 &store.directory,
                 store.manifest_slots,
             )?;
+            remove_unreferenced_recovery_slots(
+                &store.directory_path,
+                &store.directory,
+                store.manifest_slots,
+                store.current.cutoff.journal().store_id(),
+            )?;
             Ok(store)
         } else {
             Self::initialize_genesis(config, directory, store_lock, &inventory, manifest_slots)
@@ -604,6 +693,29 @@ impl ManifestStore {
         current: ManifestRecord,
         rotation_intent: Option<RotationIntent>,
     ) -> Result<Self, ManifestStoreError> {
+        let active_config = ActiveJournalConfig::new(
+            config.directory.clone(),
+            config.store_id,
+            ActiveJournalOpenMode::OpenExisting,
+            config.journal_limits,
+        )
+        .map_err(ManifestStoreError::Active)?
+        .manifest_existing()
+        .manifest_generation(
+            current.cutoff.journal().generation(),
+            current.sequence_floor,
+        )
+        .map_err(ManifestStoreError::Active)?;
+        let (journal, recovery_plan) =
+            ActiveJournal::open_manifest_root(active_config, current.cutoff).map_err(|error| {
+                match error {
+                    ManifestRootOpenError::RootMismatch => ManifestStoreError::InvalidManifest,
+                    ManifestRootOpenError::Active(error) => ManifestStoreError::Active(error),
+                }
+            })?;
+        // The root scan above is read-only and retains the writer lock. All
+        // remaining semantic authority is now proven while both stable and
+        // active locks remain held before the single-use plan can mutate bytes.
         let registry =
             read_referenced_registry(&config.directory, current.registry, config.store_id)?;
         validate_registry_inventory(
@@ -621,23 +733,8 @@ impl ManifestStore {
         validate_catalog_inventory(&config.directory, manifest_slots, config.store_id)?;
         let inventory = inspect_inventory(&config.directory)?;
         validate_generation_inventory(&inventory, current, &catalog, rotation_intent)?;
-        let active_config = ActiveJournalConfig::new(
-            config.directory.clone(),
-            config.store_id,
-            ActiveJournalOpenMode::OpenExisting,
-            config.journal_limits,
-        )
-        .map_err(ManifestStoreError::Active)?
-        .manifest_existing()
-        .manifest_generation(
-            current.cutoff.journal().generation(),
-            current.sequence_floor,
-        )
-        .map_err(ManifestStoreError::Active)?;
-        let journal = ActiveJournal::open(active_config)?;
-        if journal.durable_cutoff() != current.cutoff {
-            return Err(ManifestStoreError::InvalidManifest);
-        }
+        let recovery_inventory = read_recovery_inventory(&config.directory, config.store_id)?;
+        validate_recovery_manifest_progression(manifest_slots, &recovery_inventory)?;
         validate_recovered_declarations(&registry, journal.recovered_records())
             .map_err(|_| ManifestStoreError::InvalidRegistry)?;
         let retry = read_referenced_retry(
@@ -654,7 +751,18 @@ impl ManifestStore {
             config.retry,
             rotation_intent.is_some(),
         )?;
-        Ok(Self {
+        validate_recovery_report_coverage(
+            manifest_slots,
+            &recovery_inventory,
+            current,
+            &catalog,
+            &journal,
+        )?;
+        let recovery_report = current
+            .recovery
+            .map(|reference| referenced_recovery(&recovery_inventory, reference))
+            .transpose()?;
+        let mut store = Self {
             directory_path: config.directory,
             directory,
             _store_lock: store_lock,
@@ -662,11 +770,225 @@ impl ManifestStore {
             registry,
             retry,
             catalog,
+            recovery_report,
             manifest_slots,
             current_slot,
             current,
             faulted: false,
-        })
+        };
+        store.converge_recovery(&recovery_inventory, recovery_plan)?;
+        if store.current.recovery.is_some() {
+            store
+                .directory
+                .sync_all()
+                .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))?;
+        }
+        Ok(store)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn converge_recovery(
+        &mut self,
+        inventory: &RecoveryInventoryState,
+        recovery_plan: Option<ActiveRecoveryPlan>,
+    ) -> Result<(), ManifestStoreError> {
+        let referenced = self
+            .manifest_slots
+            .iter()
+            .flatten()
+            .filter_map(|manifest| manifest.recovery)
+            .collect::<Vec<_>>();
+        let target_slot = (0_u8..3)
+            .find(|slot| !referenced.iter().any(|reference| reference.slot == *slot))
+            .ok_or(ManifestStoreError::InvalidManifest)?;
+        let latest_generation = self
+            .recovery_report
+            .map_or(0, RecoveryReport::report_generation);
+        let mut candidate = None;
+        for artifact in inventory.slots.into_iter().flatten() {
+            if referenced.contains(&artifact.reference) {
+                continue;
+            }
+            if latest_generation > 0 && artifact.report.report_generation() < latest_generation {
+                continue;
+            }
+            if candidate.replace(artifact).is_some() {
+                return Err(ManifestStoreError::InvalidManifest);
+            }
+        }
+        if inventory.staging.is_some() && candidate.is_some() {
+            return Err(ManifestStoreError::InvalidManifest);
+        }
+
+        let expected_report_generation = latest_generation
+            .checked_add(1)
+            .ok_or(ManifestStoreError::GenerationExhausted)?;
+        let mut artifact = if let Some(report) = inventory.staging {
+            let bytes = encode_recovery_state(report).map_err(map_recovery_codec)?;
+            Some((
+                RecoveryArtifact {
+                    reference: RecoveryReference {
+                        slot: target_slot,
+                        checksum: crc32c(&bytes),
+                    },
+                    report,
+                },
+                true,
+            ))
+        } else {
+            candidate.map(|artifact| (artifact, false))
+        };
+
+        if let Some((intent, from_staging)) = artifact {
+            if intent.reference.slot != target_slot
+                || intent.report.report_generation() != expected_report_generation
+                || !report_matches_source(
+                    intent.report,
+                    self.current,
+                    self.current
+                        .generation
+                        .checked_add(1)
+                        .ok_or(ManifestStoreError::GenerationExhausted)?,
+                )
+            {
+                return Err(ManifestStoreError::InvalidManifest);
+            }
+            match &recovery_plan {
+                Some(plan)
+                    if intent.report.original_journal_length() == plan.original_length()
+                        && intent.report.classification() == plan.classification() => {}
+                Some(_) => return Err(ManifestStoreError::InvalidManifest),
+                None if from_staging => return Err(ManifestStoreError::InterruptedPublication),
+                None => {}
+            }
+            if from_staging {
+                converge_recovery_staging(
+                    &self.directory_path,
+                    &self.directory,
+                    intent,
+                    self.current.cutoff.journal().store_id(),
+                )?;
+            }
+            artifact = Some((intent, false));
+        }
+
+        if artifact.is_none() {
+            if inventory.manifest_staging.is_some() {
+                return Err(ManifestStoreError::InterruptedPublication);
+            }
+            let Some(ref plan) = recovery_plan else {
+                remove_unreferenced_recovery_slots(
+                    &self.directory_path,
+                    &self.directory,
+                    self.manifest_slots,
+                    self.current.cutoff.journal().store_id(),
+                )?;
+                return Ok(());
+            };
+            let report = RecoveryReport::new(
+                self.current.cutoff.journal().store_id(),
+                expected_report_generation,
+                self.current.generation,
+                manifest_checksum(self.current),
+                self.current.cutoff,
+                self.current.sequence_floor,
+                plan.original_length(),
+                plan.classification(),
+            )
+            .map_err(map_recovery_codec)?;
+            artifact = Some((self.publish_recovery_report(target_slot, report)?, false));
+        }
+
+        let (artifact, _) = artifact.ok_or(ManifestStoreError::InvalidManifest)?;
+        if recovery_plan.is_some() && inventory.manifest_staging.is_some() {
+            return Err(ManifestStoreError::InvalidManifest);
+        }
+        self.directory
+            .sync_all()
+            .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))?;
+        if let Some(plan) = recovery_plan {
+            self.journal.apply_recovery(plan)?;
+        } else {
+            self.journal
+                .synchronize_recovery_cutoff(self.current.cutoff)?;
+        }
+        let next_generation = self
+            .current
+            .generation
+            .checked_add(1)
+            .ok_or(ManifestStoreError::GenerationExhausted)?;
+        let next = ManifestRecord {
+            generation: next_generation,
+            registry: self.current.registry,
+            cutoff: self.current.cutoff,
+            retry: self.current.retry,
+            recovery: Some(artifact.reference),
+            sequence_floor: self.current.sequence_floor,
+            catalog: self.current.catalog,
+        };
+        let slot = if let Some(staging) = inventory.manifest_staging {
+            if staging != next {
+                return Err(ManifestStoreError::InvalidManifest);
+            }
+            converge_manifest_staging(
+                &self.directory_path,
+                &self.directory,
+                1 - self.current_slot,
+                next,
+            )?
+        } else {
+            self.publish_manifest(next)?
+        };
+        let mut slots = self.manifest_slots;
+        slots[slot] = Some(next);
+        self.manifest_slots = slots;
+        self.current_slot = slot;
+        self.current = next;
+        self.recovery_report = Some(artifact.report);
+        remove_unreferenced_catalog_slots(&self.directory_path, &self.directory, slots)?;
+        remove_unreferenced_retry_slots(&self.directory_path, &self.directory, slots)?;
+        remove_unreferenced_recovery_slots(
+            &self.directory_path,
+            &self.directory,
+            slots,
+            self.current.cutoff.journal().store_id(),
+        )?;
+        Ok(())
+    }
+
+    fn publish_recovery_report(
+        &self,
+        slot: u8,
+        report: RecoveryReport,
+    ) -> Result<RecoveryArtifact, ManifestStoreError> {
+        if slot >= 3 {
+            return Err(ManifestStoreError::InvalidManifest);
+        }
+        let bytes = encode_recovery_state(report).map_err(map_recovery_codec)?;
+        let artifact = RecoveryArtifact {
+            reference: RecoveryReference {
+                slot,
+                checksum: crc32c(&bytes),
+            },
+            report,
+        };
+        publish_reusable_slot(
+            &self.directory_path,
+            &self.directory,
+            RECOVERY_STAGING_FILE_NAME,
+            RECOVERY_SLOT_NAMES[usize::from(slot)],
+            &bytes,
+            RECOVERY_STATE_LEN,
+            |candidate| {
+                let decoded = decode_recovery_state(candidate, report.store_id())
+                    .map_err(map_recovery_codec)?;
+                if decoded != report || crc32c(candidate) != artifact.reference.checksum {
+                    return Err(ManifestStoreError::InvalidManifest);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(artifact)
     }
 
     fn initialize_genesis(
@@ -711,6 +1033,7 @@ impl ManifestStore {
             registry,
             retry: RetryStateSnapshot::empty(config.store_id, config.retry),
             catalog: GenerationCatalogSnapshot::empty(config.store_id),
+            recovery_report: None,
             manifest_slots,
             current_slot: 0,
             current: ManifestRecord {
@@ -727,6 +1050,7 @@ impl ManifestStore {
                     length: 0,
                     checksum: 0,
                 },
+                recovery: None,
                 sequence_floor: 0,
                 catalog: None,
             },
@@ -755,6 +1079,7 @@ impl ManifestStore {
             registry: registry_reference,
             cutoff: store.journal.durable_cutoff(),
             retry: retry_reference,
+            recovery: None,
             sequence_floor: 0,
             catalog: None,
         };
@@ -783,6 +1108,7 @@ impl ManifestStore {
                 self.journal.inspection().journal().generation(),
                 &self.catalog,
             ),
+            recovery: self.recovery_report,
         }
     }
 
@@ -974,6 +1300,7 @@ impl ManifestStore {
             registry: self.current.registry,
             cutoff: successor.durable_cutoff(),
             retry: self.current.retry,
+            recovery: self.current.recovery,
             sequence_floor: source_cutoff.append_sequence(),
             catalog: catalog.reference(),
         };
@@ -999,6 +1326,12 @@ impl ManifestStore {
             &self.directory_path,
             &self.directory,
             self.manifest_slots,
+        )?;
+        remove_unreferenced_recovery_slots(
+            &self.directory_path,
+            &self.directory,
+            self.manifest_slots,
+            self.current.cutoff.journal().store_id(),
         )?;
         Ok(self.commit())
     }
@@ -1072,6 +1405,7 @@ impl ManifestStore {
             registry: self.current.registry,
             cutoff,
             retry,
+            recovery: self.current.recovery,
             sequence_floor: self.current.sequence_floor,
             catalog: self.current.catalog,
         };
@@ -1180,6 +1514,7 @@ impl ManifestStore {
             registry: registry_reference,
             cutoff: self.journal.durable_cutoff(),
             retry: self.current.retry,
+            recovery: self.current.recovery,
             sequence_floor: self.current.sequence_floor,
             catalog: self.current.catalog,
         };
@@ -1216,6 +1551,15 @@ impl ManifestStore {
         if let Err(error) =
             remove_unreferenced_retry_slots(&self.directory_path, &self.directory, manifest_slots)
         {
+            self.faulted = true;
+            return Err(error);
+        }
+        if let Err(error) = remove_unreferenced_recovery_slots(
+            &self.directory_path,
+            &self.directory,
+            manifest_slots,
+            self.current.cutoff.journal().store_id(),
+        ) {
             self.faulted = true;
             return Err(error);
         }
@@ -1423,12 +1767,15 @@ struct Inventory {
     entries: usize,
     store_format: bool,
     store_format_staging: bool,
-    staging: bool,
+    registry_staging: bool,
+    retry_staging: bool,
+    recovery_staging: bool,
     rotation_staging: bool,
     registry_slots: usize,
     retry_slots: usize,
     manifest_slots: usize,
     catalog_slots: usize,
+    recovery_slots: usize,
     rotation_intent: bool,
     store_lock: bool,
     active_journals: Vec<u64>,
@@ -1475,6 +1822,7 @@ fn preflight_store_format(
     Ok(FormatPreflight::Current)
 }
 
+#[allow(clippy::too_many_lines)]
 fn preflight_current_artifact_versions(
     config: &ManifestStoreConfig,
     inventory: &Inventory,
@@ -1554,6 +1902,44 @@ fn preflight_current_artifact_versions(
             }
         }
     }
+    for name in RECOVERY_SLOT_NAMES {
+        let Some(bytes) = read_optional_bounded(&config.directory.join(name), RECOVERY_STATE_LEN)?
+        else {
+            continue;
+        };
+        decode_recovery_state(&bytes, config.store_id).map_err(map_recovery_codec)?;
+    }
+    match read_optional_bounded(
+        &config.directory.join(RECOVERY_STAGING_FILE_NAME),
+        RECOVERY_STATE_LEN,
+    ) {
+        Ok(Some(bytes)) => {
+            let _ = decode_recovery_state(&bytes, config.store_id)
+                .map_err(|_| ManifestStoreError::InterruptedPublication)?;
+        }
+        Ok(None) => {}
+        Err(ManifestStoreError::Io(error)) => return Err(ManifestStoreError::Io(error)),
+        Err(_) => return Err(ManifestStoreError::InterruptedPublication),
+    }
+    match read_optional_bounded(
+        &config.directory.join(MANIFEST_STAGING_FILE_NAME),
+        MANIFEST_LEN,
+    ) {
+        Ok(Some(bytes)) => {
+            if bytes.len() != MANIFEST_LEN
+                || bytes[..8] != MANIFEST_MAGIC
+                || u16::from_be_bytes(bytes[8..10].try_into().unwrap_or_default())
+                    != MANIFEST_VERSION
+                || u16::from_be_bytes(bytes[10..12].try_into().unwrap_or_default())
+                    != u16::try_from(MANIFEST_LEN).unwrap_or_default()
+            {
+                return Err(ManifestStoreError::InterruptedPublication);
+            }
+        }
+        Ok(None) => {}
+        Err(ManifestStoreError::Io(error)) => return Err(ManifestStoreError::Io(error)),
+        Err(_) => return Err(ManifestStoreError::InterruptedPublication),
+    }
     Ok(())
 }
 
@@ -1628,9 +2014,12 @@ fn converge_store_format_marker(
         .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))
 }
 
+#[allow(clippy::too_many_lines)]
 fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> {
     let mut count = 0_usize;
-    let mut staging = false;
+    let mut registry_staging = false;
+    let mut retry_staging = false;
+    let mut recovery_staging = false;
     let mut store_format = false;
     let mut store_format_staging = false;
     let mut rotation_staging = false;
@@ -1638,6 +2027,7 @@ fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> 
     let mut retry_slots = 0_usize;
     let mut manifest_slots = 0_usize;
     let mut catalog_slots = 0_usize;
+    let mut recovery_slots = 0_usize;
     let mut active_journals = Vec::new();
     let mut active_checkpoints = Vec::new();
     let mut sealed_generations = Vec::new();
@@ -1671,11 +2061,15 @@ fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> 
             store_format_staging = true;
         } else if name == STORE_LOCK_FILE_NAME {
             store_lock = true;
-        } else if name == MANIFEST_STAGING_FILE_NAME
-            || name == REGISTRY_STAGING_FILE_NAME
-            || name == RETRY_STAGING_FILE_NAME
-        {
-            staging = true;
+        } else if name == MANIFEST_STAGING_FILE_NAME {
+            // Exact staging content is validated separately under the same
+            // bounded fixed-name inventory.
+        } else if name == REGISTRY_STAGING_FILE_NAME {
+            registry_staging = true;
+        } else if name == RETRY_STAGING_FILE_NAME {
+            retry_staging = true;
+        } else if name == RECOVERY_STAGING_FILE_NAME {
+            recovery_staging = true;
         } else if name == GENERATION_CATALOG_STAGING_FILE_NAME
             || name == SEALED_JOURNAL_STAGING_FILE_NAME
         {
@@ -1686,6 +2080,8 @@ fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> 
             retry_slots += 1;
         } else if CATALOG_SLOT_NAMES.contains(&name) {
             catalog_slots += 1;
+        } else if RECOVERY_SLOT_NAMES.contains(&name) {
+            recovery_slots += 1;
         } else if name == ROTATION_INTENT_FILE_NAME {
             rotation_intent = true;
         } else if let Some(generation) = parse_sealed_generation_name(name) {
@@ -1714,12 +2110,15 @@ fn inspect_inventory(directory: &Path) -> Result<Inventory, ManifestStoreError> 
         entries: count,
         store_format,
         store_format_staging,
-        staging,
+        registry_staging,
+        retry_staging,
+        recovery_staging,
         rotation_staging,
         registry_slots,
         retry_slots,
         manifest_slots,
         catalog_slots,
+        recovery_slots,
         rotation_intent,
         store_lock,
         active_journals,
@@ -1737,6 +2136,8 @@ fn validate_genesis_inventory(inventory: &Inventory) -> Result<(), ManifestStore
     if !active_is_valid
         || !inventory.sealed_generations.is_empty()
         || inventory.catalog_slots != 0
+        || inventory.recovery_slots != 0
+        || inventory.recovery_staging
         || inventory.rotation_intent
         || inventory.rotation_staging
     {
@@ -1877,11 +2278,24 @@ fn select_current_manifest(
             if older.generation.checked_add(1) != Some(newer.generation)
                 || !retry_reference_progresses(older.retry, newer.retry)
                 || !catalog_reference_progresses(older.catalog, newer.catalog)
+                || !recovery_reference_progresses(older.recovery, newer.recovery)
             {
                 return Err(ManifestStoreError::InvalidManifest);
             }
             Ok(Some((newer_index, newer)))
         }
+    }
+}
+
+fn recovery_reference_progresses(
+    older: Option<RecoveryReference>,
+    newer: Option<RecoveryReference>,
+) -> bool {
+    match (older, newer) {
+        (None, None | Some(_)) => true,
+        (Some(_), None) => false,
+        (Some(older), Some(newer)) if older == newer => true,
+        (Some(older), Some(newer)) => older.slot != newer.slot,
     }
 }
 
@@ -1911,6 +2325,156 @@ fn retry_reference_progresses(
         older.public.generation().checked_add(1) == Some(newer.public.generation())
             && newer.public.slot() != older.public.slot()
     }
+}
+
+#[derive(Clone)]
+struct RecoveryInventoryState {
+    slots: [Option<RecoveryArtifact>; 3],
+    staging: Option<RecoveryReport>,
+    manifest_staging: Option<ManifestRecord>,
+}
+
+fn read_recovery_inventory(
+    directory: &Path,
+    store_id: StoreId,
+) -> Result<RecoveryInventoryState, ManifestStoreError> {
+    let mut slots = [None, None, None];
+    for (slot, name) in RECOVERY_SLOT_NAMES.iter().enumerate() {
+        let Some(bytes) = read_optional_bounded(&directory.join(name), RECOVERY_STATE_LEN)? else {
+            continue;
+        };
+        let report = decode_recovery_state(&bytes, store_id).map_err(map_recovery_codec)?;
+        slots[slot] = Some(RecoveryArtifact {
+            reference: RecoveryReference {
+                slot: u8::try_from(slot).map_err(|_| ManifestStoreError::InvalidManifest)?,
+                checksum: crc32c(&bytes),
+            },
+            report,
+        });
+    }
+    let staging = read_optional_bounded(
+        &directory.join(RECOVERY_STAGING_FILE_NAME),
+        RECOVERY_STATE_LEN,
+    )?
+    .map(|bytes| decode_recovery_state(&bytes, store_id).map_err(map_recovery_codec))
+    .transpose()?;
+    let manifest_staging =
+        read_optional_bounded(&directory.join(MANIFEST_STAGING_FILE_NAME), MANIFEST_LEN)?
+            .map(|bytes| decode_manifest(&bytes, store_id))
+            .transpose()?;
+    Ok(RecoveryInventoryState {
+        slots,
+        staging,
+        manifest_staging,
+    })
+}
+
+fn referenced_recovery(
+    inventory: &RecoveryInventoryState,
+    reference: RecoveryReference,
+) -> Result<RecoveryReport, ManifestStoreError> {
+    inventory
+        .slots
+        .get(usize::from(reference.slot))
+        .and_then(|artifact| *artifact)
+        .filter(|artifact| artifact.reference == reference)
+        .map(|artifact| artifact.report)
+        .ok_or(ManifestStoreError::InvalidManifest)
+}
+
+#[allow(clippy::large_types_passed_by_value)]
+fn validate_recovery_manifest_progression(
+    manifests: [Option<ManifestRecord>; 2],
+    inventory: &RecoveryInventoryState,
+) -> Result<(), ManifestStoreError> {
+    for manifest in manifests.into_iter().flatten() {
+        if let Some(reference) = manifest.recovery {
+            let report = referenced_recovery(inventory, reference)?;
+            if report.committing_manifest_generation() > manifest.generation {
+                return Err(ManifestStoreError::InvalidManifest);
+            }
+        }
+    }
+    let mut retained = manifests.into_iter().flatten().collect::<Vec<_>>();
+    retained.sort_by_key(|manifest| manifest.generation);
+    let [older, newer] = retained.as_slice() else {
+        return Ok(());
+    };
+    if older.recovery == newer.recovery {
+        return Ok(());
+    }
+    let newer_reference = newer.recovery.ok_or(ManifestStoreError::InvalidManifest)?;
+    let newer_report = referenced_recovery(inventory, newer_reference)?;
+    let expected_generation = match older.recovery {
+        Some(reference) => referenced_recovery(inventory, reference)?
+            .report_generation()
+            .checked_add(1),
+        None => Some(1),
+    };
+    if expected_generation != Some(newer_report.report_generation())
+        || !manifest_authority_equal_for_recovery(*older, *newer)
+        || !report_matches_source(newer_report, *older, newer.generation)
+    {
+        return Err(ManifestStoreError::InvalidManifest);
+    }
+    Ok(())
+}
+
+#[allow(clippy::large_types_passed_by_value)]
+fn validate_no_pending_recovery(
+    manifests: [Option<ManifestRecord>; 2],
+    inventory: &RecoveryInventoryState,
+) -> Result<(), ManifestStoreError> {
+    if inventory.staging.is_some() {
+        return Err(ManifestStoreError::InvalidGeneration);
+    }
+    let referenced = manifests
+        .iter()
+        .flatten()
+        .filter_map(|manifest| manifest.recovery)
+        .collect::<Vec<_>>();
+    let latest = referenced
+        .iter()
+        .map(|reference| referenced_recovery(inventory, *reference))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(RecoveryReport::report_generation)
+        .max();
+    for artifact in inventory.slots.into_iter().flatten() {
+        if referenced.contains(&artifact.reference) {
+            continue;
+        }
+        if latest.is_none_or(|generation| artifact.report.report_generation() >= generation) {
+            return Err(ManifestStoreError::InvalidGeneration);
+        }
+    }
+    Ok(())
+}
+
+fn manifest_authority_equal_for_recovery(older: ManifestRecord, newer: ManifestRecord) -> bool {
+    older.generation.checked_add(1) == Some(newer.generation)
+        && older.registry == newer.registry
+        && older.cutoff == newer.cutoff
+        && older.retry == newer.retry
+        && older.sequence_floor == newer.sequence_floor
+        && older.catalog == newer.catalog
+}
+
+fn report_matches_source(
+    report: RecoveryReport,
+    source: ManifestRecord,
+    committing_generation: u64,
+) -> bool {
+    report.source_manifest_generation() == source.generation
+        && report.committing_manifest_generation() == committing_generation
+        && report.source_manifest_checksum() == manifest_checksum(source)
+        && report.cutoff() == source.cutoff
+        && report.active_sequence_floor() == source.sequence_floor
+}
+
+fn manifest_checksum(record: ManifestRecord) -> u32 {
+    let bytes = encode_manifest(record);
+    u32::from_be_bytes(bytes[156..160].try_into().unwrap_or_default())
 }
 
 fn read_referenced_registry(
@@ -2107,6 +2671,7 @@ fn validate_catalog_advancing_transition(
         || newer_manifest.cutoff.checkpoint_generation() != 1
         || newer_manifest.registry != older_manifest.registry
         || newer_manifest.retry != older_manifest.retry
+        || newer_manifest.recovery != older_manifest.recovery
     {
         return Err(ManifestStoreError::InvalidGeneration);
     }
@@ -2450,6 +3015,7 @@ fn rollback_uncommitted_rotation(
             || current.generation.checked_add(1) != Some(decoded.generation)
             || decoded.registry != current.registry
             || decoded.retry != current.retry
+            || decoded.recovery != current.recovery
             || decoded.sequence_floor != intent.sequence_cutoff
             || decoded.catalog != catalog_reference
         {
@@ -2691,6 +3257,13 @@ fn map_retry_codec(error: RetryStateCodecError) -> ManifestStoreError {
             ManifestStoreError::InvalidRetry
         }
         RetryStateCodecError::StoreMismatch => ManifestStoreError::StoreMismatch,
+    }
+}
+
+fn map_recovery_codec(error: RecoveryCodecError) -> ManifestStoreError {
+    match error {
+        RecoveryCodecError::Invalid => ManifestStoreError::InvalidManifest,
+        RecoveryCodecError::StoreMismatch => ManifestStoreError::StoreMismatch,
     }
 }
 
@@ -2939,6 +3512,174 @@ fn cleanup_committed_rotation(
 }
 
 #[allow(clippy::large_types_passed_by_value)]
+fn validate_recovery_report_coverage(
+    manifests: [Option<ManifestRecord>; 2],
+    inventory: &RecoveryInventoryState,
+    current: ManifestRecord,
+    catalog: &GenerationCatalogSnapshot,
+    journal: &ActiveJournal,
+) -> Result<(), ManifestStoreError> {
+    let mut validated = Vec::new();
+    for reference in manifests
+        .iter()
+        .flatten()
+        .filter_map(|manifest| manifest.recovery)
+    {
+        if validated.contains(&reference) {
+            continue;
+        }
+        let report = referenced_recovery(inventory, reference)?;
+        if report.committing_manifest_generation() > current.generation {
+            return Err(ManifestStoreError::InvalidManifest);
+        }
+        let covered = if report.active_generation() == current.cutoff.journal().generation() {
+            report.active_sequence_floor() == current.sequence_floor
+                && report.append_sequence() >= current.sequence_floor
+                && report.append_sequence() <= current.cutoff.append_sequence()
+                && report.committed_end_offset() <= current.cutoff.end_offset()
+                && ((report.append_sequence() == current.sequence_floor
+                    && report.committed_end_offset() == crate::JOURNAL_V1_HEADER_LEN as u64)
+                    || journal.recovered_records().iter().any(|record| {
+                        record.admission().append_sequence() == report.append_sequence()
+                            && record.end_offset() == report.committed_end_offset()
+                    }))
+        } else {
+            catalog.entries().iter().any(|entry| {
+                entry.journal_generation() == report.active_generation()
+                    && entry.sequence_floor() == report.active_sequence_floor()
+                    && ((report.append_sequence() == entry.sequence_floor()
+                        && report.committed_end_offset() == crate::JOURNAL_V1_HEADER_LEN as u64)
+                        || (report.append_sequence() > entry.sequence_floor()
+                            && report.append_sequence() <= entry.sequence_cutoff()
+                            && report.committed_end_offset() > crate::JOURNAL_V1_HEADER_LEN as u64
+                            && report.committed_end_offset() <= entry.end_offset()))
+            })
+        };
+        if !covered {
+            return Err(ManifestStoreError::InvalidManifest);
+        }
+        validated.push(reference);
+    }
+    Ok(())
+}
+
+fn converge_recovery_staging(
+    directory_path: &Path,
+    directory: &File,
+    artifact: RecoveryArtifact,
+    store_id: StoreId,
+) -> Result<(), ManifestStoreError> {
+    let staging = directory_path.join(RECOVERY_STAGING_FILE_NAME);
+    let bytes = read_required_bounded(&staging, RECOVERY_STATE_LEN)?;
+    if decode_recovery_state(&bytes, store_id).map_err(map_recovery_codec)? != artifact.report
+        || crc32c(&bytes) != artifact.reference.checksum
+    {
+        return Err(ManifestStoreError::InvalidManifest);
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&staging)
+        .map_err(|error| manifest_io(ManifestIoOperation::OpenArtifact, &error))?
+        .sync_all()
+        .map_err(|error| manifest_io(ManifestIoOperation::SyncArtifact, &error))?;
+    std::fs::rename(
+        staging,
+        directory_path.join(RECOVERY_SLOT_NAMES[usize::from(artifact.reference.slot)]),
+    )
+    .map_err(|error| manifest_io(ManifestIoOperation::Publish, &error))?;
+    directory
+        .sync_all()
+        .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))
+}
+
+fn converge_manifest_staging(
+    directory_path: &Path,
+    directory: &File,
+    target: usize,
+    expected: ManifestRecord,
+) -> Result<usize, ManifestStoreError> {
+    let staging = directory_path.join(MANIFEST_STAGING_FILE_NAME);
+    let bytes = read_required_bounded(&staging, MANIFEST_LEN)?;
+    if bytes != encode_manifest(expected) {
+        return Err(ManifestStoreError::InvalidManifest);
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&staging)
+        .map_err(|error| manifest_io(ManifestIoOperation::OpenArtifact, &error))?
+        .sync_all()
+        .map_err(|error| manifest_io(ManifestIoOperation::SyncArtifact, &error))?;
+    std::fs::rename(staging, directory_path.join(MANIFEST_SLOT_NAMES[target]))
+        .map_err(|error| manifest_io(ManifestIoOperation::Publish, &error))?;
+    directory
+        .sync_all()
+        .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))?;
+    Ok(target)
+}
+
+#[allow(clippy::large_types_passed_by_value)]
+fn remove_unreferenced_recovery_slots(
+    directory_path: &Path,
+    directory: &File,
+    manifests: [Option<ManifestRecord>; 2],
+    store_id: StoreId,
+) -> Result<(), ManifestStoreError> {
+    let referenced = manifests
+        .iter()
+        .flatten()
+        .filter_map(|manifest| manifest.recovery)
+        .collect::<Vec<_>>();
+    let latest_generation = referenced
+        .iter()
+        .map(|reference| {
+            let bytes = read_required_bounded(
+                &directory_path.join(RECOVERY_SLOT_NAMES[usize::from(reference.slot)]),
+                RECOVERY_STATE_LEN,
+            )?;
+            if crc32c(&bytes) != reference.checksum {
+                return Err(ManifestStoreError::InvalidManifest);
+            }
+            decode_recovery_state(&bytes, store_id)
+                .map_err(map_recovery_codec)
+                .map(RecoveryReport::report_generation)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max();
+    let mut removed = false;
+    for (slot, name) in RECOVERY_SLOT_NAMES.iter().enumerate() {
+        let slot = u8::try_from(slot).map_err(|_| ManifestStoreError::InvalidManifest)?;
+        if referenced.iter().any(|reference| reference.slot == slot) {
+            continue;
+        }
+        let Some(bytes) = read_optional_bounded(&directory_path.join(name), RECOVERY_STATE_LEN)?
+        else {
+            continue;
+        };
+        let report = decode_recovery_state(&bytes, store_id).map_err(map_recovery_codec)?;
+        if latest_generation.is_none_or(|latest| report.report_generation() >= latest) {
+            return Err(ManifestStoreError::InvalidManifest);
+        }
+        #[cfg(test)]
+        if take_publish_fault(53) {
+            let error = std::io::Error::other("injected recovery cleanup failure");
+            return Err(manifest_io(ManifestIoOperation::Publish, &error));
+        }
+        std::fs::remove_file(directory_path.join(name))
+            .map_err(|error| manifest_io(ManifestIoOperation::Publish, &error))?;
+        removed = true;
+    }
+    if removed {
+        directory
+            .sync_all()
+            .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::large_types_passed_by_value)]
 fn remove_unreferenced_catalog_slots(
     directory_path: &Path,
     directory: &File,
@@ -3063,6 +3804,11 @@ fn injected_publication_fault(
         (GENERATION_CATALOG_STAGING_FILE_NAME, PublicationPoint::Readback) => 32,
         (GENERATION_CATALOG_STAGING_FILE_NAME, PublicationPoint::Publish) => 33,
         (GENERATION_CATALOG_STAGING_FILE_NAME, PublicationPoint::SyncDirectory) => 34,
+        (RECOVERY_STAGING_FILE_NAME, PublicationPoint::Write) => 45,
+        (RECOVERY_STAGING_FILE_NAME, PublicationPoint::SyncArtifact) => 46,
+        (RECOVERY_STAGING_FILE_NAME, PublicationPoint::Readback) => 47,
+        (RECOVERY_STAGING_FILE_NAME, PublicationPoint::Publish) => 48,
+        (RECOVERY_STAGING_FILE_NAME, PublicationPoint::SyncDirectory) => 49,
         _ => 0,
     };
     if code == 0 {
@@ -3151,6 +3897,11 @@ fn encode_manifest(record: ManifestRecord) -> Vec<u8> {
     bytes[96..104].copy_from_slice(&record.retry.public.generation().to_be_bytes());
     bytes[104..112].copy_from_slice(&record.retry.length.to_be_bytes());
     bytes[112..116].copy_from_slice(&record.retry.checksum.to_be_bytes());
+    if let Some(recovery) = record.recovery {
+        bytes[116] = 1;
+        bytes[117] = recovery.slot;
+        bytes[120..124].copy_from_slice(&recovery.checksum.to_be_bytes());
+    }
     bytes[124..132].copy_from_slice(&record.sequence_floor.to_be_bytes());
     if let Some(catalog) = record.catalog {
         bytes[132] = catalog.slot();
@@ -3172,7 +3923,6 @@ fn decode_manifest(bytes: &[u8], store_id: StoreId) -> Result<ManifestRecord, Ma
             != u16::try_from(MANIFEST_LEN).unwrap_or_default()
         || bytes[69..72].iter().any(|byte| *byte != 0)
         || bytes[93..96].iter().any(|byte| *byte != 0)
-        || bytes[116..124].iter().any(|byte| *byte != 0)
         || bytes[133..136].iter().any(|byte| *byte != 0)
         || crc32c(&bytes[..156])
             != u32::from_be_bytes(bytes[156..160].try_into().unwrap_or_default())
@@ -3186,6 +3936,16 @@ fn decode_manifest(bytes: &[u8], store_id: StoreId) -> Result<ManifestRecord, Ma
         ),
         length: u64::from_be_bytes(bytes[104..112].try_into().unwrap_or_default()),
         checksum: u32::from_be_bytes(bytes[112..116].try_into().unwrap_or_default()),
+    };
+    let recovery = match bytes[116] {
+        0 if bytes[117..124].iter().all(|byte| *byte == 0) => None,
+        1 if bytes[117] < 3 && bytes[118..120].iter().all(|byte| *byte == 0) => {
+            Some(RecoveryReference {
+                slot: bytes[117],
+                checksum: u32::from_be_bytes(bytes[120..124].try_into().unwrap_or_default()),
+            })
+        }
+        _ => return Err(ManifestStoreError::InvalidManifest),
     };
     if retry.public.slot() >= 3
         || retry.public.generation() == 0
@@ -3261,6 +4021,7 @@ fn decode_manifest(bytes: &[u8], store_id: StoreId) -> Result<ManifestRecord, Ma
             end_offset,
         ),
         retry,
+        recovery,
         sequence_floor,
         catalog,
     })
@@ -3702,6 +4463,16 @@ mod tests {
             )])
             .expect("fixture durability");
         (commit, qualification)
+    }
+
+    fn append_raw_suffix(directory: &Path, generation: u64, bytes: &[u8]) {
+        let path = directory.join(active_journal_file_name(generation));
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open active suffix fixture");
+        file.write_all(bytes).expect("append active suffix fixture");
+        file.sync_all().expect("sync active suffix fixture");
     }
 
     fn directory_bytes(directory: &Path) -> Vec<(String, Vec<u8>)> {
@@ -4234,6 +5005,7 @@ mod tests {
                 length: 68,
                 checksum: 7,
             },
+            recovery: None,
             sequence_floor: 1,
             catalog: first.reference(),
         };
@@ -4755,7 +5527,8 @@ mod tests {
                     reopened,
                     Err(ManifestStoreError::InterruptedPublication
                         | ManifestStoreError::InvalidManifest
-                        | ManifestStoreError::InvalidRetry)
+                        | ManifestStoreError::InvalidRetry
+                        | ManifestStoreError::Active(ActiveJournalError::InvalidLayout))
                 ));
             }
             fs::remove_dir_all(directory).expect("remove retry fault directory");
@@ -4884,6 +5657,517 @@ mod tests {
     }
 
     #[test]
+    fn manifest_root_requires_existing_checkpoint_before_registry_validation() {
+        let directory = test_directory(67);
+        let store = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create committed manifest-root fixture");
+        let committed = store.inspection().committed();
+        assert_eq!(
+            fs::metadata(directory.join(ACTIVE_JOURNAL_FILE_NAME))
+                .expect("header-only journal metadata")
+                .len(),
+            crate::JOURNAL_V1_HEADER_LEN as u64
+        );
+        drop(store);
+
+        let checkpoint_path = directory.join(ACTIVE_CHECKPOINT_FILE_NAME);
+        let canonical_checkpoint =
+            fs::read(&checkpoint_path).expect("read committed checkpoint authority");
+        assert_eq!(canonical_checkpoint.len(), 128);
+        let zero_checkpoint = vec![0_u8; canonical_checkpoint.len()];
+        fs::write(&checkpoint_path, &zero_checkpoint).expect("install absent checkpoint slots");
+
+        let registry_path =
+            directory.join(REGISTRY_SLOT_NAMES[usize::from(committed.registry_slot())]);
+        let mut invalid_registry = fs::read(&registry_path).expect("read committed registry");
+        let registry_checksum_byte = invalid_registry
+            .last_mut()
+            .expect("registry snapshot includes checksum");
+        *registry_checksum_byte ^= 1;
+        fs::write(&registry_path, invalid_registry).expect("install invalid registry authority");
+
+        let before_checkpoint_refusal = directory_bytes(&directory);
+        let Err(error) = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        )) else {
+            panic!("manifest-root open must require checkpoint authority");
+        };
+        assert_eq!(
+            error,
+            ManifestStoreError::Active(ActiveJournalError::InvalidLayout)
+        );
+        assert_eq!(
+            fs::read(&checkpoint_path).expect("read refused zero checkpoint"),
+            zero_checkpoint
+        );
+        assert_eq!(directory_bytes(&directory), before_checkpoint_refusal);
+
+        fs::write(&checkpoint_path, canonical_checkpoint)
+            .expect("restore checkpoint to prove later registry refusal");
+        let before_registry_refusal = directory_bytes(&directory);
+        let Err(error) = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        )) else {
+            panic!("invalid registry authority must refuse");
+        };
+        assert_eq!(error, ManifestStoreError::InvalidRegistry);
+        assert_eq!(directory_bytes(&directory), before_registry_refusal);
+        fs::remove_dir_all(directory).expect("remove manifest-root checkpoint fixture");
+    }
+
+    #[test]
+    fn terminal_suffix_recovery_is_manifest_bound_durable_and_idempotent() {
+        let directory = test_directory(60);
+        let store = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create recovery fixture");
+        let source = store.inspection().committed();
+        let checkpoint =
+            fs::read(directory.join(ACTIVE_CHECKPOINT_FILE_NAME)).expect("read source checkpoint");
+        drop(store);
+        append_raw_suffix(&directory, 1, b"OCHF\0\x01\x01\0\0\0\0");
+        let original_length = fs::metadata(directory.join(ACTIVE_JOURNAL_FILE_NAME))
+            .expect("suffix metadata")
+            .len();
+
+        let recovered = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("recover terminal short prefix");
+        let inspection = recovered.inspection();
+        let report = inspection
+            .latest_recovery()
+            .expect("committed recovery report");
+        assert_eq!(
+            inspection.committed().manifest_generation(),
+            source.manifest_generation() + 1
+        );
+        assert_eq!(
+            inspection.committed().durable_cutoff(),
+            source.durable_cutoff()
+        );
+        assert_eq!(report.report_generation(), 1);
+        assert_eq!(
+            report.source_manifest_generation(),
+            source.manifest_generation()
+        );
+        assert_eq!(
+            report.committing_manifest_generation(),
+            inspection.committed().manifest_generation()
+        );
+        assert_eq!(report.active_generation(), 1);
+        assert_eq!(report.active_sequence_floor(), 0);
+        assert_eq!(report.checkpoint_generation(), 1);
+        assert_eq!(report.append_sequence(), 0);
+        assert_eq!(
+            report.committed_end_offset(),
+            crate::JOURNAL_V1_HEADER_LEN as u64
+        );
+        assert_eq!(report.original_journal_length(), original_length);
+        assert_eq!(report.removed_bytes(), 11);
+        assert_eq!(
+            report.classification(),
+            crate::RecoveryClassification::ShortFramePrefix
+        );
+        assert_eq!(
+            report.action(),
+            crate::RecoveryAction::TruncateToCommittedRoot
+        );
+        assert_eq!(
+            fs::metadata(directory.join(ACTIVE_JOURNAL_FILE_NAME))
+                .expect("recovered journal metadata")
+                .len(),
+            source.durable_cutoff().end_offset()
+        );
+        assert_eq!(
+            fs::read(directory.join(ACTIVE_CHECKPOINT_FILE_NAME))
+                .expect("read unchanged checkpoint"),
+            checkpoint
+        );
+        let committed = inspection.committed();
+        drop(recovered);
+
+        let reopened = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("clean reopen retains report without another recovery");
+        assert_eq!(reopened.inspection().committed(), committed);
+        assert_eq!(reopened.inspection().latest_recovery(), Some(report));
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("remove recovery fixture");
+    }
+
+    #[test]
+    fn each_closed_terminal_suffix_subtype_recovers_without_adopting_bytes() {
+        for (name, expected) in [
+            (
+                "invalid-prefix",
+                crate::RecoveryClassification::InvalidFramePrefix,
+            ),
+            (
+                "truncated-frame",
+                crate::RecoveryClassification::TruncatedDeclaredFrame,
+            ),
+            (
+                "invalid-frame",
+                crate::RecoveryClassification::InvalidCompleteFrame,
+            ),
+        ] {
+            let directory = test_directory(63);
+            let store = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::CreateNew,
+            ))
+            .expect("create subtype fixture");
+            drop(store);
+            let frame = PreparedAdmissionV1::new(test_support::no_change_admission())
+                .expect("subtype admission")
+                .into_frame(crate::AppendSequenceV1::new(1).expect("subtype sequence"))
+                .expect("subtype frame");
+            let bytes = match name {
+                "invalid-prefix" => {
+                    let mut bytes = vec![0_u8; crate::JOURNAL_V1_FRAME_PREFIX_LEN];
+                    bytes[8..16].copy_from_slice(&1_u64.to_be_bytes());
+                    bytes
+                }
+                "truncated-frame" => frame.bytes()[..25].to_vec(),
+                "invalid-frame" => {
+                    let mut bytes = frame.bytes().to_vec();
+                    let last = bytes.len() - 1;
+                    bytes[last] ^= 1;
+                    bytes
+                }
+                _ => unreachable!("closed subtype fixture"),
+            };
+            append_raw_suffix(&directory, 1, &bytes);
+            let recovered = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::OpenExisting,
+            ))
+            .expect("closed terminal subtype recovers");
+            assert_eq!(
+                recovered
+                    .inspection()
+                    .latest_recovery()
+                    .expect("subtype report")
+                    .classification(),
+                expected
+            );
+            assert!(recovered.recovered_records().is_empty());
+            drop(recovered);
+            fs::remove_dir_all(directory).expect("remove subtype fixture");
+        }
+    }
+
+    #[test]
+    fn consecutive_recoveries_advance_reports_and_ordinary_commit_cleans_only_older_slot() {
+        let directory = test_directory(64);
+        let store = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create repeated recovery fixture");
+        drop(store);
+        append_raw_suffix(&directory, 1, b"OCHF\0");
+        let first = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("first recovery");
+        let first_report = first.inspection().latest_recovery().expect("first report");
+        drop(first);
+
+        append_raw_suffix(&directory, 1, b"OCHF\0\x01");
+        let mut second = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("second recovery");
+        let second_report = second
+            .inspection()
+            .latest_recovery()
+            .expect("second report");
+        assert_eq!(second_report.report_generation(), 2);
+        assert_eq!(
+            second_report.source_manifest_generation(),
+            first_report.committing_manifest_generation()
+        );
+        assert_eq!(
+            RECOVERY_SLOT_NAMES
+                .iter()
+                .filter(|name| directory.join(name).exists())
+                .count(),
+            2,
+            "both retained manifests protect their exact report slots"
+        );
+        set_publish_fault(53);
+        let admission = test_support::no_change_admission();
+        let declaration = admission.declaration();
+        assert!(
+            second
+                .register(
+                    declaration.series_id(),
+                    declaration.binding().clone(),
+                    declaration.payload().clone(),
+                    declaration.evidence().clone(),
+                )
+                .is_err(),
+            "postcommit cleanup fault reports no registry success"
+        );
+        drop(second);
+        let reopened = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("reopen after bounded report cleanup");
+        assert_eq!(reopened.inspection().latest_recovery(), Some(second_report));
+        assert_eq!(
+            RECOVERY_SLOT_NAMES
+                .iter()
+                .filter(|name| directory.join(name).exists())
+                .count(),
+            1,
+            "reopen removes only the strictly older unreferenced report"
+        );
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("remove repeated recovery fixture");
+    }
+
+    #[test]
+    fn rotated_recovery_preserves_retry_registry_catalog_and_report_history() {
+        let directory = test_directory(61);
+        let mut store = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create rotated recovery fixture");
+        register_rotation_fixture(&mut store);
+        append_durable(&mut store, "recovery-rotation-one");
+        let rotated = store.rotate().expect("rotate recovery fixture");
+        let registry = store.registry_snapshot();
+        let retry = store.retry_state_snapshot();
+        let catalog = rotated.generation_catalog();
+        drop(store);
+        append_raw_suffix(&directory, 2, b"OCHF\0\x01\x01");
+
+        let mut recovered = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("recover rotated active suffix");
+        let report = recovered
+            .inspection()
+            .latest_recovery()
+            .expect("rotated report");
+        assert_eq!(report.active_generation(), 2);
+        assert_eq!(report.active_sequence_floor(), 1);
+        assert_eq!(report.append_sequence(), 1);
+        assert_eq!(
+            report.committed_end_offset(),
+            crate::JOURNAL_V1_HEADER_LEN as u64
+        );
+        assert_eq!(recovered.registry_snapshot(), registry);
+        assert_eq!(recovered.retry_state_snapshot(), retry);
+        assert_eq!(
+            recovered.inspection().committed().generation_catalog(),
+            catalog
+        );
+
+        let (_, qualification) = append_durable(&mut recovered, "recovery-rotation-two");
+        assert_eq!(recovered.inspection().latest_recovery(), Some(report));
+        recovered
+            .rotate()
+            .expect("rotate recovered active generation");
+        assert_eq!(recovered.inspection().latest_recovery(), Some(report));
+        let expected_retry = recovered.retry_state_snapshot();
+        drop(recovered);
+
+        let reopened = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("historical report is covered by catalog");
+        assert_eq!(reopened.inspection().latest_recovery(), Some(report));
+        assert_eq!(reopened.retry_state_snapshot(), expected_retry);
+        assert!(matches!(
+            reopened.retry_state_snapshot().classify(&qualification),
+            crate::RetryStateMatch::Replay(_)
+        ));
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("remove rotated recovery fixture");
+    }
+
+    #[test]
+    fn valid_or_ambiguous_post_root_bytes_refuse_without_mutation() {
+        for shape in [
+            "valid",
+            "valid-torn",
+            "malformed-later",
+            "sequence",
+            "prefix-corruption",
+        ] {
+            let directory = test_directory(62);
+            let mut store = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::CreateNew,
+            ))
+            .expect("create suffix refusal fixture");
+            register_rotation_fixture(&mut store);
+            append_durable(&mut store, "suffix-root");
+            let admission = test_support::no_change_admission_with_retry_key("suffix-candidate");
+            let sequence = if shape == "sequence" { 3 } else { 2 };
+            let frame = PreparedAdmissionV1::new(admission)
+                .expect("suffix admission")
+                .into_frame(crate::AppendSequenceV1::new(sequence).expect("suffix sequence"))
+                .expect("suffix frame");
+            drop(store);
+            match shape {
+                "valid" | "sequence" => append_raw_suffix(&directory, 1, frame.bytes()),
+                "valid-torn" => {
+                    let mut bytes = frame.bytes().to_vec();
+                    bytes.extend_from_slice(&[0xa5; 7]);
+                    append_raw_suffix(&directory, 1, &bytes);
+                }
+                "malformed-later" => {
+                    let mut bytes = [0_u8; crate::JOURNAL_V1_FRAME_PREFIX_LEN].to_vec();
+                    bytes[8..16].copy_from_slice(&2_u64.to_be_bytes());
+                    bytes.extend_from_slice(frame.bytes());
+                    append_raw_suffix(&directory, 1, &bytes);
+                }
+                "prefix-corruption" => append_raw_suffix(&directory, 1, &[0xa5; 11]),
+                _ => unreachable!("closed suffix shape"),
+            }
+            let before = directory_bytes(&directory);
+            assert!(
+                ManifestStore::open(test_config(
+                    directory.clone(),
+                    ActiveJournalOpenMode::OpenExisting,
+                ))
+                .is_err()
+            );
+            assert_eq!(directory_bytes(&directory), before, "shape {shape}");
+            fs::remove_dir_all(directory).expect("remove suffix refusal fixture");
+        }
+    }
+
+    #[test]
+    fn possible_newer_manifest_damage_never_falls_back_and_malformed_recovery_staging_refuses() {
+        let newer = test_directory(65);
+        let mut store =
+            ManifestStore::open(test_config(newer.clone(), ActiveJournalOpenMode::CreateNew))
+                .expect("create newer-manifest fixture");
+        register_rotation_fixture(&mut store);
+        assert_eq!(store.inspection().committed().manifest_generation(), 2);
+        drop(store);
+        let path = newer.join(MANIFEST_SLOT_1_FILE_NAME);
+        let mut bytes = fs::read(&path).expect("read newest manifest");
+        bytes[MANIFEST_LEN - 4] ^= 1;
+        fs::write(path, bytes).expect("damage newest manifest evidence");
+        let before = directory_bytes(&newer);
+        assert!(
+            ManifestStore::open(test_config(
+                newer.clone(),
+                ActiveJournalOpenMode::OpenExisting,
+            ))
+            .is_err(),
+            "an older parseable root cannot replace possible newer evidence"
+        );
+        assert_eq!(directory_bytes(&newer), before);
+        fs::remove_dir_all(newer).expect("remove newer-manifest fixture");
+
+        let staging = test_directory(66);
+        let store = ManifestStore::open(test_config(
+            staging.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create recovery-staging fixture");
+        drop(store);
+        fs::write(staging.join(RECOVERY_STAGING_FILE_NAME), [0_u8; 17])
+            .expect("write partial recovery staging");
+        let before = directory_bytes(&staging);
+        assert!(matches!(
+            ManifestStore::open(test_config(
+                staging.clone(),
+                ActiveJournalOpenMode::OpenExisting,
+            )),
+            Err(ManifestStoreError::InterruptedPublication)
+        ));
+        assert_eq!(directory_bytes(&staging), before);
+        fs::remove_dir_all(staging).expect("remove recovery-staging fixture");
+    }
+
+    #[test]
+    fn sanitized_open_classification_preserves_exact_error_authority() {
+        let exact = ManifestStoreError::InvalidManifest;
+        assert_eq!(
+            exact.open_classification(),
+            ManifestOpenClassification::CorruptAuthority
+        );
+        assert_eq!(exact, ManifestStoreError::InvalidManifest);
+        assert_eq!(
+            ManifestStoreError::InterruptedPublication.open_classification(),
+            ManifestOpenClassification::InterruptedPublication
+        );
+        assert_eq!(
+            ManifestStoreError::UnsupportedStoreFormat.open_classification(),
+            ManifestOpenClassification::UnsupportedFormat
+        );
+    }
+
+    #[test]
+    fn recovery_publication_and_truncate_faults_converge_or_refuse_typed() {
+        for code in [45_u8, 46, 47, 48, 49, 50, 51, 52, 5, 6, 10, 7, 8] {
+            let directory = test_directory(code);
+            let store = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::CreateNew,
+            ))
+            .expect("create recovery fault fixture");
+            drop(store);
+            append_raw_suffix(&directory, 1, b"OCHF\0\x01\x01\0\0");
+            if (50..=52).contains(&code) {
+                crate::active::set_recovery_fault(code);
+            } else {
+                set_publish_fault(code);
+            }
+            assert!(
+                ManifestStore::open(test_config(
+                    directory.clone(),
+                    ActiveJournalOpenMode::OpenExisting,
+                ))
+                .is_err()
+            );
+            let after_fault = directory_bytes(&directory);
+            let reopened = ManifestStore::open(test_config(
+                directory.clone(),
+                ActiveJournalOpenMode::OpenExisting,
+            ));
+            if matches!(code, 45 | 5) {
+                assert!(matches!(
+                    reopened,
+                    Err(ManifestStoreError::InterruptedPublication)
+                ));
+                assert_eq!(directory_bytes(&directory), after_fault);
+            } else {
+                let reopened = reopened.expect("complete recovery evidence converges");
+                assert_eq!(reopened.inspection().committed().manifest_generation(), 2);
+                assert!(reopened.inspection().latest_recovery().is_some());
+                drop(reopened);
+            }
+            fs::remove_dir_all(directory).expect("remove recovery fault fixture");
+        }
+    }
+
+    #[test]
     fn current_manifest_v1_is_exactly_160_bytes_and_refuses_hostile_fields() {
         let store_id = test_support::store_id(1);
         let record = ManifestRecord {
@@ -4906,6 +6190,7 @@ mod tests {
                 length: 200,
                 checksum: 9,
             },
+            recovery: None,
             sequence_floor: 1,
             catalog: Some(GenerationCatalogReference::new(0, 1, 132, 11)),
         };
@@ -4923,7 +6208,7 @@ mod tests {
             (36, 8, 0),
             (52, 8, 0),
             (60, 8, 29),
-            (116, 1, 1),
+            (116, 1, 2),
             (124, 8, 0),
             (132, 1, 3),
             (133, 1, 1),

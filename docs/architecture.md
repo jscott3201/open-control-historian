@@ -13,8 +13,9 @@ vertical, M02-PR02a roots its range, mechanical cutoff, and complete canonical
 registry history in one bounded manifest, M02-PR02b roots a bounded durable
 retry replay/guard projection, and M02-PR02c adds one bounded store-owned
 rotation/seal transition. The durable-format reset now places one current V1
-contract for each artifact family behind a fixed Store Format V1 marker. Manifest
-V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
+contract for each artifact family behind a fixed Store Format V1 marker.
+M02-PR03a adds a manifest-rooted transaction that reports and removes only one
+proven terminal invalid/torn active suffix. Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
 ```text
@@ -26,6 +27,7 @@ default workspace selection
   16 slots + byte bounds       Journal V1 + checkpoints     |
   one control gate             manifest + registry/retry    |
   safe-boundary rotation       catalog + raw seals          |
+  recovery inspection         terminal-suffix recovery     |
        |                                                    |
        v                                      future adapters (not created yet)
   tokio rt + sync only
@@ -106,7 +108,8 @@ fixed 32-byte Store Format V1 marker, never-renamed stable store lock, one retai
 read/write lock for the current generation, the generation-one active pair or one
 deterministic successor pair, two reusable 160-byte Manifest V1 slots, three
 reusable complete registry and retry slots, three Generation Catalog V1 slots,
-one fixed rotation intent, fixed staging names, and at most 64 immutable
+three fixed 128-byte Recovery State V1 slots, one fixed rotation intent, fixed
+staging names, and at most 64 immutable
 raw-Journal sealed artifacts. Every active and sealed journal uses the exact
 28-byte Journal Header V1 and every admission frame remains Journal V1.
 Create-new publishes the marker, active genesis, an empty registry snapshot, a
@@ -150,12 +153,20 @@ catalog roots must preserve the exact older prefix and append one entry. Active
 pairs and sealed finals must equal the selected root apart from narrowly
 verified intent redundancy. A strict catalog prefix left by interruption after
 ordinary manifest adoption is verified and removed; forked or unrelated
-catalogs refuse. `och-store` still owns no final native segment
-encoding, broad recovery, reclamation, latest projection, or query behavior.
+catalogs refuse. After every other authority family is proven under both retained
+locks, a root-aware dry scan may classify only a terminal short prefix, malformed
+exact prefix, truncated declared frame, or invalid complete frame ending exactly
+at EOF. Recovery publishes its report, truncates and synchronizes exactly to the
+unchanged manifest/checkpoint cutoff, then commits an otherwise byte-identical
+next manifest. A valid post-root frame, valid-plus-torn bytes, later candidate
+bytes, identity/sequence mismatch, interior corruption, or ambiguity refuses
+unchanged. `och-store` still owns no final native segment encoding, broad repair,
+reclamation, latest projection, stale-restore custody, disk-pressure mode, or query behavior.
 Exact contracts are in [Store Format V1](store-format-v1.md),
 [Manifest V1](manifest-v1-format.md), [Retry State V1](retry-state-v1-format.md),
-[Generation Catalog V1](generation-catalog-v1-format.md), and
-[sealed raw Journal V1](sealed-journal-v1-format.md).
+[Generation Catalog V1](generation-catalog-v1-format.md),
+[sealed raw Journal V1](sealed-journal-v1-format.md), and
+[Recovery State V1](recovery-state-v1-format.md).
 
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`
@@ -289,7 +300,8 @@ and is never recomputed from admission or envelope content.
 There is currently no async/blocking admission wait, eviction, subscription/wait
 API, mutable read guard, final native segment format, sealed-history read/query
 API, retention/reclamation, unbounded/time-based retry, manifest-backed latest
-reconstruction, broad recovery event model, query
+reconstruction, broad repair or stale-restore event model, disk-pressure/degraded
+mode, query
 engine, network service, SQL layer, cloud/object provider, embedded database,
 memory mapping, Studio/Engine link, adapter, or donor-code compatibility layer.
 
@@ -314,3 +326,7 @@ The manifest-rooted durable retry horizon and its exact compatibility boundary
 are recorded by [M02-PR02b](continuation-m02-pr02b.md).
 The bounded raw-Journal rotation/seal transition and its exact successor boundary
 are recorded by [M02-PR02c](continuation-m02-pr02c.md).
+The current-only artifact epoch is recorded by the
+[durable-format reset](continuation-m02-v1-durable-format-reset.md). The
+manifest-rooted terminal-suffix transaction and deferred successor boundary are
+recorded by [M02-PR03a](continuation-m02-pr03a.md).

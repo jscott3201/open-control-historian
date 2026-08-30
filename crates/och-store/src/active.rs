@@ -4,6 +4,7 @@ use crate::codec::{crc32c, frame_len_from_prefix_v1};
 use crate::{
     AppendSequenceV1, DecodeLimitsV1, DecodedAdmissionV1, JOURNAL_V1_FRAME_PREFIX_LEN,
     JOURNAL_V1_HEADER_LEN, JournalHeaderV1, JournalV1Error, PreparedFrameV1,
+    RecoveryClassification,
 };
 use och_core::{RetryQualification, StoreId};
 use std::error::Error;
@@ -46,6 +47,28 @@ const CHECKPOINT_VERSION: u16 = 1;
 const CHECKPOINT_SLOT_LEN: usize = 64;
 const CHECKPOINT_SLOT_LEN_U16: u16 = 64;
 const CHECKPOINT_FILE_LEN: usize = CHECKPOINT_SLOT_LEN * 2;
+
+#[cfg(test)]
+std::thread_local! {
+    static RECOVERY_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_recovery_fault(code: u8) {
+    RECOVERY_FAULT.with(|fault| fault.set(code));
+}
+
+#[cfg(test)]
+fn take_recovery_fault(code: u8) -> bool {
+    RECOVERY_FAULT.with(|fault| {
+        if fault.get() == code {
+            fault.set(0);
+            true
+        } else {
+            false
+        }
+    })
+}
 
 /// Whether open creates the fixed active artifacts or requires them to exist.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -479,6 +502,43 @@ pub struct ActiveJournal {
     faults: Faults,
 }
 
+pub(crate) struct ActiveRecoveryPlan {
+    identity: JournalIdentity,
+    cutoff: DurableCutoff,
+    original_length: u64,
+    classification: RecoveryClassification,
+}
+
+pub(crate) enum ManifestRootOpenError {
+    RootMismatch,
+    Active(ActiveJournalError),
+}
+
+impl ManifestRootOpenError {
+    fn into_active(self) -> ActiveJournalError {
+        match self {
+            Self::RootMismatch => ActiveJournalError::InvalidLayout,
+            Self::Active(error) => error,
+        }
+    }
+}
+
+impl From<ActiveJournalError> for ManifestRootOpenError {
+    fn from(error: ActiveJournalError) -> Self {
+        Self::Active(error)
+    }
+}
+
+impl ActiveRecoveryPlan {
+    pub(crate) const fn original_length(&self) -> u64 {
+        self.original_length
+    }
+
+    pub(crate) const fn classification(&self) -> RecoveryClassification {
+        self.classification
+    }
+}
+
 impl ActiveJournal {
     /// Creates or opens the active artifacts on the calling blocking thread.
     ///
@@ -524,8 +584,49 @@ impl ActiveJournal {
                 sequence_floor,
                 limits,
                 recovery_policy,
-            ),
+                None,
+            )
+            .map(|(journal, _)| journal)
+            .map_err(ManifestRootOpenError::into_active),
         }
+    }
+
+    pub(crate) fn open_manifest_root(
+        config: ActiveJournalConfig,
+        root: DurableCutoff,
+    ) -> Result<(Self, Option<ActiveRecoveryPlan>), ManifestRootOpenError> {
+        let ActiveJournalConfig {
+            directory: directory_path,
+            store_id,
+            mode,
+            limits,
+            recovery_policy,
+            generation,
+            sequence_floor,
+        } = config;
+        if mode != ActiveJournalOpenMode::OpenExisting
+            || recovery_policy != RecoveryPolicy::Strict
+            || root.journal().store_id != store_id
+            || root.journal().generation != generation
+        {
+            return Err(ActiveJournalError::InvalidOptions.into());
+        }
+        let directory = open_directory(&directory_path)?;
+        let journal_path = directory_path.join(active_journal_file_name(generation));
+        let checkpoint_path = directory_path.join(active_checkpoint_file_name(generation));
+        Self::open_existing(
+            &directory,
+            &journal_path,
+            &checkpoint_path,
+            JournalIdentity {
+                store_id,
+                generation,
+            },
+            sequence_floor,
+            limits,
+            recovery_policy,
+            Some(root),
+        )
     }
 
     fn create_new(
@@ -573,7 +674,8 @@ impl ActiveJournal {
         sequence_floor: u64,
         limits: ActiveJournalLimits,
         recovery_policy: RecoveryPolicy,
-    ) -> Result<Self, ActiveJournalError> {
+        expected_root: Option<DurableCutoff>,
+    ) -> Result<(Self, Option<ActiveRecoveryPlan>), ManifestRootOpenError> {
         let mut journal = open_artifact(journal_path)?;
         lock_journal(&journal)?;
         let journal_len = journal
@@ -581,20 +683,22 @@ impl ActiveJournal {
             .map_err(|error| io_error(StoreIoOperation::Metadata, error))?
             .len();
         if journal_len < JOURNAL_V1_HEADER_LEN as u64 || journal_len > limits.active_bytes {
-            return Err(ActiveJournalError::InvalidLayout);
+            return Err(ActiveJournalError::InvalidLayout.into());
         }
         if recovery_policy == RecoveryPolicy::ManifestGenesis
             && journal_len != JOURNAL_V1_HEADER_LEN as u64
         {
-            return Err(ActiveJournalError::InvalidLayout);
+            return Err(ActiveJournalError::InvalidLayout.into());
         }
         let mut header_bytes = [0_u8; JOURNAL_V1_HEADER_LEN];
         journal
             .read_exact(&mut header_bytes)
             .map_err(|error| io_error(StoreIoOperation::Read, error))?;
-        let header_store_id = JournalHeaderV1::decode(&header_bytes)?.store_id();
+        let header_store_id = JournalHeaderV1::decode(&header_bytes)
+            .map_err(ActiveJournalError::from)?
+            .store_id();
         if header_store_id != identity.store_id {
-            return Err(ActiveJournalError::StoreMismatch);
+            return Err(ActiveJournalError::StoreMismatch.into());
         }
         let (checkpoint, mut initialized_state) = match open_artifact(checkpoint_path) {
             Ok(checkpoint) => (checkpoint, None),
@@ -607,7 +711,7 @@ impl ActiveJournal {
                     initialize_checkpoint(&checkpoint, directory, identity, sequence_floor)?;
                 (checkpoint, Some(state))
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         let checkpoint_len = checkpoint
             .metadata()
@@ -626,7 +730,7 @@ impl ActiveJournal {
                 )?);
             }
         } else if checkpoint_len != CHECKPOINT_FILE_LEN as u64 {
-            return Err(ActiveJournalError::InvalidLayout);
+            return Err(ActiveJournalError::InvalidLayout.into());
         }
         let checkpoint_state = match initialized_state {
             Some(state) => Some(state),
@@ -635,29 +739,49 @@ impl ActiveJournal {
         if recovery_policy == RecoveryPolicy::ManifestGenesis
             && checkpoint_state != Some(genesis_checkpoint_state(sequence_floor))
         {
-            return Err(ActiveJournalError::InvalidLayout);
+            return Err(ActiveJournalError::InvalidLayout.into());
         }
-        if checkpoint_state.is_none() && journal_len != JOURNAL_V1_HEADER_LEN as u64 {
-            return Err(ActiveJournalError::InvalidLayout);
+        if checkpoint_state.is_none()
+            && (expected_root.is_some() || journal_len != JOURNAL_V1_HEADER_LEN as u64)
+        {
+            return Err(ActiveJournalError::InvalidLayout.into());
         }
         let mut checkpoint_state = match checkpoint_state {
             Some(state) => state,
             None => initialize_checkpoint(&checkpoint, directory, identity, sequence_floor)?,
         };
-        let scan = scan_journal(
-            &mut journal,
-            identity,
-            limits,
-            checkpoint_state,
-            sequence_floor,
-            journal_len,
-        )?;
+        if expected_root
+            .is_some_and(|root| root != durable_cutoff_from_state(identity, checkpoint_state))
+        {
+            return Err(ManifestRootOpenError::RootMismatch);
+        }
+        let scan = match expected_root {
+            Some(root) => scan_manifest_root(
+                &mut journal,
+                identity,
+                limits,
+                checkpoint_state,
+                sequence_floor,
+                journal_len,
+                root,
+            )?,
+            None => scan_journal(
+                &mut journal,
+                identity,
+                limits,
+                checkpoint_state,
+                sequence_floor,
+                journal_len,
+            )?,
+        };
         if recovery_policy == RecoveryPolicy::Strict
             && (scan.truncate_to.is_some() || scan.valid_end != checkpoint_state.end_offset)
         {
-            return Err(ActiveJournalError::InvalidLayout);
+            return Err(ActiveJournalError::InvalidLayout.into());
         }
-        if let Some(truncate_to) = scan.truncate_to {
+        if expected_root.is_none()
+            && let Some(truncate_to) = scan.truncate_to
+        {
             journal
                 .set_len(truncate_to)
                 .map_err(|error| io_error(StoreIoOperation::Truncate, error))?;
@@ -670,7 +794,10 @@ impl ActiveJournal {
             .records
             .last()
             .map_or(sequence_floor, |record| record.admission.append_sequence());
-        if active_bytes > checkpoint_state.end_offset {
+        if expected_root.is_some() {
+            // Root-aware open is deliberately read-only until the manifest
+            // transaction validates every other authority family.
+        } else if active_bytes > checkpoint_state.end_offset {
             journal
                 .sync_all()
                 .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))?;
@@ -695,19 +822,23 @@ impl ActiveJournal {
                 .sync_all()
                 .map_err(|error| io_error(StoreIoOperation::SyncCheckpoint, error))?;
         }
-        Ok(Self {
-            journal,
-            checkpoint,
-            identity,
-            limits,
-            checkpoint_state,
-            active_bytes,
-            records: scan.records,
-            sync_count: 0,
-            faulted: false,
-            #[cfg(test)]
-            faults: Faults::default(),
-        })
+        let recovery_plan = scan.recovery_plan;
+        Ok((
+            Self {
+                journal,
+                checkpoint,
+                identity,
+                limits,
+                checkpoint_state,
+                active_bytes,
+                records: scan.records,
+                sync_count: 0,
+                faulted: false,
+                #[cfg(test)]
+                faults: Faults::default(),
+            },
+            recovery_plan,
+        ))
     }
 
     /// Returns current sanitized active-journal inspection.
@@ -736,6 +867,67 @@ impl ActiveJournal {
 
     pub(crate) const fn limits(&self) -> ActiveJournalLimits {
         self.limits
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn apply_recovery(
+        &mut self,
+        plan: ActiveRecoveryPlan,
+    ) -> Result<(), ActiveJournalError> {
+        self.ensure_usable()?;
+        let actual_length = self
+            .journal
+            .metadata()
+            .map_err(|error| io_error(StoreIoOperation::Metadata, error))?
+            .len();
+        if plan.identity != self.identity
+            || plan.cutoff != self.durable_cutoff()
+            || plan.original_length != actual_length
+            || self.active_bytes != plan.cutoff.end_offset()
+            || plan.original_length <= self.active_bytes
+        {
+            return Err(ActiveJournalError::InvalidLayout);
+        }
+        #[cfg(test)]
+        if take_recovery_fault(50) {
+            return Err(injected_io(StoreIoOperation::Truncate));
+        }
+        self.journal
+            .set_len(self.active_bytes)
+            .map_err(|error| io_error(StoreIoOperation::Truncate, error))?;
+        #[cfg(test)]
+        if take_recovery_fault(51) {
+            return Err(injected_io(StoreIoOperation::SyncJournal));
+        }
+        self.journal
+            .sync_all()
+            .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))?;
+        #[cfg(test)]
+        if take_recovery_fault(52) {
+            return Err(injected_io(StoreIoOperation::SyncJournal));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn synchronize_recovery_cutoff(
+        &self,
+        cutoff: DurableCutoff,
+    ) -> Result<(), ActiveJournalError> {
+        self.ensure_usable()?;
+        let actual_length = self
+            .journal
+            .metadata()
+            .map_err(|error| io_error(StoreIoOperation::Metadata, error))?
+            .len();
+        if cutoff != self.durable_cutoff()
+            || self.active_bytes != cutoff.end_offset()
+            || actual_length != cutoff.end_offset()
+        {
+            return Err(ActiveJournalError::InvalidLayout);
+        }
+        self.journal
+            .sync_all()
+            .map_err(|error| io_error(StoreIoOperation::SyncJournal, error))
     }
 
     /// Returns the next exact writer-owned append sequence.
@@ -935,6 +1127,7 @@ struct ScanResult {
     records: Vec<RecoveredAdmissionV1>,
     valid_end: u64,
     truncate_to: Option<u64>,
+    recovery_plan: Option<ActiveRecoveryPlan>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1057,7 +1250,206 @@ fn scan_journal(
         records,
         valid_end: offset,
         truncate_to,
+        recovery_plan: None,
     })
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn scan_manifest_root(
+    journal: &mut File,
+    identity: JournalIdentity,
+    limits: ActiveJournalLimits,
+    checkpoint: CheckpointState,
+    sequence_floor: u64,
+    journal_len: u64,
+    root: DurableCutoff,
+) -> Result<ScanResult, ActiveJournalError> {
+    let mut records = Vec::new();
+    let mut offset = JOURNAL_V1_HEADER_LEN as u64;
+    let mut previous = if sequence_floor == 0 {
+        None
+    } else {
+        Some(AppendSequenceV1::new(sequence_floor).map_err(ActiveJournalError::Journal)?)
+    };
+    while offset < root.end_offset() {
+        if records.len() >= limits.record_limit
+            || root.end_offset() - offset < JOURNAL_V1_FRAME_PREFIX_LEN as u64
+        {
+            return Err(ActiveJournalError::InvalidLayout);
+        }
+        journal
+            .seek(SeekFrom::Start(offset))
+            .map_err(|error| io_error(StoreIoOperation::Seek, error))?;
+        let mut prefix = [0_u8; JOURNAL_V1_FRAME_PREFIX_LEN];
+        journal
+            .read_exact(&mut prefix)
+            .map_err(|error| io_error(StoreIoOperation::Read, error))?;
+        let frame_len = frame_len_from_prefix_v1(
+            &prefix,
+            DecodeLimitsV1::new(limits.payload_limit).map_err(ActiveJournalError::Journal)?,
+        )
+        .map_err(|_| ActiveJournalError::InvalidLayout)?;
+        let end = offset
+            .checked_add(u64::try_from(frame_len).map_err(|_| ActiveJournalError::InvalidLayout)?)
+            .ok_or(ActiveJournalError::InvalidLayout)?;
+        if end > root.end_offset() {
+            return Err(ActiveJournalError::InvalidLayout);
+        }
+        let mut frame = vec![0_u8; frame_len];
+        frame[..JOURNAL_V1_FRAME_PREFIX_LEN].copy_from_slice(&prefix);
+        journal
+            .read_exact(&mut frame[JOURNAL_V1_FRAME_PREFIX_LEN..])
+            .map_err(|error| io_error(StoreIoOperation::Read, error))?;
+        let decoded = crate::decode_admission_frame_v1(
+            &frame,
+            DecodeLimitsV1::new(limits.payload_limit).map_err(ActiveJournalError::Journal)?,
+            previous,
+        )
+        .map_err(|_| ActiveJournalError::InvalidLayout)?;
+        if decoded.store_id() != identity.store_id
+            || decoded.declaration().store_id() != identity.store_id
+        {
+            return Err(ActiveJournalError::StoreMismatch);
+        }
+        previous = Some(
+            AppendSequenceV1::new(decoded.append_sequence())
+                .map_err(ActiveJournalError::Journal)?,
+        );
+        records.push(RecoveredAdmissionV1 {
+            end_offset: end,
+            admission: decoded,
+        });
+        offset = end;
+    }
+    let prefix_sequence = records
+        .last()
+        .map_or(sequence_floor, |record| record.admission.append_sequence());
+    if offset != root.end_offset()
+        || checkpoint.append_sequence != prefix_sequence
+        || root.append_sequence() != prefix_sequence
+        || root.checkpoint_generation() != checkpoint.slot_generation
+        || journal_len < root.end_offset()
+    {
+        return Err(ActiveJournalError::InvalidLayout);
+    }
+    if journal_len == root.end_offset() {
+        return Ok(ScanResult {
+            records,
+            valid_end: offset,
+            truncate_to: None,
+            recovery_plan: None,
+        });
+    }
+
+    let suffix_length = journal_len - root.end_offset();
+    let expected_sequence = prefix_sequence
+        .checked_add(1)
+        .ok_or(ActiveJournalError::InvalidLayout)?;
+    let classification = if suffix_length < JOURNAL_V1_FRAME_PREFIX_LEN as u64 {
+        journal
+            .seek(SeekFrom::Start(root.end_offset()))
+            .map_err(|error| io_error(StoreIoOperation::Seek, error))?;
+        let suffix_len =
+            usize::try_from(suffix_length).map_err(|_| ActiveJournalError::InvalidLayout)?;
+        let mut suffix = [0_u8; JOURNAL_V1_FRAME_PREFIX_LEN - 1];
+        journal
+            .read_exact(&mut suffix[..suffix_len])
+            .map_err(|error| io_error(StoreIoOperation::Read, error))?;
+        let mut required = [0_u8; 16];
+        required[..4].copy_from_slice(&crate::JOURNAL_V1_FRAME_MAGIC);
+        required[4..6].copy_from_slice(&crate::JOURNAL_V1_VERSION.to_be_bytes());
+        required[6] = 1;
+        required[8..16].copy_from_slice(&expected_sequence.to_be_bytes());
+        let required_len = suffix_len.min(required.len());
+        if suffix[..required_len] != required[..required_len] {
+            return Err(ActiveJournalError::InvalidLayout);
+        }
+        RecoveryClassification::ShortFramePrefix
+    } else {
+        journal
+            .seek(SeekFrom::Start(root.end_offset()))
+            .map_err(|error| io_error(StoreIoOperation::Seek, error))?;
+        let mut prefix = [0_u8; JOURNAL_V1_FRAME_PREFIX_LEN];
+        journal
+            .read_exact(&mut prefix)
+            .map_err(|error| io_error(StoreIoOperation::Read, error))?;
+        if u64::from_be_bytes(prefix[8..16].try_into().unwrap_or_default()) != expected_sequence {
+            return Err(ActiveJournalError::SequenceMismatch);
+        }
+        let frame_len = match frame_len_from_prefix_v1(
+            &prefix,
+            DecodeLimitsV1::new(limits.payload_limit).map_err(ActiveJournalError::Journal)?,
+        ) {
+            Ok(length) => length,
+            Err(_) if suffix_length == JOURNAL_V1_FRAME_PREFIX_LEN as u64 => {
+                return Ok(ScanResult {
+                    records,
+                    valid_end: offset,
+                    truncate_to: None,
+                    recovery_plan: Some(ActiveRecoveryPlan {
+                        identity,
+                        cutoff: root,
+                        original_length: journal_len,
+                        classification: RecoveryClassification::InvalidFramePrefix,
+                    }),
+                });
+            }
+            Err(_) => return Err(ActiveJournalError::InvalidLayout),
+        };
+        let end = root
+            .end_offset()
+            .checked_add(u64::try_from(frame_len).map_err(|_| ActiveJournalError::InvalidLayout)?)
+            .ok_or(ActiveJournalError::InvalidLayout)?;
+        match end.cmp(&journal_len) {
+            std::cmp::Ordering::Greater => RecoveryClassification::TruncatedDeclaredFrame,
+            std::cmp::Ordering::Less => return Err(ActiveJournalError::InvalidLayout),
+            std::cmp::Ordering::Equal => {
+                let mut frame = vec![0_u8; frame_len];
+                frame[..JOURNAL_V1_FRAME_PREFIX_LEN].copy_from_slice(&prefix);
+                journal
+                    .read_exact(&mut frame[JOURNAL_V1_FRAME_PREFIX_LEN..])
+                    .map_err(|error| io_error(StoreIoOperation::Read, error))?;
+                match crate::decode_admission_frame_v1(
+                    &frame,
+                    DecodeLimitsV1::new(limits.payload_limit)
+                        .map_err(ActiveJournalError::Journal)?,
+                    previous,
+                ) {
+                    Ok(decoded)
+                        if decoded.store_id() != identity.store_id
+                            || decoded.declaration().store_id() != identity.store_id =>
+                    {
+                        return Err(ActiveJournalError::StoreMismatch);
+                    }
+                    Ok(_) => return Err(ActiveJournalError::InvalidLayout),
+                    Err(_) => RecoveryClassification::InvalidCompleteFrame,
+                }
+            }
+        }
+    };
+    Ok(ScanResult {
+        records,
+        valid_end: offset,
+        truncate_to: None,
+        recovery_plan: Some(ActiveRecoveryPlan {
+            identity,
+            cutoff: root,
+            original_length: journal_len,
+            classification,
+        }),
+    })
+}
+
+const fn durable_cutoff_from_state(
+    identity: JournalIdentity,
+    state: CheckpointState,
+) -> DurableCutoff {
+    DurableCutoff {
+        journal: identity,
+        checkpoint_generation: state.slot_generation,
+        append_sequence: state.append_sequence,
+        end_offset: state.end_offset,
+    }
 }
 
 fn open_directory(path: &Path) -> Result<File, ActiveJournalError> {

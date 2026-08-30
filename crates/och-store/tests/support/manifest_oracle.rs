@@ -21,6 +21,50 @@ pub struct CatalogReference {
     pub checksum: u32,
 }
 
+#[derive(Clone, Copy)]
+pub struct RecoveryReference {
+    pub slot: u8,
+    pub checksum: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn recovery_state_v1(
+    store: [u8; 16],
+    report_generation: u64,
+    source_manifest_generation: u64,
+    source_manifest_checksum: u32,
+    active_generation: u64,
+    sequence_floor: u64,
+    checkpoint_generation: u64,
+    append_sequence: u64,
+    committed_end_offset: u64,
+    original_journal_length: u64,
+    classification: u8,
+) -> [u8; 128] {
+    let mut bytes = [0_u8; 128];
+    bytes[..8].copy_from_slice(b"OCHRCV01");
+    bytes[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    bytes[10..12].copy_from_slice(&128_u16.to_be_bytes());
+    bytes[12..28].copy_from_slice(&store);
+    bytes[28..36].copy_from_slice(&report_generation.to_be_bytes());
+    bytes[36..44].copy_from_slice(&source_manifest_generation.to_be_bytes());
+    bytes[44..52].copy_from_slice(&(source_manifest_generation + 1).to_be_bytes());
+    bytes[52..56].copy_from_slice(&source_manifest_checksum.to_be_bytes());
+    bytes[56..64].copy_from_slice(&active_generation.to_be_bytes());
+    bytes[64..72].copy_from_slice(&sequence_floor.to_be_bytes());
+    bytes[72..80].copy_from_slice(&checkpoint_generation.to_be_bytes());
+    bytes[80..88].copy_from_slice(&append_sequence.to_be_bytes());
+    bytes[88..96].copy_from_slice(&committed_end_offset.to_be_bytes());
+    bytes[96..104].copy_from_slice(&original_journal_length.to_be_bytes());
+    bytes[104..112]
+        .copy_from_slice(&(original_journal_length - committed_end_offset).to_be_bytes());
+    bytes[112] = classification;
+    bytes[113] = 1;
+    let checksum = crc32c(&bytes[..124]);
+    bytes[124..128].copy_from_slice(&checksum.to_be_bytes());
+    bytes
+}
+
 pub struct RetryV1Outcome<'a> {
     pub series: [u8; 16],
     pub producer: [u8; 16],
@@ -139,6 +183,43 @@ pub fn current_manifest_v1(
     sequence_floor: u64,
     catalog: Option<CatalogReference>,
 ) -> [u8; MANIFEST_V1_LEN] {
+    current_manifest_v1_with_recovery(
+        store,
+        generation,
+        journal_generation,
+        checkpoint_generation,
+        append_sequence,
+        end_offset,
+        registry_slot,
+        registry_generation,
+        registry_bytes,
+        retry_slot,
+        retry_generation,
+        retry_bytes,
+        sequence_floor,
+        catalog,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn current_manifest_v1_with_recovery(
+    store: [u8; 16],
+    generation: u64,
+    journal_generation: u64,
+    checkpoint_generation: u64,
+    append_sequence: u64,
+    end_offset: u64,
+    registry_slot: u8,
+    registry_generation: u64,
+    registry_bytes: &[u8],
+    retry_slot: u8,
+    retry_generation: u64,
+    retry_bytes: &[u8],
+    sequence_floor: u64,
+    catalog: Option<CatalogReference>,
+    recovery: Option<RecoveryReference>,
+) -> [u8; MANIFEST_V1_LEN] {
     let mut bytes = [0_u8; MANIFEST_V1_LEN];
     bytes[..8].copy_from_slice(b"OCHMAN01");
     bytes[8..10].copy_from_slice(&1_u16.to_be_bytes());
@@ -157,6 +238,11 @@ pub fn current_manifest_v1(
     bytes[96..104].copy_from_slice(&retry_generation.to_be_bytes());
     bytes[104..112].copy_from_slice(&(retry_bytes.len() as u64).to_be_bytes());
     bytes[112..116].copy_from_slice(&crc32c(retry_bytes).to_be_bytes());
+    if let Some(recovery) = recovery {
+        bytes[116] = 1;
+        bytes[117] = recovery.slot;
+        bytes[120..124].copy_from_slice(&recovery.checksum.to_be_bytes());
+    }
     bytes[124..132].copy_from_slice(&sequence_floor.to_be_bytes());
     if let Some(catalog) = catalog {
         bytes[132] = catalog.slot;
