@@ -44,11 +44,12 @@ done
 readonly EVIDENCE_ROOT="${OCH_V2_EVIDENCE_ROOT:-${ROOT}/target/v2-evidence}"
 readonly REPORT_ROOT="${EVIDENCE_ROOT}/reports"
 readonly SAMPLES="${REPORT_ROOT}/samples.tsv"
-mkdir -p -- "${REPORT_ROOT}"
 
 cd -- "${ROOT}"
 cargo "+${TOOLCHAIN}" build --release --locked -p och-v2-evidence
 readonly TOOL="${ROOT}/target/release/och-v2-evidence"
+"${TOOL}" prepare-root --root "${EVIDENCE_ROOT}" >/dev/null
+mkdir -p -- "${REPORT_ROOT}"
 
 os_name="$(uname -s)"
 arch_name="$(uname -m)"
@@ -261,7 +262,7 @@ with open(output_path, 'w', encoding='utf-8') as output:
         output.write(f'{prefix}.rss_median_bytes={int(statistics.median(rss))}\n')
         output.write(f'{prefix}.rss_p95_bytes={rss[p95_index]}\n')
         output.write(f'{prefix}.rss_max_bytes={rss[-1]}\n')
-        output.write(f'{prefix}.rss_below_target={str(rss[-1] <= target).lower()}\n')
+        output.write(f'{prefix}.rss_below_target={str(rss[-1] < target).lower()}\n')
 PY
 
 echo "wrote sanitized evidence reports under target/v2-evidence/reports"

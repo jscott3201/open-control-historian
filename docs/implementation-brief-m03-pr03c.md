@@ -48,6 +48,14 @@ source linkage, append/recent redistribution, repeated refusal, 64-pair sequenti
 state drop, bounded reads, controlled-ledger return, and partial-file cleanup.
 Errors remain path- and content-free.
 
+The `prepare-root` command runs the same evidence-root fence without writing a
+report. The measurement script calls it before creating `reports/`. Tests prove
+that boundary refuses a real V1 store without changing its direct inventory or
+bytes and that the store reopens, while a missing safe root remains creatable.
+Metadata, identity, and set text use one `limit + 1` bounded reader and have
+oversized-input regressions. RSS equality with the absolute target reports
+`rss_below_target=false`.
+
 ## Measurement status and hard stop
 
 Darwin release measurements may be recorded as exploratory evidence in the

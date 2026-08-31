@@ -68,7 +68,10 @@ validated sidecar count, then the tool reads and accounts each actual `Vec`
 capacity and refuses any allocator capacity above the corresponding hard bound.
 Frame, re-encode, and scratch capacities receive the same check. Successful build
 and validation reports read the controlled-state counter only after dropping pair
-state and require the actual value to be zero.
+state and require the actual value to be zero. Private fixture metadata, segment
+identity, and fixture-set text share one reader that allocates independently of
+file metadata, reads at most the respective `limit + 1` bytes, and rejects excess
+before semantic work.
 
 **FORMULA:** The conservative controlled base is exactly:
 
@@ -191,6 +194,8 @@ order, and per-series recent-observation ordering before byte-comparing with
 
 ```console
 cargo +1.98.0 run --release --locked -p och-v2-evidence -- \
+  prepare-root --root target/v2-evidence
+cargo +1.98.0 run --release --locked -p och-v2-evidence -- \
   generate --root target/v2-evidence --case representative --seed 1
 cargo +1.98.0 run --release --locked -p och-v2-evidence -- \
   stream-build --root target/v2-evidence --case representative
@@ -206,6 +211,14 @@ segment final, deletes raw evidence, falls back, repairs, migrates, or grants
 registry/query/receipt authority. Failure removes the private partial output by
 default; `--keep-on-failure` retains at most that one bounded evidence partial.
 Errors contain no path or canonical content.
+
+The measurement script builds the tool, invokes the exact `prepare-root` CLI
+boundary, and only then creates `reports/` or performs another evidence-root
+write. A deterministic test applies that CLI boundary to a real current-V1 store,
+exact-compares its direct names and bytes before/after refusal, and reopens the
+store; a separate case proves a missing safe root can be created without creating
+children. The shell ordering itself is checked as source because recursively
+invoking Cargo from the package test is deliberately avoided.
 
 ## Measurement and acceptance protocol
 
@@ -233,7 +246,8 @@ exploratory. Revision cleanliness inspects tracked changes only.
 Darwin samples remain **PROTOTYPE MEASUREMENT / EXPLORATORY_ONLY** even below the
 target. Linux x86_64 must run the documented maximum-bound cases, report memory
 and latency, and stop for owner review. Numeric writer/open latency ceilings stay
-`UNKNOWN`; the tool cannot set them.
+`UNKNOWN`; the tool cannot set them. A peak is below target only when it is
+strictly less than `167,772,160`; equality is not below target.
 
 ## Product non-inference and remaining hard stop
 

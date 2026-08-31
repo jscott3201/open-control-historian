@@ -10,6 +10,7 @@ use och_store::{
     ActiveJournalLimits, ActiveJournalOpenMode, ManifestStore, ManifestStoreConfig,
     PreparedAdmissionV1, RegistryPersistenceOptions, RetryPersistenceOptions,
 };
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -407,6 +408,134 @@ fn roots_containing_current_or_future_store_names_refuse_before_output() {
 }
 
 #[test]
+fn prepare_root_cli_refuses_a_real_v1_store_without_mutation_and_store_reopens() {
+    let store_directory = TempDirectory::new("prepare-root-product-store");
+    let store_id = och_core::StoreId::from_bytes(uuid_bytes(91_000))
+        .expect("valid deterministic store identity");
+    let config = |mode| {
+        ManifestStoreConfig::new(
+            store_directory.path().to_path_buf(),
+            store_id,
+            mode,
+            ActiveJournalLimits::new(
+                och_store::MAX_ADMISSION_PAYLOAD_V1,
+                och_store::MAX_ACTIVE_JOURNAL_BYTES,
+                och_store::MAX_ACTIVE_JOURNAL_RECORDS,
+            )
+            .expect("maximum store limits"),
+            RegistryPersistenceOptions::new(och_core::SeriesRegistryLimits::new(1, 1))
+                .expect("bounded registry options"),
+            RetryPersistenceOptions::new(1, 1).expect("bounded retry options"),
+        )
+        .expect("valid product store config")
+    };
+    let store = ManifestStore::open(config(ActiveJournalOpenMode::CreateNew))
+        .expect("create valid V1 store");
+    let before = direct_inventory(store_directory.path());
+    let error = run(&[
+        "prepare-root".to_owned(),
+        "--root".to_owned(),
+        store_directory.path().to_string_lossy().into_owned(),
+    ])
+    .expect_err("V1 store must refuse as evidence root");
+    assert_eq!(error, EvidenceError::UnsafeEvidenceRoot);
+    assert_eq!(direct_inventory(store_directory.path()), before);
+    drop(store);
+    let reopened = ManifestStore::open(config(ActiveJournalOpenMode::OpenExisting))
+        .expect("unchanged V1 store reopens");
+    drop(reopened);
+}
+
+#[test]
+fn prepare_root_cli_creates_only_a_missing_safe_root() {
+    let directory = TempDirectory::new("prepare-root-safe-parent");
+    let safe_root = directory.path().join("new-evidence-root");
+    run(&[
+        "prepare-root".to_owned(),
+        "--root".to_owned(),
+        safe_root.to_string_lossy().into_owned(),
+    ])
+    .expect("prepare missing safe evidence root");
+    assert!(safe_root.is_dir());
+    assert_eq!(fs::read_dir(safe_root).expect("read safe root").count(), 0);
+}
+
+#[test]
+fn oversized_fixture_metadata_refuses_before_pair_state_or_partial_output() {
+    let (_directory, root, meta) = setup("oversized-meta", "min");
+    fs::write(
+        root.fixture_meta_path(&meta.case).expect("metadata path"),
+        vec![b'x'; 2_049],
+    )
+    .expect("write oversized fixture metadata");
+    assert_eq!(
+        stream::build(&root, &meta.case, false).expect_err("oversized metadata must refuse"),
+        EvidenceError::InvalidFixture
+    );
+    assert_eq!(active_controlled_bytes(), 0);
+    assert_no_partial_files(&root);
+}
+
+#[test]
+fn oversized_segment_identity_refuses_before_pair_state_or_partial_output() {
+    let (_directory, root, meta) = setup("oversized-identity", "min");
+    stream::build(&root, &meta.case, false).expect("build identity baseline");
+    fs::write(
+        root.segment_identity_path(&meta.case)
+            .expect("identity path"),
+        vec![b'x'; 513],
+    )
+    .expect("write oversized segment identity");
+    assert_eq!(
+        stream::validate(&root, &meta.case).expect_err("oversized identity must refuse"),
+        EvidenceError::InvalidFixture
+    );
+    assert_eq!(active_controlled_bytes(), 0);
+    assert_no_partial_files(&root);
+}
+
+#[test]
+fn oversized_fixture_set_refuses_before_pair_state_or_partial_output() {
+    let (_directory, root, meta) = setup("oversized-set", "min");
+    stream::build(&root, &meta.case, false).expect("build set baseline");
+    fs::write(
+        root.set_path("oversized-set").expect("set path"),
+        vec![b'x'; 8_193],
+    )
+    .expect("write oversized fixture set");
+    assert_eq!(
+        run(&[
+            "validate-set".to_owned(),
+            "--root".to_owned(),
+            root.path_for_test(),
+            "--set".to_owned(),
+            "oversized-set".to_owned(),
+        ])
+        .expect_err("oversized set must refuse"),
+        EvidenceError::Bounds
+    );
+    assert_eq!(active_controlled_bytes(), 0);
+    assert_no_partial_files(&root);
+}
+
+#[test]
+fn measurement_script_fences_before_reports_and_uses_strict_rss_target() {
+    let script = include_str!("../../../scripts/measure-v2-evidence.sh");
+    let build = script
+        .find("cargo \"+${TOOLCHAIN}\" build")
+        .expect("release build command");
+    let prepare = script
+        .find("\"${TOOL}\" prepare-root --root")
+        .expect("evidence-root preparation command");
+    let report_write = script
+        .find("mkdir -p -- \"${REPORT_ROOT}\"")
+        .expect("first report-root write");
+    assert!(build < prepare && prepare < report_write);
+    assert!(script.contains("rss[-1] < target"));
+    assert!(!script.contains("rss[-1] <= target"));
+}
+
+#[test]
 fn maximum_fixture_profiles_are_constructible_within_current_source_bounds() {
     let (max_byte_source, max_observation_source) = bound_probe().expect("probe maximum fixtures");
     assert_eq!(max_byte_source, och_store::MAX_ACTIVE_JOURNAL_BYTES);
@@ -504,4 +633,20 @@ fn assert_no_partial_files(root: &EvidenceRoot) {
             .filter_map(std::result::Result::ok)
             .all(|entry| { !entry.file_name().to_string_lossy().ends_with(".partial") })
     );
+}
+
+fn direct_inventory(directory: &Path) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(directory)
+        .expect("read direct inventory")
+        .map(|entry| {
+            let entry = entry.expect("read inventory entry");
+            assert!(entry.file_type().expect("read entry type").is_file());
+            let name = entry
+                .file_name()
+                .into_string()
+                .expect("store artifact name is UTF-8");
+            let bytes = fs::read(entry.path()).expect("read store artifact bytes");
+            (name, bytes)
+        })
+        .collect()
 }

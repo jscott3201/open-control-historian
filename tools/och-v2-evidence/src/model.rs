@@ -1,7 +1,8 @@
 use crate::error::{EvidenceError, Result};
 use crate::ledger::{MAX_FRAMES, MAX_OBSERVATIONS, MAX_SERIES};
 use och_core::StoreId;
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 pub(crate) const FIXTURE_SCHEMA: &str = "och-v2-evidence-fixture-v1";
@@ -82,10 +83,7 @@ impl FixtureMeta {
     }
 
     pub(crate) fn read(path: &Path) -> Result<Self> {
-        let text = fs::read_to_string(path).map_err(|_| EvidenceError::Io)?;
-        if text.len() > 2_048 {
-            return Err(EvidenceError::InvalidFixture);
-        }
+        let text = read_bounded_text(path, 2_048, EvidenceError::InvalidFixture)?;
         let mut fields = Fields::new(&text)?;
         if fields.take("schema")? != FIXTURE_SCHEMA {
             return Err(EvidenceError::InvalidFixture);
@@ -141,10 +139,7 @@ impl SegmentIdentity {
     }
 
     pub(crate) fn read(path: &Path) -> Result<Self> {
-        let text = fs::read_to_string(path).map_err(|_| EvidenceError::Io)?;
-        if text.len() > 512 {
-            return Err(EvidenceError::InvalidFixture);
-        }
+        let text = read_bounded_text(path, 512, EvidenceError::InvalidFixture)?;
         let mut fields = Fields::new(&text)?;
         if fields.take("schema")? != IDENTITY_SCHEMA {
             return Err(EvidenceError::InvalidFixture);
@@ -158,6 +153,31 @@ impl SegmentIdentity {
         fields.finish()?;
         Ok(identity)
     }
+}
+
+pub(crate) fn read_bounded_text(
+    path: &Path,
+    limit: usize,
+    excess_error: EvidenceError,
+) -> Result<String> {
+    let read_limit = limit.checked_add(1).ok_or(EvidenceError::Bounds)?;
+    let mut file = File::open(path).map_err(|_| EvidenceError::Io)?;
+    let mut bytes = vec![0_u8; read_limit];
+    let mut filled = 0_usize;
+    while filled < read_limit {
+        let read = file
+            .read(&mut bytes[filled..])
+            .map_err(|_| EvidenceError::Io)?;
+        if read == 0 {
+            break;
+        }
+        filled = filled.checked_add(read).ok_or(EvidenceError::Bounds)?;
+    }
+    if filled > limit {
+        return Err(excess_error);
+    }
+    bytes.truncate(filled);
+    String::from_utf8(bytes).map_err(|_| EvidenceError::InvalidFixture)
 }
 
 pub(crate) fn valid_case_name(value: &str) -> bool {

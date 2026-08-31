@@ -29,6 +29,7 @@ fn main() {
 fn run(arguments: &[String]) -> Result<()> {
     let (command, arguments) = arguments.split_first().ok_or(EvidenceError::Usage)?;
     match command.as_str() {
+        "prepare-root" => prepare_root_command(arguments),
         "generate" => generate_command(arguments),
         "stream-build" => build_command(arguments),
         "stream-validate" => validate_command(arguments),
@@ -39,6 +40,14 @@ fn run(arguments: &[String]) -> Result<()> {
         }
         _ => Err(EvidenceError::Usage),
     }
+}
+
+fn prepare_root_command(arguments: &[String]) -> Result<()> {
+    let parsed = Parsed::new(arguments, &["--root"], &[])?;
+    let _root = EvidenceRoot::prepare(&PathBuf::from(parsed.required("--root")?))?;
+    println!("schema=och-v2-evidence-root-preparation-v1");
+    println!("safe=true");
+    Ok(())
 }
 
 fn generate_command(arguments: &[String]) -> Result<()> {
@@ -115,10 +124,7 @@ fn validate_set_command(arguments: &[String]) -> Result<()> {
     let parsed = Parsed::new(arguments, &["--root", "--set"], &[])?;
     let root = EvidenceRoot::open(&PathBuf::from(parsed.required("--root")?))?;
     let set_name = parsed.required("--set")?;
-    let text = std::fs::read_to_string(root.set_path(set_name)?).map_err(|_| EvidenceError::Io)?;
-    if text.len() > 8_192 {
-        return Err(EvidenceError::Bounds);
-    }
+    let text = model::read_bounded_text(&root.set_path(set_name)?, 8_192, EvidenceError::Bounds)?;
     let mut lines = text.lines();
     if lines.next() != Some("schema=och-v2-evidence-set-v1") {
         return Err(EvidenceError::InvalidFixture);
