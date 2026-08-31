@@ -58,6 +58,8 @@ recovery transaction may mutate. The recognized inventory maximum is 91: the
 prior 87 plus three Recovery State finals and one staging name. A rejected directory is
 left byte-for-byte and name-for-name unchanged. Error displays contain operation
 classes and standard I/O kinds where applicable, never paths or artifact content.
+Offline Native Segment V1 candidate bytes have no recognized filename or inventory
+role; placing them in this directory remains unknown-artifact evidence and refuses.
 
 ## Logical preflight and volatile pressure custody
 

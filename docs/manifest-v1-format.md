@@ -123,6 +123,8 @@ same-layout next manifest last. Complete report/manifest staging and finals are
 resumed only when exact expected bytes prove the next transaction; malformed,
 duplicate, future, or mismatched evidence refuses unchanged. A second clean open
 does not advance either generation. Broad repair, migration, destructive reset,
-native segments, reclamation, retention, stale-restore custody, and disk-pressure
-runtime policy remain outside this contract. Store-only typed pressure evidence
+durable segment publication/reference authority, reclamation, retention,
+stale-restore custody, and disk-pressure runtime policy remain outside this
+contract. Offline Native Segment V1 candidates do not alter Manifest V1.
+Store-only typed pressure evidence
 and volatile reopen custody do not alter Manifest V1 bytes or authority.

@@ -1,6 +1,7 @@
 # OpenControl Historian
 
-OpenControl Historian is at its canonical-model and manifest-rooted active-journal stage.
+OpenControl Historian is at its canonical-model, manifest-rooted active-journal,
+and offline Native Segment V1 candidate stage.
 This repository provides a small Rust workspace, an enforceable native dependency
 boundary, the dependency-free canonical Historian data model, bounded series
 declaration authority, source/capture provenance and admission boundary,
@@ -15,9 +16,12 @@ frames and ambiguity refuse unchanged. Store-owned mutating boundaries also
 report typed standard-library storage pressure and put that live store handle in
 sticky reopen custody without adding durable state. The runtime now retains the
 first bounded typed pressure evidence, closes ingress before waking waiters, and
-joins the existing fixed reaper before pressure shutdown returns. It does **not**
-yet provide final native segments, retention/reclamation, unbounded or time-based
-retry, current/held-value, or query behavior.
+joins the existing fixed reaper before pressure shutdown returns. `och-store` can
+also build and hostile-parse one bounded non-authorizing Native Segment V1
+candidate from one committed sealed raw generation without publishing it or
+changing store authority. It does **not** yet provide durable segment publication,
+retention/reclamation, unbounded or time-based retry, current/held-value, or query
+behavior.
 
 ## Current status
 
@@ -85,6 +89,10 @@ first-wins path-free pressure evidence. Pressure atomically establishes
 `StoragePressure` health before fail-stop wakes receipt/latest waiters; consuming
 shutdown then waits for the fixed reaper and returns that exact evidence. No
 pressure retry, clear, continued degraded ingress, or new receipt/latest variant exists.
+Its dependency-free Native Segment V1 candidate retains complete original frames
+in one SeriesId-ordered block per series, plus global append and recent-observation
+directories. Candidate bytes remain in memory/offline, are rejected as store
+inventory, and grant no declaration, runtime, query, retention, or reclamation authority.
 
 The current workspace contains:
 
@@ -92,7 +100,7 @@ The current workspace contains:
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model, bounded series declaration authority, and a measurement-only example |
 | [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, durable retry replay/guard classification, automatic safe-boundary rotation, recovery/pressure inspection, writer-serialized registry control, manifest-backed receipts, and volatile latest snapshots |
-| [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, conservative terminal-suffix recovery, typed pressure/reopen custody, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
+| [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, offline Native Segment V1 candidates, conservative terminal-suffix recovery, typed pressure/reopen custody, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
 `och-core` has no dependencies. `och-store` depends inward on `och-core`, and
@@ -202,6 +210,9 @@ through nextest rather than being repeated with `cargo test`.
   pre-segment artifact and streaming verification contract.
 - [Recovery State V1](docs/recovery-state-v1-format.md) defines the exact durable
   report bytes, manifest reference, convergence law, and diagnostic semantics.
+- [Native Segment V1](docs/native-segment-v1-format.md) defines the exact bounded
+  offline candidate bytes, source proof, hostile parser law, indexes, and explicit
+  non-authority boundary.
 - [M02-PR03a implementation brief](docs/implementation-brief-m02-pr03a.md) and
   [continuation](docs/continuation-m02-pr03a.md) record conservative current-V1
   recovery evidence and the remaining deferrals.
@@ -211,6 +222,10 @@ through nextest rather than being repeated with `cargo test`.
 - [M02-PR03b2 implementation brief](docs/implementation-brief-m02-pr03b2.md) and
   [continuation](docs/continuation-m02-pr03b2.md) record runtime pressure evidence,
   fail-stop ordering, receipt/latest preservation, and reaper-joined shutdown.
+- [M03-PR01a implementation brief](docs/implementation-brief-m03-pr01a.md) and
+  [continuation](docs/continuation-m03-pr01a.md) record the exact one-generation
+  Native Segment V1 candidate, independent oracle, read-only bridge, and deferred
+  publication/query/reclamation boundary.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

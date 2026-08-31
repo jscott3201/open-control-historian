@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod segment_oracle;
+
 use och_core::{
     ArtifactId, ArtifactReference, CanonicalAdmission, CaptureLifecycle, CaptureRunEvidence,
     CollectionEnvelope, CollectionMode, ContentFormat, ContentIdentity, ContentVersion,
@@ -174,13 +176,29 @@ fn registry_bound(
 }
 
 fn observation(number: u64, value: ExactValue, positioned: bool) -> Observation {
+    observation_with_times(
+        number,
+        value,
+        positioned,
+        Timestamp::new(10, 11).expect("receive timestamp"),
+        Timestamp::new(9, 12).expect("effective timestamp"),
+    )
+}
+
+fn observation_with_times(
+    number: u64,
+    value: ExactValue,
+    positioned: bool,
+    receive: Timestamp,
+    effective: Timestamp,
+) -> Observation {
     Observation::new(
         observation_id(number),
         value,
         ObservationTimes::new(
             Some(Timestamp::new(-1, 999_999_999).expect("source timestamp")),
-            Timestamp::new(10, 11).expect("receive timestamp"),
-            Timestamp::new(9, 12).expect("effective timestamp"),
+            receive,
+            effective,
         ),
         Quality::new(
             QualityLevel::Uncertain,
@@ -268,14 +286,45 @@ pub fn observed_admission(
     gap_count: usize,
     revised: bool,
 ) -> CanonicalAdmission {
-    let series = series_id(2);
-    let producer = producer_id(3);
     let positioned = !values.is_empty();
     let observations: Vec<_> = values
         .into_iter()
         .enumerate()
         .map(|(index, value)| observation(10_000 + index as u64, value, positioned))
         .collect();
+    observed_admission_from_observations(observations, family, gap_count, revised)
+}
+
+pub fn observed_admission_with_raw_times(
+    entries: &[(u64, i64, u32, i64, u32)],
+) -> CanonicalAdmission {
+    let observations = entries
+        .iter()
+        .map(
+            |(number, receive_seconds, receive_nanos, effective_seconds, effective_nanos)| {
+                observation_with_times(
+                    *number,
+                    ExactValue::Boolean(true),
+                    true,
+                    Timestamp::new(*receive_seconds, *receive_nanos)
+                        .expect("normalized custom receive time"),
+                    Timestamp::new(*effective_seconds, *effective_nanos)
+                        .expect("normalized custom effective time"),
+                )
+            },
+        )
+        .collect();
+    observed_admission_from_observations(observations, ValueFamily::Boolean, 0, false)
+}
+
+fn observed_admission_from_observations(
+    observations: Vec<Observation>,
+    family: ValueFamily,
+    gap_count: usize,
+    revised: bool,
+) -> CanonicalAdmission {
+    let series = series_id(2);
+    let producer = producer_id(3);
     let gaps: Vec<_> = (0..gap_count)
         .map(|index| {
             let start = 20_000 + index as u128 * 2;

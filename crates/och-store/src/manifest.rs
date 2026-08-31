@@ -1224,6 +1224,45 @@ impl ManifestStore {
         }
     }
 
+    /// Builds one offline Native Segment V1 candidate from an exact committed
+    /// sealed generation selected by the already-authoritative catalog.
+    ///
+    /// This read-only convenience performs bounded sealed-file validation and
+    /// returns only in-memory bytes. It does not publish an artifact, alter store
+    /// inventory or authority, synchronize, clean up, or change write custody.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an active, unknown, uncommitted, corrupt, foreign, excessive, or
+    /// unreadable source with closed path- and content-free segment evidence.
+    pub fn build_segment_candidate_v1(
+        &self,
+        journal_generation: u64,
+    ) -> Result<crate::PreparedSegmentV1, crate::SegmentV1Error> {
+        let sealed = self
+            .catalog
+            .entries()
+            .iter()
+            .copied()
+            .find(|entry| entry.journal_generation() == journal_generation)
+            .ok_or(crate::SegmentV1Error::InvalidSource)?;
+        let path = self
+            .directory_path
+            .join(sealed_journal_file_name(journal_generation));
+        validate_sealed_journal(
+            &path,
+            sealed,
+            self.current.cutoff.journal().store_id(),
+            self.journal.limits(),
+            &self.registry,
+        )
+        .map_err(map_segment_source_error)?;
+        let maximum = usize::try_from(crate::MAX_ACTIVE_JOURNAL_BYTES)
+            .map_err(|_| crate::SegmentV1Error::Bounds)?;
+        let bytes = read_required_bounded(&path, maximum).map_err(map_segment_source_error)?;
+        crate::build_segment_v1(self.current.cutoff.journal().store_id(), sealed, &bytes)
+    }
+
     /// Returns decoded journal evidence without granting registry authority.
     #[must_use]
     pub fn recovered_records(&self) -> &[crate::RecoveredAdmissionV1] {
@@ -3568,6 +3607,16 @@ fn map_generation_codec(error: GenerationCodecError) -> ManifestStoreError {
     match error {
         GenerationCodecError::Invalid => ManifestStoreError::InvalidGeneration,
         GenerationCodecError::StoreMismatch => ManifestStoreError::StoreMismatch,
+    }
+}
+
+fn map_segment_source_error(error: ManifestStoreError) -> crate::SegmentV1Error {
+    match error {
+        ManifestStoreError::StoreMismatch => crate::SegmentV1Error::StoreMismatch,
+        ManifestStoreError::Io(evidence) | ManifestStoreError::StoragePressure(evidence) => {
+            crate::SegmentV1Error::Io(evidence)
+        }
+        _ => crate::SegmentV1Error::InvalidSource,
     }
 }
 
