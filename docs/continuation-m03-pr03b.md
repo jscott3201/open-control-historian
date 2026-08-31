@@ -66,10 +66,13 @@ authority.
 The existing in-memory segment builder can exceed 700 MB and is not authorized on
 the sole-writer path. M03-PR03c supplies a separately reviewed tooling-only
 streaming/multipass prototype with a 160 MiB target and zero external sort
-workspace, but it is not native integration or Linux acceptance. Implementation
-still requires Linux x86_64 maximum-bound memory and latency evidence, complete
-native fault injection, and fresh owner approval. Writer/open SLOs remain
-`UNKNOWN`; see the [M03-PR03c resource plan](m03-pr03c-segment-resource-plan.md).
+workspace. M03-PR03d accepts its standalone Linux x86_64 resource evidence, but
+that is not native integration or product timing evidence. Implementation still
+requires a separately reviewed native timing/transaction/fault/cleanup/pressure/
+receipt evidence plan, measured native results, complete native fault evidence,
+and fresh owner approval. Writer/open SLOs remain `UNKNOWN`; see the
+[M03-PR03c resource plan](m03-pr03c-segment-resource-plan.md) and
+[M03-PR03d evidence record](m03-pr03d-linux-resource-evidence.md).
 
 The required future implementation matrix is recorded in the
 [M03-PR03b implementation brief](implementation-brief-m03-pr03b.md). This docs PR

@@ -35,12 +35,15 @@ time-based retry, or current/held-value behavior.
 M03-PR03b adds a documentation-only review barrier for a future new-store Store
 Format V2 that would require the unchanged raw-frame Native Segment V1 on every
 nonempty rotation. It adds no implementation: current code remains Store Format
-V1-only and continues to reject all proposed V2 names and bytes. Future work is
-blocked on Linux x86_64 maximum-bound evidence and a fresh owner checkpoint.
+V1-only and continues to reject all proposed V2 names and bytes.
 M03-PR03c supplies the private tooling-only streaming/multipass resource prototype,
 deterministic fixtures, checked 160 MiB/zero-external-sort ledger, and measurement
 protocol. It changes no native behavior or durable format; Darwin measurements
-are exploratory and writer/open latency ceilings remain unknown.
+are exploratory. M03-PR03d records the owner-accepted standalone tooling Linux
+x86_64 resource evidence and closes only that standalone measurement condition.
+Writer/open SLOs remain `UNKNOWN`; V2 product work still requires a separately
+reviewed native evidence plan, measured native results, and a fresh owner
+checkpoint.
 
 ## Current status
 
@@ -279,8 +282,11 @@ through nextest rather than being repeated with `cargo test`.
 - [M03-PR03c resource plan](docs/m03-pr03c-segment-resource-plan.md),
   [implementation brief](docs/implementation-brief-m03-pr03c.md), and
   [continuation](docs/continuation-m03-pr03c.md) record the tooling-only exact
-  streaming prototype, controlled-memory ledger, measurement protocol, and
-  still-mandatory Linux/owner hard stop.
+  streaming prototype, controlled-memory ledger, and measurement protocol.
+- [M03-PR03d accepted Linux resource evidence](docs/m03-pr03d-linux-resource-evidence.md),
+  [implementation brief](docs/implementation-brief-m03-pr03d.md), and
+  [continuation](docs/continuation-m03-pr03d.md) record the accepted standalone
+  Linux x86_64 result and the still-mandatory native evidence/owner hard stop.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

@@ -18,9 +18,11 @@ The statements below use four labels deliberately:
 
 The prototype target is an absolute process peak RSS below **160 MiB**, exactly
 `167,772,160` bytes, with **zero external sort workspace**. Linux x86_64 maximum-
-bound evidence and a fresh owner checkpoint remain mandatory before V2 product
-implementation. Darwin results are exploratory only. Writer and eager-open
-latency ceilings remain `UNKNOWN` pending that checkpoint.
+bound standalone measurements are accepted by
+[M03-PR03d](m03-pr03d-linux-resource-evidence.md) as tooling evidence only. Darwin
+results remain exploratory. Writer and eager-open SLOs remain `UNKNOWN`, and a
+separate native evidence plan, measured native results, and fresh owner checkpoint
+remain mandatory before V2 product implementation.
 
 ## Exact unchanged artifact arithmetic
 
@@ -244,10 +246,10 @@ is Linux and `uname -m` is exactly `x86_64`; every other architecture is
 exploratory. Revision cleanliness inspects tracked changes only.
 
 Darwin samples remain **PROTOTYPE MEASUREMENT / EXPLORATORY_ONLY** even below the
-target. Linux x86_64 must run the documented maximum-bound cases, report memory
-and latency, and stop for owner review. Numeric writer/open latency ceilings stay
-`UNKNOWN`; the tool cannot set them. A peak is below target only when it is
-strictly less than `167,772,160`; equality is not below target.
+target. M03-PR03d records the completed Linux x86_64 maximum-bound standalone run
+and owner acceptance. Numeric writer/open SLOs stay `UNKNOWN`; the tool cannot set
+them. A peak is below target only when it is strictly less than `167,772,160`;
+equality is not below target.
 
 ## Product non-inference and remaining hard stop
 
@@ -258,9 +260,10 @@ production latency. It does not authorize V2 names or bytes in `och-store`.
 
 A future product PR remains blocked on all of the following:
 
-1. Linux x86_64 release measurements for minimum, representative, and maximum
-   legal resource bounds with every peak below `167,772,160` bytes;
-2. measured writer-delay and eager-open latency presented without invented SLOs;
-3. a fresh owner checkpoint accepting those numbers and the integration plan; and
+1. a separately reviewed native timing/transaction/fault/cleanup/pressure/receipt
+   evidence plan;
+2. measured native writer-delay and eager-open results presented without invented
+   SLOs;
+3. a fresh owner checkpoint accepting those results and the integration plan; and
 4. the complete native transaction, crash, cleanup, pressure, and receipt evidence
    matrix retained by [M03-PR03b](implementation-brief-m03-pr03b.md).

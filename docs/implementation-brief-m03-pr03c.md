@@ -60,9 +60,11 @@ oversized-input regressions. RSS equality with the absolute target reports
 
 Darwin release measurements may be recorded as exploratory evidence in the
 [continuation](continuation-m03-pr03c.md). They cannot satisfy Linux acceptance.
-The future V2 implementation remains blocked until Linux x86_64 maximum-bound
-memory and latency evidence is reviewed at a fresh owner checkpoint. Writer and
-open latency ceilings are `UNKNOWN`.
+M03-PR03d now records owner-accepted standalone Linux x86_64 resource evidence and
+satisfies only this prototype's standalone measurement condition. The future V2
+implementation remains blocked on a separately reviewed native timing/
+transaction/fault/cleanup/pressure/receipt evidence plan, measured native results,
+and a fresh owner checkpoint. Writer and open SLOs remain `UNKNOWN`.
 
 The standalone tool proves no native writer transaction, crash convergence,
 pressure custody, receipt behavior, durable segment authority, query integration,
