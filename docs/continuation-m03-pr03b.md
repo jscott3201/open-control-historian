@@ -42,6 +42,18 @@ reopen may return only to the exact prior root or refuse unchanged. After it
 commits, reopen must completely validate the manifest, Catalog V2, retained raw
 seal, Published Native Segment V1, and successor relation before adoption.
 
+Committed cleanup retains `journal-rotation-v2.intent` as proof while it
+idempotently removes the exact predecessor active Journal V1, synchronizes the
+directory, removes the predecessor checkpoint, synchronizes the directory,
+removes exact-matching raw, segment, catalog, and manifest staging in fixed
+publication order with a directory sync after each present removal, and proves
+the exact clean committed inventory. Only then may it remove the intent last and
+synchronize the directory again. The retained raw-seal and Published Native
+Segment V1 finals are never cleanup targets. A cleanup crash revalidates the
+committed relation and resumes only that exact proof-backed prefix; it never falls
+back to the prior root. Missing or ambiguous proof refuses unchanged, and an
+absent intent is accepted only with an already-clean committed inventory.
+
 Full raw and segment payload validation is eager on open. A committed segment
 that is missing, corrupt, foreign, malformed, excessive, or catalog-mismatched
 refuses unchanged. Retained raw Journal V1 bytes never provide implicit open,
@@ -60,7 +72,8 @@ fault injection, and owner approval. Numeric budgets and SLOs remain `UNKNOWN`.
 The required future implementation matrix is recorded in the
 [M03-PR03b implementation brief](implementation-brief-m03-pr03b.md). This docs PR
 claims none of its byte-oracle, namespace, epoch-refusal, convergence, pressure,
-fail-closed, bound, memory, or latency evidence.
+fail-closed, predecessor/staging/intent-last cleanup-fault, bound, memory, or
+latency evidence.
 
 No migration, codec-backed bytes, query/runtime integration, multi-generation
 merge, cursor, compaction, pin, retention/reclamation, raw deletion, fallback,

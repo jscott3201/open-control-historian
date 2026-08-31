@@ -56,12 +56,28 @@ rotation follows this exact order:
    V1 and checkpoint at the prior global sequence cutoff.
 6. **Catalog.** Publish, synchronize, bounded-read back, and exact-decode the next
    Generation Catalog V2 candidate containing the raw and segment identities.
-7. **Commit.** Publish and directory-synchronize Manifest V2 last. Only then adopt
-   the successor and narrowly remove exact redundant staging and intent evidence.
+7. **Commit.** Publish and directory-synchronize Manifest V2 last. Revalidate the
+   complete manifest/catalog/raw/segment/successor relation. Commit fixes the new
+   root; no later cleanup fault permits fallback to the prior root.
+8. **Adopt and clean.** Adopt the validated successor. Keep
+   `journal-rotation-v2.intent` as cleanup proof while performing this exact,
+   idempotent sequence: remove the intent/root-proven predecessor active Journal
+   V1 and synchronize the directory; remove its exact predecessor checkpoint and
+   synchronize the directory; then process any redundant transaction staging in
+   fixed publication order: `sealed-journal-v1.staging`,
+   `native-segment-v1.staging`, `generation-catalog-v2.staging`, and
+   `manifest-v2.staging`. Each present staging artifact must exact-match its
+   intent/root derivative before removal, and each removal is followed by a
+   directory synchronization. Read back and prove the exact committed inventory,
+   remove the intent last, and synchronize the directory once more. A repeated
+   removal may accept absence only when the committed root, intent, and exact
+   cleanup prefix prove that the earlier attempt completed it. The retained
+   raw-seal final and Published Native Segment V1 final are never cleanup targets.
 
-No step may expose a successful rotation or durable authority before step 7.
-Storage-pressure custody and all other failure paths must preserve the existing
-no-false-commit law.
+No step may expose durable authority before step 7 or transaction-complete success
+before step 8. Storage-pressure custody and all other failure paths must preserve
+the existing no-false-commit law. A postcommit cleanup failure reports the
+committed-root truth and never manufactures prior-root fallback.
 
 ## Crash and reopen law
 
@@ -69,13 +85,26 @@ Before Manifest V2 commit, the prior exact manifest root remains sole authority.
 Reopen may roll back and remove only intent-proven uncommitted transaction
 artifacts to that prior exact root, or it refuses unchanged. It never adopts an
 uncommitted raw seal, segment, catalog, or successor and never guesses from
-directory names or bytes without the complete relation.
+directory names or bytes without the complete relation. Rollback retains the
+intent through exact uncommitted-artifact and staging cleanup, synchronizes those
+removals, removes the intent last, and synchronizes the directory.
 
 After Manifest V2 commit, reopen validates the exact manifest/catalog/raw/segment/
-successor relation before authority adoption. It may remove only proven redundant
-staging and intent evidence. Any missing, corrupt, foreign, malformed, partial,
-future, forked, unrelated, excessive, or mismatched committed evidence refuses
-unchanged.
+successor relation before authority adoption and cannot return to the prior root.
+While the exact intent remains, reopen uses it with the committed root to identify
+the predecessor generation and resumes only the cleanup prefix in step 8:
+predecessor active Journal V1, predecessor checkpoint, redundant staging, then
+intent-last removal, with the specified directory synchronizations. A crash
+before, between, or after any removal converges idempotently to the exact committed
+root and exact canonical inventory. The retained raw seal and Published Native
+Segment V1 remain present and exact throughout.
+
+If intent/root proof is missing or ambiguous, a cleanup state is not an exact
+prefix, or a retained final or committed relation is missing, corrupt, foreign,
+malformed, partial, future, forked, unrelated, excessive, or mismatched, reopen
+refuses unchanged. If the intent is absent, reopen accepts only an already-clean
+committed inventory with no predecessor or transaction staging; it never guesses
+that leftover evidence is redundant.
 
 There is no broad fallback, raw deletion, segment fallback, rebuild, repair,
 migration, or second writer. Each injected interruption must converge to exactly
@@ -96,8 +125,9 @@ define and prove:
 - writer-delay and open-latency measurements at relevant bounds;
 - deterministic cleanup and pressure custody at every publication phase;
 - complete hostile parsing and source-link validation without semantic weakening;
-- fault injection at every write, sync, readback, rename, directory-sync,
-  publication, adoption, and cleanup phase; and
+- fault injection at every write, sync, readback, rename, publication, adoption,
+  predecessor active/checkpoint removal, staging cleanup, intent-last removal,
+  and directory-sync boundary; and
 - explicit owner approval of the measured resource and latency budget.
 
 The numeric memory budget and all writer-delay/open-latency SLOs are `UNKNOWN`.
@@ -114,7 +144,8 @@ implementation is incomplete until each row has independent, deterministic proof
 | Published segment bytes | Independent full-segment oracle proving exact unchanged `OCHSEG01` bytes, source reconstruction, indexes, and trailer | Not implemented or claimed |
 | Namespace and inventory | Exact recognized-name oracle, 156-entry maximum, unknown-name refusal, and no orphan/gap/alternate segment | Not implemented or claimed |
 | Epoch fence | V1, V2, markerless, historical, and mixed-format refusal before lock creation/acquisition or mutation, with before/after equality | Not implemented or claimed |
-| Transaction convergence | Fault injection at every phase proving only exact prior-root rollback or exact committed-root adoption | Not implemented or claimed |
+| Transaction convergence | Fault injection at every publication phase proving exact prior-root rollback only before commit and exact committed-root adoption only after commit | Not implemented or claimed |
+| Committed cleanup convergence | Inject failure before, between, and after predecessor active deletion, predecessor checkpoint deletion, each fixed staging-name deletion, intent-last removal, and each directory sync; prove no retained raw/segment deletion, no postcommit prior-root fallback, no extra inventory, and eventual exact committed-root reopen | Not implemented or claimed |
 | Pressure and receipts | Storage-pressure custody, no false manifest/catalog/segment commit, and no false durable receipt | Not implemented or claimed |
 | Committed fail-closed behavior | Missing, corrupt, foreign, malformed, truncated, excessive, and catalog-mismatched segment refusal with exact inventory equality | Not implemented or claimed |
 | Raw/segment linkage | Full checksum/hostile parse proving exact StoreId, generation, range, registry, raw length/CRC, frame coverage, and catalog identity | Not implemented or claimed |

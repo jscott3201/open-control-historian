@@ -126,7 +126,25 @@ artifacts exactly.
 
 The intent never authorizes a seal, segment, catalog, successor, registry state,
 or root. It is bounded transaction evidence used only for exact rollback or
-postcommit cleanup under the retained locks.
+postcommit cleanup under the retained locks. After Manifest V2 commits and the
+complete manifest/catalog/raw/segment/successor relation validates, that proof
+permits and requires idempotent removal of the exact predecessor active Journal
+V1, its predecessor checkpoint, and exact redundant transaction staging. It never
+permits removal of the retained raw-seal final or Published Native Segment V1
+final.
+
+`journal-rotation-v2.intent` remains present until predecessor and staging cleanup
+is proven complete. Cleanup removes the predecessor active journal, synchronizes
+the directory, removes its checkpoint, synchronizes the directory, removes exact
+redundant transaction staging in publication order—raw seal, segment, catalog,
+then manifest—synchronizing the directory after each present removal, and proves
+the clean committed inventory before removing the intent last and synchronizing
+the directory again. Every present staging artifact must exact-match its
+intent/root derivative before removal. Repetition after a crash is idempotent only
+when the committed root and still-present intent prove the exact cleanup prefix.
+If the intent is absent while predecessor or staging evidence remains, or any
+relation is ambiguous, open refuses unchanged rather than guessing. An absent
+intent is canonical only with the exact already-clean committed inventory.
 
 ## Authority boundary
 
