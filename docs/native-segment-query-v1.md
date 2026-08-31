@@ -9,10 +9,31 @@ existing canonical `TimeInterval`, and requests a positive result limit. Zero an
 limits above `MAX_SEGMENT_QUERY_RESULTS_V1` refuse before segment inspection or
 result allocation; that constant is exactly 16.
 
-This contract does not open or build a store candidate. It performs no filesystem
-I/O, runtime command, raw-Journal fallback, generation merge, or durable segment
-lookup. Unvalidated bytes must first pass `parse_segment_v1`; malformed bytes
-therefore never gain a public query path.
+The parsed-view method itself does not open or build a store candidate and performs
+no filesystem I/O. Unvalidated bytes must first pass `parse_segment_v1`; malformed
+bytes therefore never gain a public query path. The separate store composition
+below reuses that exact parser and query and adds no alternate path.
+
+## Exact store composition
+
+`ManifestStore::query_sealed_generation_observations_v1` synchronously selects
+exactly the supplied generation through
+`ManifestStore::build_segment_candidate_v1`. Consequently only the authoritative
+committed Generation Catalog V1 entry can select a source: active, unknown,
+uncommitted, foreign, corrupt, excessive, missing, or unreadable evidence refuses
+without a raw-file or directory fallback.
+
+The method then parses the newly built current-V1 candidate with the same store
+identity and invokes `SegmentV1::query_observations_v1` with the caller's already
+validated query. `ManifestStoreSegmentQueryV1Error` preserves the exact
+`SegmentV1Error` from selection/build/parse or the exact
+`SegmentObservationQueryV1Error` from post-parse execution. The error sum, its
+accessors, and its display/source chain are closed, path-free, and content-free.
+
+Only `SegmentObservationQueryResultV1` leaves the method. Its copied entries and
+`Arc`-owned decoded admissions remain valid after the candidate bytes and borrowing
+parsed view drop. The composition creates no additional full source or candidate
+clone beyond the existing builder/parser path.
 
 ## Selection and ordering
 
@@ -69,11 +90,22 @@ filters with sparse or no matches may necessarily inspect the complete selected
 series slice. `D` frame decodes occur, where `D <= materialized results <= 16`.
 No work term includes unrelated series observations or frame decoding.
 
+Those result bounds do not bound the store composition's overall memory or
+latency. It performs a heavyweight synchronous full-generation sealed-source
+validation/read, candidate build, hostile parse, and query. At maximum current-V1
+bounds, simultaneous source/candidate/parser working memory can exceed 700 MB even
+when the query limit is one. Allocation exhaustion has no new typed pressure or
+recovery contract; no configurable budget or streaming path exists in this slice.
+
 ## Authority and deferrals
 
-Querying does not mutate candidate bytes or parsed directories and has no store,
-filesystem, manifest, catalog, registry, retry, latest, receipt, or runtime side
-effect. The sealed raw Journal V1 remains the sole durable authority. Durable
-segment publication/naming/sync/recovery, store query convenience, raw fallback,
-multi-generation merge, cursor pagination, gap/no-change results, retention,
-reclamation, compression, rollups, memory mapping, and adapters remain deferred.
+Querying does not mutate candidate bytes or parsed directories. The store
+composition reads only the selected committed sealed source and does not write,
+synchronize, rename, clean up, or mutate inventory, manifest, catalog, registry,
+retry, recovery, latest, receipt, or write-custody state. It remains available as
+read-side inspection while the live store requires validated reopen and does not
+reinterpret read failures as typed storage pressure. The sealed raw Journal V1
+remains the sole durable authority. Durable segment publication/naming/sync/
+recovery/authority, raw fallback, multi-generation merge, runtime query, cursor
+pagination, gap/no-change results, retention, reclamation, compression, rollups,
+memory mapping, and adapters remain deferred.

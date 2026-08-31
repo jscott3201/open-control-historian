@@ -347,6 +347,65 @@ impl fmt::Display for ManifestStoreError {
 
 impl Error for ManifestStoreError {}
 
+/// Closed path- and content-free refusal from one sealed-generation store query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManifestStoreSegmentQueryV1Error {
+    /// Candidate construction or hostile parsing refused exact segment evidence.
+    Segment(crate::SegmentV1Error),
+    /// Post-parse query execution found impossible inconsistent evidence.
+    Query(crate::SegmentObservationQueryV1Error),
+}
+
+impl ManifestStoreSegmentQueryV1Error {
+    /// Returns exact candidate-build or parse evidence when that stage refused.
+    #[must_use]
+    pub const fn segment_error(self) -> Option<crate::SegmentV1Error> {
+        match self {
+            Self::Segment(error) => Some(error),
+            Self::Query(_) => None,
+        }
+    }
+
+    /// Returns exact post-parse query evidence when that stage refused.
+    #[must_use]
+    pub const fn query_error(self) -> Option<crate::SegmentObservationQueryV1Error> {
+        match self {
+            Self::Segment(_) => None,
+            Self::Query(error) => Some(error),
+        }
+    }
+}
+
+impl fmt::Display for ManifestStoreSegmentQueryV1Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Segment(error) => error.fmt(formatter),
+            Self::Query(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ManifestStoreSegmentQueryV1Error {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Segment(error) => Some(error),
+            Self::Query(error) => Some(error),
+        }
+    }
+}
+
+impl From<crate::SegmentV1Error> for ManifestStoreSegmentQueryV1Error {
+    fn from(error: crate::SegmentV1Error) -> Self {
+        Self::Segment(error)
+    }
+}
+
+impl From<crate::SegmentObservationQueryV1Error> for ManifestStoreSegmentQueryV1Error {
+    fn from(error: crate::SegmentObservationQueryV1Error) -> Self {
+        Self::Query(error)
+    }
+}
+
 /// Additive path- and content-free classification of a store-open refusal.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1261,6 +1320,43 @@ impl ManifestStore {
             .map_err(|_| crate::SegmentV1Error::Bounds)?;
         let bytes = read_required_bounded(&path, maximum).map_err(map_segment_source_error)?;
         crate::build_segment_v1(self.current.cutoff.journal().store_id(), sealed, &bytes)
+    }
+
+    /// Queries one exact committed sealed generation through current-V1 segment proof.
+    ///
+    /// Selection uses only the committed Generation Catalog V1 path of
+    /// [`Self::build_segment_candidate_v1`]. The resulting candidate is parsed
+    /// with the same store identity and queried without any raw-file fallback or
+    /// generation merge. Returned entries and decoded admissions are owned;
+    /// candidate bytes and the borrowing parsed view are dropped before return.
+    ///
+    /// Result and decoded-cache allocation remain `O(query.limit())`, with a
+    /// fixed limit of at most 16. This bridge is nevertheless a heavyweight
+    /// synchronous full-generation read, candidate build, and hostile parse.
+    /// Its maximum source/candidate/parser working set can exceed 700 MB and
+    /// allocation exhaustion gains no typed recovery contract here.
+    ///
+    /// The operation is read-only and remains inspection-capable while write
+    /// custody requires reopen. It neither publishes durable segment authority
+    /// nor mutates inventory, manifest, catalog, registry, retry, recovery,
+    /// receipt, latest, or write-custody state.
+    ///
+    /// # Errors
+    ///
+    /// Preserves exact closed segment evidence for catalog selection, source
+    /// build, and hostile parse refusal, or exact query inconsistency evidence
+    /// after parsing.
+    pub fn query_sealed_generation_observations_v1(
+        &self,
+        journal_generation: u64,
+        query: &crate::SegmentObservationQueryV1,
+    ) -> Result<crate::SegmentObservationQueryResultV1, ManifestStoreSegmentQueryV1Error> {
+        let candidate = self.build_segment_candidate_v1(journal_generation)?;
+        let segment =
+            crate::parse_segment_v1(candidate.bytes(), self.current.cutoff.journal().store_id())?;
+        segment
+            .query_observations_v1(query)
+            .map_err(ManifestStoreSegmentQueryV1Error::Query)
     }
 
     /// Returns decoded journal evidence without granting registry authority.
@@ -6662,6 +6758,63 @@ mod tests {
         assert!(reopened.inspection().latest_recovery().is_some());
         drop(reopened);
         fs::remove_dir_all(directory).expect("remove active-pressure fixture");
+    }
+
+    #[test]
+    fn sealed_generation_query_remains_read_only_while_pressure_requires_reopen() {
+        let directory = test_directory(79);
+        let mut store = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create pressured-query store");
+        register_rotation_fixture(&mut store);
+        append_durable(&mut store, "sealed-query-source");
+        store.rotate().expect("seal pressured-query source");
+        let query = crate::SegmentObservationQueryV1::new(test_support::series_id(4), None, 1)
+            .expect("valid pressured store query");
+        assert!(
+            store
+                .query_sealed_generation_observations_v1(1, &query)
+                .expect("query sealed source before pressure")
+                .is_empty()
+        );
+
+        let admission = test_support::no_change_admission_with_retry_key("query-pressure");
+        let sequence = store.next_append_sequence().expect("pressure sequence");
+        let frame = PreparedAdmissionV1::new(admission)
+            .expect("pressure admission")
+            .into_frame(sequence)
+            .expect("pressure frame");
+        store
+            .journal
+            .inject_append_pressure(11, ErrorKind::StorageFull);
+        assert!(matches!(
+            store.append(&frame),
+            Err(ManifestStoreError::Active(
+                ActiveJournalError::StoragePressure(_)
+            ))
+        ));
+        let pressured = store.inspection();
+        let registry = store.registry_snapshot();
+        let retry = store.retry_state_snapshot();
+        let artifacts = directory_bytes(&directory);
+        assert_eq!(pressured.write_state(), StoreWriteState::ReopenRequired);
+
+        for _ in 0..2 {
+            assert!(
+                store
+                    .query_sealed_generation_observations_v1(1, &query)
+                    .expect("sealed inspection remains available in reopen custody")
+                    .is_empty()
+            );
+            assert_eq!(store.inspection(), pressured);
+            assert_eq!(store.registry_snapshot(), registry);
+            assert_eq!(store.retry_state_snapshot(), retry);
+            assert_eq!(directory_bytes(&directory), artifacts);
+        }
+        drop(store);
+        fs::remove_dir_all(directory).expect("remove pressured-query fixture");
     }
 
     #[test]

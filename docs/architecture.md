@@ -21,7 +21,9 @@ M02-PR03b2 projects that custody into one bounded fail-stop runtime lifecycle.
 M03-PR01a adds one bounded offline Native Segment V1 candidate derived from one
 committed sealed raw generation without changing durable store authority.
 M03-PR02a adds one hard-bounded current-only observation query over an already
-hostile-validated in-memory candidate.
+hostile-validated in-memory candidate. M03-PR02b adds one synchronous read-only
+`ManifestStore` bridge that composes those proofs for exactly one committed sealed
+raw generation.
 Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
@@ -179,10 +181,16 @@ raw generation into SeriesId-ascending blocks, adds a strict global append
 directory and canonical recent-observation indexes, and reconstructs source
 length/checksum during parse. The read-only store bridge selects only committed
 catalog evidence and never adds an inventory artifact or durable reference.
-Segment decode remains non-authorizing; durable publication, durable query, and
-reclamation remain absent. The in-memory parsed view alone supports an exact
-one-series, optional-effective-time, recent-first result of at most 16
-observations without cursor or store/runtime integration. The store still owns no
+It can now build, hostile-parse, and query that exact selected generation, returning
+only the owned bounded non-authorizing result without fallback or merge. Segment
+decode remains non-authorizing; durable segment publication/query authority and
+reclamation remain absent. Both the parsed view and this one-generation store
+composition support an exact one-series, optional-effective-time, recent-first
+result of at most 16 observations without cursor or runtime integration. Result
+and decoded-cache allocation are `O(limit)`, but the synchronous store composition
+fully reads/builds/parses one generation and can transiently require more than
+700 MB at maximum bounds; allocation exhaustion has no typed recovery contract.
+The store still owns no
 broad repair, latest projection, stale-restore custody, runtime degraded mode, or
 durable query integration.
 At a store-owned create/write/resize/truncate/sync/rename/publish/remove boundary,
@@ -341,8 +349,8 @@ evidence rather than graceful or generic success.
 
 There is currently no async/blocking admission wait, eviction, subscription/wait
 API, mutable read guard, durable segment publication/authority, durable
-sealed-history query
-API, retention/reclamation, unbounded/time-based retry, manifest-backed latest
+segment-backed query authority, multi-generation or runtime historical query API,
+retention/reclamation, unbounded/time-based retry, manifest-backed latest
 reconstruction, broad repair or stale-restore event model, pressure retry/clear,
 continued degraded ingress, query
 engine, network service, SQL layer, cloud/object provider, embedded database,
@@ -378,4 +386,6 @@ Store-only pressure custody and its runtime-policy handoff are recorded by
 lifecycle is recorded by [M02-PR03b2](continuation-m02-pr03b2.md).
 The exact offline Native Segment V1 foundation and its publication/query/reclamation
 hard stop are recorded by [M03-PR01a](continuation-m03-pr01a.md). The bounded
-in-memory query successor is recorded by [M03-PR02a](continuation-m03-pr02a.md).
+in-memory query successor is recorded by [M03-PR02a](continuation-m03-pr02a.md),
+and its one-generation read-only store composition is recorded by
+[M03-PR02b](continuation-m03-pr02b.md).

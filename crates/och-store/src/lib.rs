@@ -13,8 +13,10 @@
 //! volatile reopen custody without changing durable formats. One committed sealed
 //! generation can also produce a bounded in-memory Native Segment V1 candidate
 //! with non-authorizing indexes. An already parsed candidate supports one bounded
-//! one-series recent-observation query. The crate owns no runtime scheduling,
-//! degraded policy, durable segment publication/query authority, or reclamation.
+//! one-series recent-observation query; a synchronous read-only store bridge
+//! composes those exact proofs for one catalog-committed sealed generation. The
+//! crate owns no runtime scheduling, degraded policy, durable segment publication
+//! or query authority, multi-generation query, or reclamation.
 
 mod active;
 mod codec;
@@ -56,11 +58,11 @@ pub use manifest::{
     MAX_PERSISTED_REGISTRY_REVISIONS, MAX_PERSISTED_REGISTRY_SERIES, MAX_REGISTRY_SNAPSHOT_BYTES,
     ManifestCommit, ManifestIoEvidence, ManifestIoOperation, ManifestOpenClassification,
     ManifestStore, ManifestStoreConfig, ManifestStoreError, ManifestStoreInspection,
-    REGISTRY_SLOT_0_FILE_NAME, REGISTRY_SLOT_1_FILE_NAME, REGISTRY_SLOT_2_FILE_NAME,
-    REGISTRY_STAGING_FILE_NAME, RETRY_SLOT_0_FILE_NAME, RETRY_SLOT_1_FILE_NAME,
-    RETRY_SLOT_2_FILE_NAME, RETRY_STAGING_FILE_NAME, RegistryPersistenceOptions,
-    STORE_FORMAT_FILE_NAME, STORE_FORMAT_LEN, STORE_FORMAT_MAGIC, STORE_FORMAT_STAGING_FILE_NAME,
-    STORE_FORMAT_VERSION, STORE_LOCK_FILE_NAME,
+    ManifestStoreSegmentQueryV1Error, REGISTRY_SLOT_0_FILE_NAME, REGISTRY_SLOT_1_FILE_NAME,
+    REGISTRY_SLOT_2_FILE_NAME, REGISTRY_STAGING_FILE_NAME, RETRY_SLOT_0_FILE_NAME,
+    RETRY_SLOT_1_FILE_NAME, RETRY_SLOT_2_FILE_NAME, RETRY_STAGING_FILE_NAME,
+    RegistryPersistenceOptions, STORE_FORMAT_FILE_NAME, STORE_FORMAT_LEN, STORE_FORMAT_MAGIC,
+    STORE_FORMAT_STAGING_FILE_NAME, STORE_FORMAT_VERSION, STORE_LOCK_FILE_NAME,
 };
 pub use pressure::StoreWriteState;
 pub use recovery::{

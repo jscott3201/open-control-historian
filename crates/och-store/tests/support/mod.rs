@@ -362,6 +362,30 @@ pub fn observed_admission_with_lineage_ordinal(ordinal: u8) -> CanonicalAdmissio
     )
 }
 
+pub fn observed_admission_with_query_evidence(
+    values: Vec<ExactValue>,
+    family: ValueFamily,
+    first_observation_number: u64,
+    first_lineage_ordinal: u8,
+    retry_key: &str,
+) -> CanonicalAdmission {
+    let observations = values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| observation(first_observation_number + index as u64, value, true))
+        .collect();
+    observed_admission_from_observations_with_ordinal_and_retry_key(
+        observations,
+        family,
+        0,
+        false,
+        series_id(2),
+        producer_id(3),
+        first_lineage_ordinal,
+        retry_key,
+    )
+}
+
 fn observed_admission_from_observations(
     observations: Vec<Observation>,
     family: ValueFamily,
@@ -389,6 +413,29 @@ fn observed_admission_from_observations_with_ordinal(
     series: SeriesId,
     producer: ProducerId,
     first_ordinal: u8,
+) -> CanonicalAdmission {
+    observed_admission_from_observations_with_ordinal_and_retry_key(
+        observations,
+        family,
+        gap_count,
+        revised,
+        series,
+        producer,
+        first_ordinal,
+        "historian-request",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observed_admission_from_observations_with_ordinal_and_retry_key(
+    observations: Vec<Observation>,
+    family: ValueFamily,
+    gap_count: usize,
+    revised: bool,
+    series: SeriesId,
+    producer: ProducerId,
+    first_ordinal: u8,
+    retry_key: &str,
 ) -> CanonicalAdmission {
     let gaps: Vec<_> = (0..gap_count)
         .map(|index| {
@@ -439,7 +486,7 @@ fn observed_admission_from_observations_with_ordinal(
         .collect();
     CanonicalAdmission::observed(
         registry_bound(envelope, family, revised),
-        retry(series, producer),
+        retry_with_key(series, producer, retry_key),
         batch(SourceIntervalKind::Observed),
         lifecycle(),
         contexts,

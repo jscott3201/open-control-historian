@@ -188,4 +188,7 @@ state. Candidate bytes remain outside the recognized store inventory.
 
 Query execution is not part of this byte format. The current-only bounded query
 contract is defined separately in
-[Native Segment V1 observation query](native-segment-query-v1.md).
+[Native Segment V1 observation query](native-segment-query-v1.md). Its read-only
+store composition reuses this exact builder and the hostile parser for one
+catalog-committed generation, returns only an owned transient non-authorizing
+result, and changes no format byte or durable authority.
