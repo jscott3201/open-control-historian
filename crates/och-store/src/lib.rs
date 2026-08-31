@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
-//! Bounded Journal V1 framing and one blocking active-journal owner.
+//! Bounded Journal V1 storage and offline Native Segment V1 candidates.
 //!
 //! The crate encodes already-authorized [`och_core::CanonicalAdmission`] values
 //! and decodes hostile bytes into non-authorizing inspection records. Its
@@ -10,8 +10,10 @@
 //! sealing, successor rotation, and a manifest-backed durable cutoff. The crate
 //! also owns one manifest-rooted conservative terminal-suffix recovery event.
 //! Store-owned mutation boundaries report typed storage pressure and retain
-//! volatile reopen custody without changing durable formats. The crate owns no
-//! runtime scheduling, degraded policy, final segment encoding, or query behavior.
+//! volatile reopen custody without changing durable formats. One committed sealed
+//! generation can also produce a bounded in-memory Native Segment V1 candidate
+//! with non-authorizing indexes. The crate owns no runtime scheduling, degraded
+//! policy, segment publication/authority, reclamation, or query behavior.
 
 mod active;
 mod codec;
@@ -22,6 +24,7 @@ mod manifest;
 mod pressure;
 mod recovery;
 mod retry;
+mod segment;
 
 #[cfg(test)]
 #[path = "../tests/support/mod.rs"]
@@ -68,6 +71,13 @@ pub use retry::{
     MAX_PERSISTED_RETRY_ENTRIES, MAX_RETRY_STATE_BYTES, PendingRetryOutcome, RetryGuardEntry,
     RetryOptionsError, RetryPersistenceOptions, RetryReplayOutcome, RetryStateMatch,
     RetryStateReference, RetryStateSnapshot,
+};
+pub use segment::{
+    MAX_SEGMENT_V1_BYTES, MAX_SEGMENT_V1_OBSERVATIONS, MAX_SEGMENT_V1_SERIES, PreparedSegmentV1,
+    SEGMENT_V1_APPEND_ENTRY_LEN, SEGMENT_V1_CRC_LEN, SEGMENT_V1_HEADER_LEN, SEGMENT_V1_MAGIC,
+    SEGMENT_V1_OBSERVATION_ENTRY_LEN, SEGMENT_V1_SERIES_ENTRY_LEN, SEGMENT_V1_VERSION,
+    SegmentAppendEntryV1, SegmentObservationEntryV1, SegmentSeriesEntryV1, SegmentV1,
+    SegmentV1Error, SegmentV1Inspection, build_segment_v1, parse_segment_v1,
 };
 
 /// Journal V1 format version written in every header and admission frame.

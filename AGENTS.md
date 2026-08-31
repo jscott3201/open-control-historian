@@ -31,7 +31,9 @@ current-V1 conservative recovery transaction. M02-PR03b1 adds deterministic
 store logical preflight, typed observed storage pressure, and sticky volatile
 reopen custody to direct active journals and composed manifest stores. M02-PR03b2
 projects that already-typed pressure into sticky bounded runtime evidence,
-fail-stop health, and reaper-joined pressure shutdown. `och-runtime` depends
+fail-stop health, and reaper-joined pressure shutdown. M03-PR01a adds one
+dependency-free, bounded, offline Native Segment V1 candidate with exact
+complete-frame fidelity and non-authorizing indexes. `och-runtime` depends
 inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05
 `CanonicalAdmission` evidence, reserves exact encoded bytes before allocation,
@@ -79,8 +81,8 @@ committed report is durable event history and never registry, retry, latest,
 receipt, or declaration authority. Runtime pressure is fail-stop: first evidence
 wins, unresolved receipt stages stop, future latest capture becomes unavailable,
 and consuming shutdown waits for the fixed reaper before returning that evidence.
-Final native segments, retention/reclamation, unbounded or time-based retry,
-query, adapters, manifest-backed latest projection, pressure retry/clear or
+Durable segment publication/authority, retention/reclamation, unbounded or
+time-based retry, query, adapters, manifest-backed latest projection, pressure retry/clear or
 continued degraded ingress, stale-restore custody, and broad repair remain absent.
 Published observations never imply current or held values.
 

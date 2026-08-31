@@ -18,6 +18,8 @@ M02-PR03a adds a manifest-rooted transaction that reports and removes only one
 proven terminal invalid/torn active suffix. M02-PR03b1 adds store-only logical
 transaction preflight plus typed observed pressure and sticky reopen custody.
 M02-PR03b2 projects that custody into one bounded fail-stop runtime lifecycle.
+M03-PR01a adds one bounded offline Native Segment V1 candidate derived from one
+committed sealed raw generation without changing durable store authority.
 Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
@@ -169,8 +171,15 @@ at EOF. Recovery publishes its report, truncates and synchronizes exactly to the
 unchanged manifest/checkpoint cutoff, then commits an otherwise byte-identical
 next manifest. A valid post-root frame, valid-plus-torn bytes, later candidate
 bytes, identity/sequence mismatch, interior corruption, or ambiguity refuses
-unchanged. `och-store` still owns no final native segment encoding, broad repair,
-reclamation, latest projection, stale-restore custody, runtime degraded mode, or query behavior.
+unchanged. `och-store` also owns exact Native Segment V1 candidate bytes and
+hostile parsing. One candidate groups unchanged complete frames from one sealed
+raw generation into SeriesId-ascending blocks, adds a strict global append
+directory and canonical recent-observation indexes, and reconstructs source
+length/checksum during parse. The read-only store bridge selects only committed
+catalog evidence and never adds an inventory artifact or durable reference.
+Segment decode remains non-authorizing; durable publication, query, and
+reclamation remain absent. The store still owns no broad repair, latest
+projection, stale-restore custody, runtime degraded mode, or query behavior.
 At a store-owned create/write/resize/truncate/sync/rename/publish/remove boundary,
 only `StorageFull` and `QuotaExceeded` are typed as pressure. The first such live
 failure makes the direct active journal or composed manifest store require reopen;
@@ -181,8 +190,9 @@ current conservative PR03a path.
 Exact contracts are in [Store Format V1](store-format-v1.md),
 [Manifest V1](manifest-v1-format.md), [Retry State V1](retry-state-v1-format.md),
 [Generation Catalog V1](generation-catalog-v1-format.md),
-[sealed raw Journal V1](sealed-journal-v1-format.md), and
-[Recovery State V1](recovery-state-v1-format.md).
+[sealed raw Journal V1](sealed-journal-v1-format.md),
+[Recovery State V1](recovery-state-v1-format.md), and
+[Native Segment V1](native-segment-v1-format.md).
 
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`
@@ -325,7 +335,7 @@ evidence rather than graceful or generic success.
 ## Intentionally absent
 
 There is currently no async/blocking admission wait, eviction, subscription/wait
-API, mutable read guard, final native segment format, sealed-history read/query
+API, mutable read guard, durable segment publication/authority, sealed-history query
 API, retention/reclamation, unbounded/time-based retry, manifest-backed latest
 reconstruction, broad repair or stale-restore event model, pressure retry/clear,
 continued degraded ingress, query
@@ -360,3 +370,5 @@ recorded by [M02-PR03a](continuation-m02-pr03a.md).
 Store-only pressure custody and its runtime-policy handoff are recorded by
 [M02-PR03b1](continuation-m02-pr03b1.md). The bounded fail-stop runtime pressure
 lifecycle is recorded by [M02-PR03b2](continuation-m02-pr03b2.md).
+The exact offline Native Segment V1 foundation and its publication/query/reclamation
+hard stop are recorded by [M03-PR01a](continuation-m03-pr01a.md).

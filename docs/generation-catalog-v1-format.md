@@ -2,7 +2,8 @@
 
 Generation Catalog V1 is the bounded Manifest V1 authority for immutable sealed
 raw-Journal generations. It is not a directory listing, recovery event log, or
-retention index. `och-store` is its sole mutator. All integers are big-endian and
+retention index. It contains no Native Segment V1 candidate reference; derived
+candidate bytes remain offline and non-authorizing. `och-store` is its sole mutator. All integers are big-endian and
 all checksums use the Journal V1 CRC-32C parameters.
 
 ## Artifacts and bound
