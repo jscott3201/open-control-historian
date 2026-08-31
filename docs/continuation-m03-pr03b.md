@@ -64,10 +64,12 @@ authority.
 ## Implementation hard stop and successor handoff
 
 The existing in-memory segment builder can exceed 700 MB and is not authorized on
-the sole-writer path. Implementation requires a separately reviewed bounded
-streaming/multipass plan with fixed buffer/index/workspace limits, an exact peak
-resident-memory bound, writer-delay and eager-open latency evidence, complete
-fault injection, and owner approval. Numeric budgets and SLOs remain `UNKNOWN`.
+the sole-writer path. M03-PR03c supplies a separately reviewed tooling-only
+streaming/multipass prototype with a 160 MiB target and zero external sort
+workspace, but it is not native integration or Linux acceptance. Implementation
+still requires Linux x86_64 maximum-bound memory and latency evidence, complete
+native fault injection, and fresh owner approval. Writer/open SLOs remain
+`UNKNOWN`; see the [M03-PR03c resource plan](m03-pr03c-segment-resource-plan.md).
 
 The required future implementation matrix is recorded in the
 [M03-PR03b implementation brief](implementation-brief-m03-pr03b.md). This docs PR

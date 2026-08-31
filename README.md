@@ -36,7 +36,11 @@ M03-PR03b adds a documentation-only review barrier for a future new-store Store
 Format V2 that would require the unchanged raw-frame Native Segment V1 on every
 nonempty rotation. It adds no implementation: current code remains Store Format
 V1-only and continues to reject all proposed V2 names and bytes. Future work is
-blocked on a separately reviewed bounded streaming resource and latency plan.
+blocked on Linux x86_64 maximum-bound evidence and a fresh owner checkpoint.
+M03-PR03c supplies the private tooling-only streaming/multipass resource prototype,
+deterministic fixtures, checked 160 MiB/zero-external-sort ledger, and measurement
+protocol. It changes no native behavior or durable format; Darwin measurements
+are exploratory and writer/open latency ceilings remain unknown.
 
 ## Current status
 
@@ -122,6 +126,7 @@ The current workspace contains:
 | [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, durable retry replay/guard classification, automatic safe-boundary rotation, recovery/pressure inspection, writer-serialized registry control, manifest-backed receipts, and volatile latest snapshots |
 | [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, Native Segment V1 candidates and one-generation read-only observation query, conservative terminal-suffix recovery, typed pressure/reopen custody, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
+| [`och-v2-evidence`](tools/och-v2-evidence/) | tooling | Private exact Native Segment V1 streaming/resource evidence and measurement CLI |
 
 `och-core` has no dependencies. `och-store` depends inward on `och-core`, and
 `och-runtime` depends inward on both. The
@@ -129,7 +134,8 @@ only forbidden-dependency exception remains the direct `och-runtime -> tokio`
 edge with Tokio default features disabled and only `rt` and `sync`. Because core
 is shared, the union native closure is three roots and five packages:
 `och-core`, `och-runtime`, `och-store`, `tokio`, and `pin-project-lite`.
-`och-policy` and its dependencies are tooling excluded from defaults.
+`och-policy`, `och-v2-evidence`, and their tooling-only dependencies are excluded
+from defaults and the native product closure.
 
 ## Toolchain and checks
 
@@ -270,6 +276,11 @@ through nextest rather than being repeated with `cargo test`.
   [continuation](docs/continuation-m03-pr03b.md) record the single-writer
   transaction, fail-closed open law, implementation hard stop, and required
   future evidence matrix.
+- [M03-PR03c resource plan](docs/m03-pr03c-segment-resource-plan.md),
+  [implementation brief](docs/implementation-brief-m03-pr03c.md), and
+  [continuation](docs/continuation-m03-pr03c.md) record the tooling-only exact
+  streaming prototype, controlled-memory ledger, measurement protocol, and
+  still-mandatory Linux/owner hard stop.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

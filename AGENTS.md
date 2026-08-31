@@ -44,6 +44,11 @@ M03-PR03b adds only a checked-in Store Format V2 design/authority review barrier
 for future mandatory publication of the unchanged raw-frame Native Segment V1 on
 every nonempty rotation. It adds no implementation or accepted durable byte;
 current product authority remains Store Format V1-only.
+M03-PR03c adds only a private tooling streaming/multipass prototype, checked
+resource ledger, deterministic fixtures, and exploratory measurement protocol for
+the unchanged Native Segment V1. Its 160 MiB target and zero external-sort plan do
+not authorize V2 product code; Linux x86_64 maximum-bound evidence, unknown
+latency review, and a fresh owner checkpoint still block implementation.
 `och-runtime` depends
 inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05

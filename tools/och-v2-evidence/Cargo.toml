@@ -1,0 +1,20 @@
+[package]
+name = "och-v2-evidence"
+description = "Private bounded-resource evidence tool for unchanged Native Segment V1 bytes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata.och]
+role = "tooling"
+
+[dependencies]
+och-core = { version = "=0.0.0", path = "../../crates/och-core" }
+och-store = { version = "=0.0.0", path = "../../crates/och-store" }
+
+[lints]
+workspace = true
