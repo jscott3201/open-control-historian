@@ -30,6 +30,9 @@ M03-PR03b adds only a documentation review barrier for a future new-store Store
 Format V2 that would publish the unchanged raw-frame Native Segment V1 beside
 every retained raw seal. Current topology and authority remain Store Format
 V1-only; no proposed V2 name or byte is accepted today.
+M03-PR03c adds a separate private tooling-only exact streaming/resource prototype
+and measurement protocol. It is not on a native call path, changes no current
+format, and leaves V2 implementation blocked on Linux evidence and owner review.
 Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
@@ -48,6 +51,7 @@ default workspace selection
   tokio rt + sync only
 
   och-policy (tooling): cargo_metadata + parsing support
+  och-v2-evidence (tooling): std + inward och-store/och-core evidence only
 ```
 
 [`och-core`](../crates/och-core/) owns exact platform-independent contracts for
@@ -226,6 +230,12 @@ The separately reviewed but unimplemented future authority is defined by
 the full workspace so clippy and tests cover it, while root `default-members`
 selects all three native roots and no tooling. Consequently the tool's Cargo
 metadata/parsing dependencies do not masquerade as native product dependencies.
+
+[`och-v2-evidence`](../tools/och-v2-evidence/) is likewise private tooling outside
+defaults and the product closure. It depends inward only on `och-store` and
+`och-core`, duplicates exact Segment V1 emission for resource evidence, and uses
+no external sort workspace or product authority name. Its standalone RSS and
+latency observations cannot establish native writer/open behavior.
 
 ## Direction and ownership
 
@@ -408,4 +418,5 @@ evidence and its no-format boundary are recorded by
 [M03-PR03a](continuation-m03-pr03a.md). The future Store Format V2 publication
 contract, fail-closed relationship, and bounded-resource implementation hard stop
 are recorded by [M03-PR03b](continuation-m03-pr03b.md); they do not change the
-current implemented topology.
+current implemented topology. The tooling-only resource successor and remaining
+Linux/owner stop are recorded by [M03-PR03c](continuation-m03-pr03c.md).

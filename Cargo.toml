@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/och-core", "crates/och-runtime", "crates/och-store", "tools/och-policy"]
+members = [
+    "crates/och-core",
+    "crates/och-runtime",
+    "crates/och-store",
+    "tools/och-policy",
+    "tools/och-v2-evidence",
+]
 default-members = ["crates/och-core", "crates/och-runtime", "crates/och-store"]
 
 [workspace.package]
@@ -46,7 +52,7 @@ strip = false
 schema = 2
 native-packages = ["och-core", "och-runtime", "och-store"]
 adapter-packages = []
-tool-packages = ["och-policy"]
+tool-packages = ["och-policy", "och-v2-evidence"]
 dependency-free-native-packages = ["och-core"]
 forbidden-dependency-exceptions = [
     { source = "och-runtime", target = "tokio", default-features = false, features = ["rt", "sync"] },
