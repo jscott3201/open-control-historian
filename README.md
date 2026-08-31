@@ -24,6 +24,10 @@ hard-bounded, recent-first observation query for an exact series and optional
 canonical effective-time interval. A synchronous read-only `ManifestStore`
 method composes that builder, parser, and query for exactly one catalog-committed
 sealed generation and returns only the owned non-authorizing result. It does
+not consume the separate M03-PR03a transient typed-value block evidence. That
+proof exists only in `och-store` crate tests and covers exact raw values plus
+deterministic Boolean bit-pack/RLE selection; it is not a product API, persisted
+format, Native Segment V1 byte, or compatibility promise. The store does
 **not** provide durable segment publication/authority, runtime or
 multiple-generation historical query, retention/reclamation, unbounded or
 time-based retry, or current/held-value behavior.
@@ -246,6 +250,10 @@ through nextest rather than being repeated with `cargo test`.
   [continuation](docs/continuation-m03-pr02b.md) record the exact one-generation
   read-only store bridge, heavyweight bounds, refusal evidence, and remaining
   durable-authority/runtime/multi-generation boundary.
+- [M03-PR03a implementation brief](docs/implementation-brief-m03-pr03a.md),
+  [proof contract](docs/typed-value-block-codec-proof.md), and
+  [continuation](docs/continuation-m03-pr03a.md) record private transient exact
+  raw/Boolean codec evidence and its strict no-product/no-format boundary.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

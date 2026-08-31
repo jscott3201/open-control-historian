@@ -36,7 +36,10 @@ dependency-free, bounded, offline Native Segment V1 candidate with exact
 complete-frame fidelity and non-authorizing indexes. M03-PR02a adds one bounded
 current-only observation query over an already parsed in-memory candidate.
 M03-PR02b composes those proofs into one synchronous read-only query of exactly
-one catalog-committed sealed raw-Journal generation.
+one catalog-committed sealed raw-Journal generation. M03-PR03a adds only a
+private crate-test transient typed-value block codec proof: exact raw coverage for
+all current value families plus bounded Boolean bit-pack/RLE selection. It is not
+a product API, durable format, Native Segment V1 change, or compatibility promise.
 `och-runtime` depends
 inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05
