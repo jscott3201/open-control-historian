@@ -29,7 +29,9 @@ the durable-format reset makes each artifact family current-only V1 behind a
 fixed Store Format V1 epoch marker, and M02-PR03a adds one manifest-rooted
 current-V1 conservative recovery transaction. M02-PR03b1 adds deterministic
 store logical preflight, typed observed storage pressure, and sticky volatile
-reopen custody to direct active journals and composed manifest stores. `och-runtime` depends
+reopen custody to direct active journals and composed manifest stores. M02-PR03b2
+projects that already-typed pressure into sticky bounded runtime evidence,
+fail-stop health, and reaper-joined pressure shutdown. `och-runtime` depends
 inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05
 `CanonicalAdmission` evidence, reserves exact encoded bytes before allocation,
@@ -74,9 +76,12 @@ per generation. Recovery removes and synchronizes only a proven terminal
 invalid/torn suffix beyond the selected manifest cutoff after all authority is
 validated; valid post-root frames and ambiguity refuse unchanged. The latest
 committed report is durable event history and never registry, retry, latest,
-receipt, or declaration authority. Final native segments, retention/reclamation,
-unbounded or time-based retry, query, adapters, manifest-backed latest projection,
-runtime degraded/latest/receipt pressure policy, stale-restore custody, and broad repair remain absent.
+receipt, or declaration authority. Runtime pressure is fail-stop: first evidence
+wins, unresolved receipt stages stop, future latest capture becomes unavailable,
+and consuming shutdown waits for the fixed reaper before returning that evidence.
+Final native segments, retention/reclamation, unbounded or time-based retry,
+query, adapters, manifest-backed latest projection, pressure retry/clear or
+continued degraded ingress, stale-restore custody, and broad repair remain absent.
 Published observations never imply current or held values.
 
 The ignored `_roadmap/` directory is local and unpublished.

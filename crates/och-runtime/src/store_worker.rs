@@ -9,11 +9,14 @@ use och_core::{
 };
 use och_store::{
     ActiveJournalError, ActiveJournalInspection, ActiveJournalLimits, ActiveJournalOpenMode,
-    GenerationInventory, ManifestCommit, ManifestStore, ManifestStoreConfig, ManifestStoreError,
-    ManifestStoreInspection, PendingRetryOutcome, PreparedAdmissionV1, RecoveredAdmissionV1,
-    RecoveryReport, RegistryPersistenceOptions, RetryPersistenceOptions, RetryStateSnapshot,
+    GenerationInventory, ManifestCommit, ManifestIoEvidence, ManifestIoOperation, ManifestStore,
+    ManifestStoreConfig, ManifestStoreError, ManifestStoreInspection, PendingRetryOutcome,
+    PreparedAdmissionV1, RecoveredAdmissionV1, RecoveryReport, RegistryPersistenceOptions,
+    RetryPersistenceOptions, RetryStateSnapshot, StoreIoEvidence, StoreIoOperation,
+    StoreWriteState,
 };
 use std::fmt;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
@@ -95,6 +98,8 @@ pub struct StoreOptions {
     retry: RetryPersistenceOptions,
     #[cfg(test)]
     cleanup_on_reap: bool,
+    #[cfg(test)]
+    pressure_hook: Option<TestPressureHook>,
 }
 
 impl StoreOptions {
@@ -141,6 +146,8 @@ impl StoreOptions {
             retry,
             #[cfg(test)]
             cleanup_on_reap: false,
+            #[cfg(test)]
+            pressure_hook: None,
         })
     }
 
@@ -201,6 +208,94 @@ impl StoreOptions {
     pub(crate) fn with_test_cleanup(mut self) -> Self {
         self.cleanup_on_reap = true;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_pressure(mut self, hook: TestPressureHook) -> Self {
+        self.pressure_hook = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn take_test_pressure(&mut self, boundary: TestPressureBoundary) -> Option<TestPressureHook> {
+        let hook = self.pressure_hook.as_mut()?;
+        if hook.boundary != boundary {
+            return None;
+        }
+        if hook.skip > 0 {
+            hook.skip -= 1;
+            return None;
+        }
+        self.pressure_hook.take()
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TestPressureBoundary {
+    Append,
+    Flush,
+    Registry,
+}
+
+#[cfg(test)]
+pub(crate) struct TestPressureHook {
+    boundary: TestPressureBoundary,
+    skip: usize,
+    evidence: RuntimePressureEvidence,
+    fired: Arc<AtomicBool>,
+    release: Option<Receiver<()>>,
+}
+
+#[cfg(test)]
+pub(crate) struct TestPressureControl {
+    fired: Arc<AtomicBool>,
+    release: Option<SyncSender<()>>,
+}
+
+#[cfg(test)]
+impl TestPressureHook {
+    pub(crate) fn new(
+        boundary: TestPressureBoundary,
+        skip: usize,
+        evidence: RuntimePressureEvidence,
+        hold_after_response: bool,
+    ) -> (Self, TestPressureControl) {
+        let fired = Arc::new(AtomicBool::new(false));
+        let (release, wait) = std::sync::mpsc::sync_channel(0);
+        (
+            Self {
+                boundary,
+                skip,
+                evidence,
+                fired: Arc::clone(&fired),
+                release: hold_after_response.then_some(wait),
+            },
+            TestPressureControl {
+                fired,
+                release: hold_after_response.then_some(release),
+            },
+        )
+    }
+
+    fn after_response(self) {
+        self.fired.store(true, Ordering::Release);
+        if let Some(release) = self.release {
+            let _ = release.recv();
+        }
+    }
+}
+
+#[cfg(test)]
+impl TestPressureControl {
+    pub(crate) fn fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn release(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
     }
 }
 
@@ -325,6 +420,115 @@ impl fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
+/// Store-owned family that reported runtime storage pressure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimePressureSource {
+    /// The active journal or its mechanical checkpoint reported pressure.
+    ActiveJournal,
+    /// The composed manifest, registry, retry, catalog, or recovery layer reported pressure.
+    ManifestStore,
+}
+
+/// Existing store operation attached to runtime pressure evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimePressureOperation {
+    /// Active-journal operation evidence.
+    ActiveJournal(StoreIoOperation),
+    /// Composed manifest-store operation evidence.
+    ManifestStore(ManifestIoOperation),
+}
+
+/// Bounded path- and content-free evidence for the first runtime pressure event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimePressureEvidence {
+    source: RuntimePressureSource,
+    operation: RuntimePressureOperation,
+    kind: ErrorKind,
+    raw_os_error: Option<i32>,
+}
+
+impl RuntimePressureEvidence {
+    const fn from_active(evidence: StoreIoEvidence) -> Self {
+        Self {
+            source: RuntimePressureSource::ActiveJournal,
+            operation: RuntimePressureOperation::ActiveJournal(evidence.operation()),
+            kind: evidence.kind(),
+            raw_os_error: evidence.raw_os_error(),
+        }
+    }
+
+    const fn from_manifest(evidence: ManifestIoEvidence) -> Self {
+        Self {
+            source: RuntimePressureSource::ManifestStore,
+            operation: RuntimePressureOperation::ManifestStore(evidence.operation()),
+            kind: evidence.kind(),
+            raw_os_error: evidence.raw_os_error(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_active_parts(
+        operation: StoreIoOperation,
+        kind: ErrorKind,
+        raw_os_error: Option<i32>,
+    ) -> Self {
+        Self {
+            source: RuntimePressureSource::ActiveJournal,
+            operation: RuntimePressureOperation::ActiveJournal(operation),
+            kind,
+            raw_os_error,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_manifest_parts(
+        operation: ManifestIoOperation,
+        kind: ErrorKind,
+        raw_os_error: Option<i32>,
+    ) -> Self {
+        Self {
+            source: RuntimePressureSource::ManifestStore,
+            operation: RuntimePressureOperation::ManifestStore(operation),
+            kind,
+            raw_os_error,
+        }
+    }
+
+    pub(crate) fn project(error: ManifestStoreError) -> Option<Self> {
+        match error {
+            ManifestStoreError::StoragePressure(evidence) => Some(Self::from_manifest(evidence)),
+            ManifestStoreError::Active(ActiveJournalError::StoragePressure(evidence)) => {
+                Some(Self::from_active(evidence))
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the store-owned source family.
+    #[must_use]
+    pub const fn source(self) -> RuntimePressureSource {
+        self.source
+    }
+
+    /// Returns the exact existing store operation.
+    #[must_use]
+    pub const fn operation(self) -> RuntimePressureOperation {
+        self.operation
+    }
+
+    /// Returns the standard-library error kind retained by the store.
+    #[must_use]
+    pub const fn kind(self) -> ErrorKind {
+        self.kind
+    }
+
+    /// Returns optional platform-native error evidence.
+    #[must_use]
+    pub const fn raw_os_error(self) -> Option<i32> {
+        self.raw_os_error
+    }
+}
+
 /// Coarse sanitized runtime health.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeHealth {
@@ -332,6 +536,8 @@ pub enum RuntimeHealth {
     Healthy,
     /// Active size, record, or session-age policy requires a future successor.
     RotationRequired,
+    /// A store-owned mutating boundary observed storage pressure.
+    StoragePressure,
     /// The writer stopped on a terminal fault.
     Faulted,
     /// Graceful shutdown completed.
@@ -345,6 +551,8 @@ pub struct RuntimeInspection {
     committed: ManifestCommit,
     generations: GenerationInventory,
     recovery: Option<RecoveryReport>,
+    write_state: StoreWriteState,
+    pressure_evidence: Option<RuntimePressureEvidence>,
     pending_count: usize,
     pending_bytes: usize,
     health: RuntimeHealth,
@@ -378,6 +586,18 @@ impl RuntimeInspection {
         self.recovery
     }
 
+    /// Returns composed manifest-store write custody.
+    #[must_use]
+    pub const fn write_state(self) -> StoreWriteState {
+        self.write_state
+    }
+
+    /// Returns first-wins path- and content-free runtime pressure evidence.
+    #[must_use]
+    pub const fn pressure_evidence(self) -> Option<RuntimePressureEvidence> {
+        self.pressure_evidence
+    }
+
     /// Returns commands retaining an outstanding slot.
     #[must_use]
     pub const fn pending_count(self) -> usize {
@@ -404,6 +624,8 @@ pub(crate) struct InspectionShared {
 
 struct InspectionState {
     store: Option<ManifestStoreInspection>,
+    write_state: Option<StoreWriteState>,
+    pressure_evidence: Option<RuntimePressureEvidence>,
     health: RuntimeHealth,
 }
 
@@ -412,6 +634,8 @@ impl InspectionShared {
         Self {
             state: Arc::new(Mutex::new(InspectionState {
                 store: None,
+                write_state: None,
+                pressure_evidence: None,
                 health: RuntimeHealth::Healthy,
             })),
         }
@@ -423,21 +647,47 @@ impl InspectionShared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.store = Some(*store);
-        state.health = health;
+        state.write_state = Some(store.write_state());
+        if state.health != RuntimeHealth::StoragePressure {
+            state.health = health;
+        }
     }
 
     fn update_store(&self, store: &ManifestStoreInspection) {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .store = Some(*store);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.store = Some(*store);
+        state.write_state = Some(store.write_state());
     }
 
     fn set_health(&self, health: RuntimeHealth) {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .health = health;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.health != RuntimeHealth::StoragePressure {
+            state.health = health;
+        }
+    }
+
+    fn store_terminal(&self, store: &ManifestStoreInspection, failure: StoreTerminalFailure) {
+        let pressure = failure.pressure_evidence();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.store = Some(*store);
+        state.write_state = Some(failure.write_state(store));
+        if let Some(evidence) = pressure {
+            if state.pressure_evidence.is_none() {
+                state.pressure_evidence = Some(evidence);
+                state.health = RuntimeHealth::StoragePressure;
+            }
+        } else if state.health != RuntimeHealth::StoragePressure {
+            state.health = failure.non_pressure_health();
+        }
     }
 
     pub(crate) fn coordinator_fault(&self) {
@@ -450,6 +700,24 @@ impl InspectionShared {
         }
     }
 
+    pub(crate) fn accepts_control(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .health
+            == RuntimeHealth::Healthy
+    }
+
+    pub(crate) fn pressure_evidence(&self) -> Option<RuntimePressureEvidence> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.health == RuntimeHealth::StoragePressure)
+            .then_some(state.pressure_evidence)
+            .flatten()
+    }
+
     pub(crate) fn snapshot(
         &self,
         ingress: &IngressShared,
@@ -460,6 +728,8 @@ impl InspectionShared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let store = state.store.unwrap_or(*fallback);
+        let write_state = state.write_state.unwrap_or_else(|| store.write_state());
+        let pressure_evidence = state.pressure_evidence;
         let health = state.health;
         drop(state);
         let (pending_count, pending_bytes) = ingress.pending_counts();
@@ -468,6 +738,8 @@ impl InspectionShared {
             committed: store.committed(),
             generations: store.generations(),
             recovery: store.latest_recovery(),
+            write_state,
+            pressure_evidence,
             pending_count,
             pending_bytes,
             health,
@@ -524,9 +796,55 @@ struct PendingDurable {
     append: AppendIdentity,
 }
 
+#[derive(Clone, Copy)]
+enum StoreTerminalFailure {
+    Store(ManifestStoreError),
+    #[cfg(test)]
+    Pressure(RuntimePressureEvidence),
+}
+
+impl StoreTerminalFailure {
+    fn pressure_evidence(self) -> Option<RuntimePressureEvidence> {
+        match self {
+            Self::Store(error) => RuntimePressureEvidence::project(error),
+            #[cfg(test)]
+            Self::Pressure(evidence) => Some(evidence),
+        }
+    }
+
+    #[cfg(test)]
+    const fn response_error(self) -> ManifestStoreError {
+        match self {
+            Self::Store(error) => error,
+            #[cfg(test)]
+            Self::Pressure(_) => ManifestStoreError::ReopenRequired,
+        }
+    }
+
+    const fn write_state(self, store: &ManifestStoreInspection) -> StoreWriteState {
+        match self {
+            Self::Store(_) => store.write_state(),
+            #[cfg(test)]
+            Self::Pressure(_) => StoreWriteState::ReopenRequired,
+        }
+    }
+
+    const fn non_pressure_health(self) -> RuntimeHealth {
+        match self {
+            Self::Store(
+                ManifestStoreError::GenerationCatalogFull
+                | ManifestStoreError::Active(ActiveJournalError::RotationRequired),
+            ) => RuntimeHealth::RotationRequired,
+            Self::Store(_) => RuntimeHealth::Faulted,
+            #[cfg(test)]
+            Self::Pressure(_) => RuntimeHealth::StoragePressure,
+        }
+    }
+}
+
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub(crate) fn run_store_worker(
-    options: StoreOptions,
+    mut options: StoreOptions,
     receiver: Receiver<WorkerMessage>,
     readiness: oneshot::Sender<Result<WorkerReady, ManifestStoreError>>,
     ingress: Arc<IngressShared>,
@@ -590,36 +908,46 @@ pub(crate) fn run_store_worker(
                 response,
             }) => {
                 if unpublished.is_some() {
+                    fail_worker(&ingress, &inspection);
                     let _ = response.send(Err(ManifestStoreError::Active(
                         ActiveJournalError::InvalidLayout,
                     )));
-                    fail_worker(&ingress, &inspection);
                     return;
                 }
                 let frame_len = prepared.frame_len();
                 let sequence = match store.next_append_sequence() {
                     Ok(sequence) => sequence,
                     Err(error) => {
+                        stop_for_store_failure(
+                            &store,
+                            &ingress,
+                            &inspection,
+                            StoreTerminalFailure::Store(error),
+                        );
                         let _ = response.send(Err(error));
-                        fail_worker(&ingress, &inspection);
                         return;
                     }
                 };
                 let frame = match (*prepared).into_frame(sequence) {
                     Ok(frame) => frame,
                     Err(error) => {
+                        fail_worker(&ingress, &inspection);
                         let _ = response.send(Err(ManifestStoreError::Active(
                             ActiveJournalError::Journal(error.error()),
                         )));
-                        fail_worker(&ingress, &inspection);
                         return;
                     }
                 };
                 if let Err(error) =
                     store.preflight_historical_declaration(frame.admission().declaration())
                 {
+                    stop_for_store_failure(
+                        &store,
+                        &ingress,
+                        &inspection,
+                        StoreTerminalFailure::Store(error),
+                    );
                     let _ = response.send(Err(error));
-                    fail_worker(&ingress, &inspection);
                     return;
                 }
                 let age_rotation = store.inspection().active().active_records() > 0
@@ -627,14 +955,25 @@ pub(crate) fn run_store_worker(
                 let fit_rotation = match store.requires_rotation(frame_len) {
                     Ok(required) => required,
                     Err(error) => {
+                        stop_for_store_failure(
+                            &store,
+                            &ingress,
+                            &inspection,
+                            StoreTerminalFailure::Store(error),
+                        );
                         let _ = response.send(Err(error));
-                        fail_worker(&ingress, &inspection);
                         return;
                     }
                 };
                 if age_rotation || fit_rotation {
-                    if flush_pending(&mut store, &mut pending, &ingress, &inspection).is_err() {
-                        let _ = response.send(Err(ManifestStoreError::Faulted));
+                    if let Err(error) = flush_pending(
+                        &mut store,
+                        &mut pending,
+                        &ingress,
+                        &inspection,
+                        &mut options,
+                    ) {
+                        let _ = response.send(Err(error));
                         return;
                     }
                     match store.rotate() {
@@ -643,16 +982,24 @@ pub(crate) fn run_store_worker(
                             inspection.update(&store.inspection(), RuntimeHealth::Healthy);
                         }
                         Err(error) => {
+                            stop_for_store_failure(
+                                &store,
+                                &ingress,
+                                &inspection,
+                                StoreTerminalFailure::Store(error),
+                            );
                             let _ = response.send(Err(error));
-                            if error == ManifestStoreError::GenerationCatalogFull {
-                                inspection.set_health(RuntimeHealth::RotationRequired);
-                                ingress.stop();
-                            } else {
-                                fail_worker(&ingress, &inspection);
-                            }
                             return;
                         }
                     }
+                }
+                #[cfg(test)]
+                if let Some(hook) = options.take_test_pressure(TestPressureBoundary::Append) {
+                    let failure = StoreTerminalFailure::Pressure(hook.evidence);
+                    stop_for_store_failure(&store, &ingress, &inspection, failure);
+                    let _ = response.send(Err(failure.response_error()));
+                    hook.after_response();
+                    return;
                 }
                 let end_offset = match store.append(&frame) {
                     Ok(end_offset) => end_offset,
@@ -661,13 +1008,13 @@ pub(crate) fn run_store_worker(
                         // mismatch after synchronous resource admission cannot
                         // be downgraded to handled evidence, so the existing
                         // fail-stop receipt contract closes the authority.
+                        stop_for_store_failure(
+                            &store,
+                            &ingress,
+                            &inspection,
+                            StoreTerminalFailure::Store(error),
+                        );
                         let _ = response.send(Err(error));
-                        if error == ManifestStoreError::Active(ActiveJournalError::RotationRequired)
-                        {
-                            inspection.set_health(RuntimeHealth::RotationRequired);
-                        } else {
-                            fail_worker(&ingress, &inspection);
-                        }
                         return;
                     }
                 };
@@ -715,7 +1062,15 @@ pub(crate) fn run_store_worker(
                     || pending.len() >= options.group_commit.max_records
                     || pending_bytes >= options.group_commit.max_bytes
                     || rotation_demand;
-                if forced && flush_pending(&mut store, &mut pending, &ingress, &inspection).is_err()
+                if forced
+                    && flush_pending(
+                        &mut store,
+                        &mut pending,
+                        &ingress,
+                        &inspection,
+                        &mut options,
+                    )
+                    .is_err()
                 {
                     return;
                 }
@@ -726,12 +1081,23 @@ pub(crate) fn run_store_worker(
                             inspection.update(&store.inspection(), RuntimeHealth::Healthy);
                         }
                         Err(ManifestStoreError::GenerationCatalogFull) => {
-                            inspection.set_health(RuntimeHealth::RotationRequired);
-                            ingress.stop();
+                            stop_for_store_failure(
+                                &store,
+                                &ingress,
+                                &inspection,
+                                StoreTerminalFailure::Store(
+                                    ManifestStoreError::GenerationCatalogFull,
+                                ),
+                            );
                             return;
                         }
-                        Err(_) => {
-                            fail_worker(&ingress, &inspection);
+                        Err(error) => {
+                            stop_for_store_failure(
+                                &store,
+                                &ingress,
+                                &inspection,
+                                StoreTerminalFailure::Store(error),
+                            );
                             return;
                         }
                     }
@@ -745,11 +1111,17 @@ pub(crate) fn run_store_worker(
                     let result = Err(ManifestStoreError::Active(
                         ActiveJournalError::InvalidLayout,
                     ));
-                    let _ = response.send(result);
                     fail_worker(&ingress, &inspection);
+                    let _ = response.send(result);
                     return;
                 }
-                let result = flush_pending(&mut store, &mut pending, &ingress, &inspection);
+                let result = flush_pending(
+                    &mut store,
+                    &mut pending,
+                    &ingress,
+                    &inspection,
+                    &mut options,
+                );
                 pending_since = None;
                 let _ = response.send(result);
                 if result.is_err() {
@@ -761,10 +1133,18 @@ pub(crate) fn run_store_worker(
                 response,
             }) => {
                 if unpublished.is_some() {
+                    fail_worker(&ingress, &inspection);
                     let _ = response.send(Err(ManifestStoreError::Active(
                         ActiveJournalError::InvalidLayout,
                     )));
-                    fail_worker(&ingress, &inspection);
+                    return;
+                }
+                #[cfg(test)]
+                if let Some(hook) = options.take_test_pressure(TestPressureBoundary::Registry) {
+                    let failure = StoreTerminalFailure::Pressure(hook.evidence);
+                    stop_for_store_failure(&store, &ingress, &inspection, failure);
+                    let _ = response.send(Err(failure.response_error()));
+                    hook.after_response();
                     return;
                 }
                 let result = match *operation {
@@ -807,27 +1187,45 @@ pub(crate) fn run_store_worker(
                 if result.as_ref().is_ok() {
                     inspection.update_store(&store.inspection());
                 }
+                if let Err(error) = result.as_ref()
+                    && terminal
+                {
+                    stop_for_store_failure(
+                        &store,
+                        &ingress,
+                        &inspection,
+                        StoreTerminalFailure::Store(*error),
+                    );
+                }
                 let _ = response.send(result);
                 if terminal {
-                    fail_worker(&ingress, &inspection);
                     return;
                 }
             }
             Ok(WorkerMessage::Bind { envelope, response }) => {
                 if unpublished.is_some() {
+                    fail_worker(&ingress, &inspection);
                     let _ = response.send(Err(ManifestStoreError::Active(
                         ActiveJournalError::InvalidLayout,
                     )));
-                    fail_worker(&ingress, &inspection);
                     return;
                 }
                 let result = store.bind(envelope);
                 let terminal = result
                     .as_ref()
                     .is_err_and(|error| !matches!(error, ManifestStoreError::Model(_)));
+                if let Err(error) = result.as_ref()
+                    && terminal
+                {
+                    stop_for_store_failure(
+                        &store,
+                        &ingress,
+                        &inspection,
+                        StoreTerminalFailure::Store(*error),
+                    );
+                }
                 let _ = response.send(result);
                 if terminal {
-                    fail_worker(&ingress, &inspection);
                     return;
                 }
             }
@@ -836,11 +1234,17 @@ pub(crate) fn run_store_worker(
                     let result = Err(ManifestStoreError::Active(
                         ActiveJournalError::InvalidLayout,
                     ));
-                    let _ = response.send(result);
                     fail_worker(&ingress, &inspection);
+                    let _ = response.send(result);
                     return;
                 }
-                let result = flush_pending(&mut store, &mut pending, &ingress, &inspection);
+                let result = flush_pending(
+                    &mut store,
+                    &mut pending,
+                    &ingress,
+                    &inspection,
+                    &mut options,
+                );
                 let _ = response.send(result);
                 if result.is_ok() {
                     inspection.update(&store.inspection(), RuntimeHealth::Stopped);
@@ -853,7 +1257,14 @@ pub(crate) fn run_store_worker(
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !pending.is_empty()
-                    && flush_pending(&mut store, &mut pending, &ingress, &inspection).is_err()
+                    && flush_pending(
+                        &mut store,
+                        &mut pending,
+                        &ingress,
+                        &inspection,
+                        &mut options,
+                    )
+                    .is_err()
                 {
                     return;
                 }
@@ -868,9 +1279,19 @@ fn flush_pending(
     pending: &mut Vec<PendingDurable>,
     ingress: &IngressShared,
     inspection: &InspectionShared,
+    options: &mut StoreOptions,
 ) -> Result<(), ManifestStoreError> {
     if pending.is_empty() {
         return Ok(());
+    }
+    #[cfg(not(test))]
+    let _ = options;
+    #[cfg(test)]
+    if let Some(hook) = options.take_test_pressure(TestPressureBoundary::Flush) {
+        let failure = StoreTerminalFailure::Pressure(hook.evidence);
+        stop_for_store_failure(store, ingress, inspection, failure);
+        hook.after_response();
+        return Err(failure.response_error());
     }
     let retry_pending = pending
         .iter()
@@ -885,7 +1306,12 @@ fn flush_pending(
     let (committed, retry) = match store.sync_pending(&retry_pending) {
         Ok(committed) => committed,
         Err(error) => {
-            fail_worker(ingress, inspection);
+            stop_for_store_failure(
+                store,
+                ingress,
+                inspection,
+                StoreTerminalFailure::Store(error),
+            );
             return Err(error);
         }
     };
@@ -915,6 +1341,16 @@ fn rotation_required(store: &ManifestStore, options: &StoreOptions, opened_at: I
     active.active_bytes() >= options.journal_limits.max_active_bytes()
         || active.active_records() >= options.journal_limits.max_active_records()
         || (active.active_records() > 0 && opened_at.elapsed() >= options.group_commit.rotation_age)
+}
+
+fn stop_for_store_failure(
+    store: &ManifestStore,
+    ingress: &IngressShared,
+    inspection: &InspectionShared,
+    failure: StoreTerminalFailure,
+) {
+    inspection.store_terminal(&store.inspection(), failure);
+    ingress.stop();
 }
 
 fn fail_worker(ingress: &IngressShared, inspection: &InspectionShared) {

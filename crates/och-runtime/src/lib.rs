@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
-//! Bounded durable active-journal ingress and volatile latest snapshots.
+//! Bounded durable active-journal ingress, pressure lifecycle, and volatile latest snapshots.
 //!
 //! Each [`HistorianRuntime`] owns one immutable store scope, one Tokio
 //! coordinator, and one dedicated blocking active-journal writer joined by a
@@ -22,7 +22,8 @@ pub use latest::{
 };
 pub use store_worker::{
     GroupCommitPolicy, RegistryCommit, RegistryError, RegistryOperation, RegistryOutcome,
-    RuntimeHealth, RuntimeInspection, StoreOptions, StoreOptionsError,
+    RuntimeHealth, RuntimeInspection, RuntimePressureEvidence, RuntimePressureOperation,
+    RuntimePressureSource, StoreOptions, StoreOptionsError,
 };
 
 use ingress::{CompletionFaultInjection, IngressShared, NextWork};
@@ -223,6 +224,9 @@ impl HistorianRuntime {
             .try_acquire_owned()
             .map_err(|_| RegistryError::Capacity)?;
         let _control = self.control_gate.lock().await;
+        if !self.inspection.accepts_control() {
+            return Err(RegistryError::Closed);
+        }
         let sender = self.store_sender.as_ref().ok_or(RegistryError::Closed)?;
         let (response_tx, response_rx) = oneshot::channel();
         if try_send(
@@ -260,6 +264,9 @@ impl HistorianRuntime {
             .try_acquire_owned()
             .map_err(|_| RegistryError::Capacity)?;
         let _control = self.control_gate.lock().await;
+        if !self.inspection.accepts_control() {
+            return Err(RegistryError::Closed);
+        }
         let sender = self.store_sender.as_ref().ok_or(RegistryError::Closed)?;
         let (response_tx, response_rx) = oneshot::channel();
         if try_send(
@@ -289,9 +296,10 @@ impl HistorianRuntime {
     /// # Errors
     ///
     /// Returns a sanitized [`ShutdownError`] when the writer had already exited,
-    /// was cancelled, or panicked. If this future is cancelled, its owned handle
-    /// is dropped and requests nonblocking writer abortion rather than detaching
-    /// the retained task.
+    /// was cancelled, or panicked. A pressure-stopped writer is reaped before its
+    /// exact retained [`RuntimePressureEvidence`] is returned. If this future is
+    /// cancelled, its owned handle is dropped and requests nonblocking writer
+    /// abortion rather than detaching the retained task.
     pub async fn shutdown(mut self) -> Result<(), ShutdownError> {
         self.ingress.close_admission();
         let Some(writer) = self.writer.as_mut() else {
@@ -300,8 +308,24 @@ impl HistorianRuntime {
         let result = writer.await;
         self.writer = None;
 
-        match result {
-            Ok(WriterExit::Shutdown) => {
+        let exit = match result {
+            Ok(exit) => exit,
+            Err(error) => return Err(classify_shutdown_join_error(&error)),
+        };
+        if let Some(evidence) = self.inspection.pressure_evidence() {
+            self.store_sender = None;
+            let Some(reaped) = self.reaped.take() else {
+                return Err(ShutdownError::WriterExitedBeforeShutdown);
+            };
+            if reaped.await.is_err() {
+                return Err(ShutdownError::WriterExitedBeforeShutdown);
+            }
+            self.shutdown_complete = true;
+            return Err(ShutdownError::StoragePressure(evidence));
+        }
+
+        match exit {
+            WriterExit::Shutdown => {
                 self.store_sender = None;
                 let Some(reaped) = self.reaped.take() else {
                     return Err(ShutdownError::WriterExitedBeforeShutdown);
@@ -312,8 +336,7 @@ impl HistorianRuntime {
                 self.shutdown_complete = true;
                 Ok(())
             }
-            Ok(_) => Err(ShutdownError::WriterExitedBeforeShutdown),
-            Err(error) => Err(classify_shutdown_join_error(&error)),
+            _ => Err(ShutdownError::WriterExitedBeforeShutdown),
         }
     }
 
@@ -510,6 +533,8 @@ pub enum ShutdownError {
     WriterTaskCancelled,
     /// Tokio reported that the writer task panicked.
     WriterTaskPanicked,
+    /// Storage pressure stopped the runtime and the blocking worker was reaped.
+    StoragePressure(RuntimePressureEvidence),
 }
 
 impl fmt::Display for ShutdownError {
@@ -518,6 +543,7 @@ impl fmt::Display for ShutdownError {
             Self::WriterExitedBeforeShutdown => "writer exited before graceful shutdown",
             Self::WriterTaskCancelled => "writer task was cancelled during shutdown",
             Self::WriterTaskPanicked => "writer task panicked before shutdown",
+            Self::StoragePressure(_) => "historian runtime stopped on storage pressure",
         })
     }
 }
@@ -1037,14 +1063,15 @@ enum TestBehavior {
 
 #[cfg(test)]
 mod tests {
+    use super::store_worker::{TestPressureBoundary, TestPressureHook};
     use super::{
         AdmissionPriority, BarrierDemand, ByteReservationLimits, DurableOutcome, GroupCommitPolicy,
         HandledOutcome, HistorianIngress, HistorianRuntime, IngressCommand, LatestReadError,
         LatestReadHandle, LifecycleProbe, MAX_OUTSTANDING_COMMANDS, MAX_PUBLISHED_SERIES,
         ReceiptOutcome, RegistryError, RegistryOperation, RegistryOutcome, RuntimeHealth,
-        ShutdownError, StartError, StoreOptions, StoreOptionsError, SubmissionDisposition,
-        TestBehavior, TrySubmitErrorKind, WriterOptions, default_test_registry_operation,
-        test_directory,
+        RuntimePressureEvidence, RuntimePressureOperation, RuntimePressureSource, ShutdownError,
+        StartError, StoreOptions, StoreOptionsError, SubmissionDisposition, TestBehavior,
+        TrySubmitErrorKind, WriterOptions, default_test_registry_operation, test_directory,
     };
     use och_core::{
         ArtifactId, ArtifactReference, CanonicalAdmission, CaptureLifecycle, CaptureRunEvidence,
@@ -1063,7 +1090,7 @@ mod tests {
     };
     use std::fs;
     use std::future::{Future, poll_fn};
-    use std::io::Write;
+    use std::io::{ErrorKind, Write};
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::process::{Command, Stdio};
@@ -1153,6 +1180,26 @@ mod tests {
             .await
             .expect("default durable-test registry declaration should commit");
         Ok(runtime)
+    }
+
+    fn reopen_manifest_store(directory: &Path, store: StoreId) -> och_store::ManifestStore {
+        let config = och_store::ManifestStoreConfig::new(
+            directory.to_path_buf(),
+            store,
+            och_store::ActiveJournalOpenMode::OpenExisting,
+            och_store::ActiveJournalLimits::new(
+                och_store::MAX_ADMISSION_PAYLOAD_V1,
+                64 * 1_024 * 1_024,
+                4_096,
+            )
+            .expect("pressure-reopen journal limits"),
+            och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(16, 64))
+                .expect("pressure-reopen registry options"),
+            och_store::RetryPersistenceOptions::new(2, 2).expect("pressure-reopen retry options"),
+        )
+        .expect("pressure-reopen manifest configuration");
+        och_store::ManifestStore::open(config)
+            .expect("pressure shutdown must release the same store lock")
     }
 
     async fn register_metadata(runtime: &HistorianRuntime, metadata: &SeriesMetadata) {
@@ -1563,6 +1610,7 @@ mod tests {
             .await
             .expect("coordinator failure must wake and reap the store worker");
         assert_eq!(runtime.inspection().health(), RuntimeHealth::Faulted);
+        assert_eq!(runtime.inspection().pressure_evidence(), None);
         assert_eq!(
             runtime.read_handle().snapshot(),
             Err(LatestReadError::unavailable())
@@ -4094,6 +4142,7 @@ mod tests {
                     ReceiptOutcome::WriterStopped
                 );
                 assert_eq!(runtime.inspection().health(), RuntimeHealth::Faulted);
+                assert_eq!(runtime.inspection().pressure_evidence(), None);
                 let error = read
                     .snapshot()
                     .expect_err("future snapshots must be unavailable");
@@ -5207,6 +5256,301 @@ mod tests {
                 drop(reopened);
                 fs::remove_dir_all(directory).expect("remove drop directory");
             }
+        });
+    }
+
+    #[test]
+    fn pressure_evidence_preserves_typed_parts_without_classifying_raw_codes() {
+        let active = RuntimePressureEvidence::from_active_parts(
+            och_store::StoreIoOperation::SyncJournal,
+            ErrorKind::StorageFull,
+            Some(28),
+        );
+        assert_eq!(active.source(), RuntimePressureSource::ActiveJournal);
+        assert_eq!(
+            active.operation(),
+            RuntimePressureOperation::ActiveJournal(och_store::StoreIoOperation::SyncJournal)
+        );
+        assert_eq!(active.kind(), ErrorKind::StorageFull);
+        assert_eq!(active.raw_os_error(), Some(28));
+
+        let manifest = RuntimePressureEvidence::from_manifest_parts(
+            och_store::ManifestIoOperation::Publish,
+            ErrorKind::QuotaExceeded,
+            Some(122),
+        );
+        assert_eq!(manifest.source(), RuntimePressureSource::ManifestStore);
+        assert_eq!(
+            manifest.operation(),
+            RuntimePressureOperation::ManifestStore(och_store::ManifestIoOperation::Publish)
+        );
+        assert_eq!(manifest.kind(), ErrorKind::QuotaExceeded);
+        assert_eq!(manifest.raw_os_error(), Some(122));
+        assert_eq!(
+            RuntimePressureEvidence::project(och_store::ManifestStoreError::ReopenRequired),
+            None,
+            "reopen custody cannot fabricate first pressure evidence"
+        );
+        assert_eq!(
+            RuntimePressureEvidence::project(och_store::ManifestStoreError::Faulted),
+            None
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn append_pressure_stops_before_handled_and_shutdown_waits_for_reaping() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let evidence = RuntimePressureEvidence::from_active_parts(
+                och_store::StoreIoOperation::Write,
+                ErrorKind::StorageFull,
+                Some(28),
+            );
+            let (hook, mut control) =
+                TestPressureHook::new(TestPressureBoundary::Append, 1, evidence, true);
+            let runtime = complete_bounded(open_durable_test(
+                durable_options(
+                    directory.clone(),
+                    store_id(1),
+                    och_store::ActiveJournalOpenMode::CreateNew,
+                    ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                        .expect("append-pressure byte limits"),
+                    group_policy(
+                        std::time::Duration::from_secs(60),
+                        MAX_OUTSTANDING_COMMANDS,
+                        64 * 1_024 * 1_024,
+                    ),
+                )
+                .with_test_pressure(hook),
+            ))
+            .await
+            .expect("append-pressure runtime");
+            let ingress = runtime.ingress();
+            let read = runtime.read_handle();
+            let first = ingress
+                .try_submit(IngressCommand::with_policy(
+                    positioned_command(1, 2, CollectionMode::Sampled, 70, 1, 10, "pressure-prior")
+                        .into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Immediate,
+                ))
+                .expect("prior append")
+                .into_receipt();
+            let DurableOutcome::Durable(first_commit) =
+                complete_bounded(first.clone().wait_durable()).await
+            else {
+                panic!("prior append must become durable");
+            };
+            let old = read.snapshot().expect("capture pre-pressure latest");
+            assert_eq!(old.len(), 1);
+            let before = runtime.inspection();
+
+            let pressured = ingress
+                .try_submit(positioned_command(
+                    1,
+                    2,
+                    CollectionMode::Sampled,
+                    71,
+                    2,
+                    11,
+                    "pressure-append",
+                ))
+                .expect("pressure append reaches worker")
+                .into_receipt();
+            assert_eq!(
+                complete_bounded(pressured.clone().wait_handled()).await,
+                HandledOutcome::WriterStopped
+            );
+            assert_eq!(
+                complete_bounded(pressured.wait_durable()).await,
+                DurableOutcome::WriterStopped
+            );
+            wait_until(|| control.fired()).await;
+            let after = runtime.inspection();
+            assert_eq!(after.health(), RuntimeHealth::StoragePressure);
+            assert_eq!(
+                after.write_state(),
+                och_store::StoreWriteState::ReopenRequired
+            );
+            assert_eq!(after.pressure_evidence(), Some(evidence));
+            assert_eq!(after.store(), before.store());
+            assert_eq!(after.committed(), before.committed());
+            assert_eq!(after.pending_count(), 0);
+            assert_eq!(after.pending_bytes(), 0);
+            assert_eq!(read.snapshot(), Err(LatestReadError::unavailable()));
+            assert_eq!(old.len(), 1, "caller-held old snapshot remains usable");
+            assert_eq!(
+                complete_bounded(first.clone().wait_handled()).await,
+                HandledOutcome::WriterHandled(first_commit.append())
+            );
+            assert_eq!(
+                complete_bounded(first.wait_durable()).await,
+                DurableOutcome::Durable(first_commit)
+            );
+
+            runtime.inspection.coordinator_fault();
+            ingress.stop();
+            assert_eq!(runtime.inspection(), after);
+            let closed = ingress
+                .try_submit(command("pressure-closed", 72, 72))
+                .expect_err("new append admission is closed after pressure");
+            assert_eq!(closed.kind(), TrySubmitErrorKind::Closed);
+            assert_eq!(
+                runtime
+                    .apply_registry(default_test_registry_operation(store_id(1)))
+                    .await,
+                Err(RegistryError::Closed)
+            );
+            wait_until(|| {
+                runtime
+                    .writer
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+            })
+            .await;
+
+            let mut shutdown = Box::pin(runtime.shutdown());
+            assert!(poll_once(shutdown.as_mut()).await.is_pending());
+            control.release();
+            assert_eq!(
+                complete_bounded(shutdown).await,
+                Err(ShutdownError::StoragePressure(evidence))
+            );
+            let reopened = reopen_manifest_store(&directory, store_id(1));
+            drop(reopened);
+            fs::remove_dir_all(directory).expect("remove append-pressure directory");
+        });
+    }
+
+    #[test]
+    fn flush_pressure_preserves_handled_identity_without_false_commit() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let evidence = RuntimePressureEvidence::from_manifest_parts(
+                och_store::ManifestIoOperation::Publish,
+                ErrorKind::QuotaExceeded,
+                Some(122),
+            );
+            let (hook, _control) =
+                TestPressureHook::new(TestPressureBoundary::Flush, 0, evidence, false);
+            let runtime = complete_bounded(open_durable_test(
+                durable_options(
+                    directory.clone(),
+                    store_id(1),
+                    och_store::ActiveJournalOpenMode::CreateNew,
+                    ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                        .expect("flush-pressure byte limits"),
+                    group_policy(
+                        std::time::Duration::from_secs(60),
+                        MAX_OUTSTANDING_COMMANDS,
+                        64 * 1_024 * 1_024,
+                    ),
+                )
+                .with_test_pressure(hook),
+            ))
+            .await
+            .expect("flush-pressure runtime");
+            let before = runtime.inspection();
+            let receipt = runtime
+                .ingress()
+                .try_submit(IngressCommand::with_policy(
+                    positioned_command(1, 2, CollectionMode::Sampled, 73, 1, 12, "pressure-flush")
+                        .into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Immediate,
+                ))
+                .expect("flush-pressure append")
+                .into_receipt();
+            let HandledOutcome::WriterHandled(append) =
+                complete_bounded(receipt.clone().wait_handled()).await
+            else {
+                panic!("append identity must be retained before flush pressure");
+            };
+            assert_eq!(
+                complete_bounded(receipt.wait_durable()).await,
+                DurableOutcome::WriterStopped
+            );
+            let after = runtime.inspection();
+            assert_eq!(after.health(), RuntimeHealth::StoragePressure);
+            assert_eq!(
+                after.write_state(),
+                och_store::StoreWriteState::ReopenRequired
+            );
+            assert_eq!(after.pressure_evidence(), Some(evidence));
+            assert_eq!(after.committed(), before.committed());
+            assert_eq!(
+                after.store().durable_cutoff(),
+                before.store().durable_cutoff()
+            );
+            assert_eq!(after.store().active_records(), 1);
+            assert_eq!(append.append_sequence(), 1);
+            assert_eq!(after.pending_count(), 0);
+            assert_eq!(after.pending_bytes(), 0);
+            assert_eq!(
+                complete_bounded(runtime.shutdown()).await,
+                Err(ShutdownError::StoragePressure(evidence))
+            );
+            fs::remove_dir_all(directory).expect("remove flush-pressure directory");
+        });
+    }
+
+    #[test]
+    fn control_pressure_returns_bounded_in_flight_error_then_closes_control() {
+        harness().block_on(async {
+            let directory = test_directory();
+            let evidence = RuntimePressureEvidence::from_manifest_parts(
+                och_store::ManifestIoOperation::Write,
+                ErrorKind::StorageFull,
+                None,
+            );
+            let (hook, _control) =
+                TestPressureHook::new(TestPressureBoundary::Registry, 0, evidence, false);
+            let runtime = complete_bounded(HistorianRuntime::open(
+                durable_options(
+                    directory.clone(),
+                    store_id(1),
+                    och_store::ActiveJournalOpenMode::CreateNew,
+                    ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                        .expect("control-pressure byte limits"),
+                    group_policy(
+                        std::time::Duration::from_secs(60),
+                        MAX_OUTSTANDING_COMMANDS,
+                        64 * 1_024 * 1_024,
+                    ),
+                )
+                .with_test_pressure(hook),
+            ))
+            .await
+            .expect("control-pressure runtime");
+            let in_flight = runtime
+                .apply_registry(default_test_registry_operation(store_id(1)))
+                .await;
+            assert_eq!(
+                in_flight,
+                Err(RegistryError::Store(
+                    och_store::ManifestStoreError::ReopenRequired
+                ))
+            );
+            let inspection = runtime.inspection();
+            assert_eq!(inspection.health(), RuntimeHealth::StoragePressure);
+            assert_eq!(inspection.pressure_evidence(), Some(evidence));
+            assert_eq!(inspection.pending_count(), 0);
+            assert_eq!(inspection.pending_bytes(), 0);
+            assert_eq!(
+                runtime
+                    .apply_registry(default_test_registry_operation(store_id(1)))
+                    .await,
+                Err(RegistryError::Closed)
+            );
+            let output = format!("{inspection:?} {evidence:?} {in_flight:?}");
+            assert!(!output.contains(directory.to_string_lossy().as_ref()));
+            assert!(!output.contains("provider:test"));
+            assert_eq!(
+                complete_bounded(runtime.shutdown()).await,
+                Err(ShutdownError::StoragePressure(evidence))
+            );
+            fs::remove_dir_all(directory).expect("remove control-pressure directory");
         });
     }
 

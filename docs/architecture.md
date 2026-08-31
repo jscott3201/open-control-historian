@@ -17,6 +17,7 @@ contract for each artifact family behind a fixed Store Format V1 marker.
 M02-PR03a adds a manifest-rooted transaction that reports and removes only one
 proven terminal invalid/torn active suffix. M02-PR03b1 adds store-only logical
 transaction preflight plus typed observed pressure and sticky reopen custody.
+M02-PR03b2 projects that custody into one bounded fail-stop runtime lifecycle.
 Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
@@ -29,7 +30,7 @@ default workspace selection
   16 slots + byte bounds       Journal V1 + checkpoints     |
   one control gate             manifest + registry/retry    |
   safe-boundary rotation       catalog + raw seals          |
-  recovery inspection         recovery + pressure custody  |
+  recovery/pressure state     recovery + pressure custody  |
        |                                                    |
        v                                      future adapters (not created yet)
   tokio rt + sync only
@@ -88,6 +89,12 @@ owned by the command until append/publication returns it to the bounded slot,
 and the slot and exact byte reservation remain retained until durability or
 terminal stop. Reopen evidence is decoded and bounded but cannot authorize
 submission, registry, or latest state.
+
+Runtime inspection copies composed `ManifestStoreInspection` write custody, not
+only active-journal custody. The first already-typed active or manifest pressure
+error is projected into copyable path/content-free runtime evidence and sticky
+`StoragePressure` health. Raw codes remain diagnostic and never classify health.
+No runtime filesystem probe or second storage classifier exists.
 
 Because the registry is reachable only on the blocking writer, synchronous
 ingress performs resource/framing admission rather than historical lookup. An
@@ -304,13 +311,24 @@ receipt that coalesced during the preparation window while releasing exact bytes
 Caller-supplied content identity is trusted only for core retry classification
 and is never recomputed from admission or envelope content.
 
+For already-typed store pressure, the blocking worker first copies the composed
+inspection and exact first evidence under the shared inspection authority, sets
+`StoragePressure`, and only then idempotently stops ingress and wakes responses.
+Already handled or durable receipt stages remain exact; only unresolved stages
+become `WriterStopped`, reservations become zero, future latest capture is
+unavailable, and caller-held immutable snapshots remain usable. A later generic
+coordinator guard cannot overwrite pressure. Consuming shutdown gives Tokio
+panic/cancellation truth precedence, otherwise drops the retained store sender,
+awaits the fixed reaper and lock release, and returns the retained pressure
+evidence rather than graceful or generic success.
+
 ## Intentionally absent
 
 There is currently no async/blocking admission wait, eviction, subscription/wait
 API, mutable read guard, final native segment format, sealed-history read/query
 API, retention/reclamation, unbounded/time-based retry, manifest-backed latest
-reconstruction, broad repair or stale-restore event model, runtime pressure-degraded
-latest/receipt mode, query
+reconstruction, broad repair or stale-restore event model, pressure retry/clear,
+continued degraded ingress, query
 engine, network service, SQL layer, cloud/object provider, embedded database,
 memory mapping, Studio/Engine link, adapter, or donor-code compatibility layer.
 
@@ -340,4 +358,5 @@ The current-only artifact epoch is recorded by the
 manifest-rooted terminal-suffix transaction and deferred successor boundary are
 recorded by [M02-PR03a](continuation-m02-pr03a.md).
 Store-only pressure custody and its runtime-policy handoff are recorded by
-[M02-PR03b1](continuation-m02-pr03b1.md).
+[M02-PR03b1](continuation-m02-pr03b1.md). The bounded fail-stop runtime pressure
+lifecycle is recorded by [M02-PR03b2](continuation-m02-pr03b2.md).
