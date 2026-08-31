@@ -1,7 +1,7 @@
 # OpenControl Historian
 
 OpenControl Historian is at its canonical-model, manifest-rooted active-journal,
-and bounded offline Native Segment V1 candidate/query stage.
+and bounded one-generation Native Segment V1 candidate/query stage.
 This repository provides a small Rust workspace, an enforceable native dependency
 boundary, the dependency-free canonical Historian data model, bounded series
 declaration authority, source/capture provenance and admission boundary,
@@ -21,9 +21,12 @@ also build and hostile-parse one bounded non-authorizing Native Segment V1
 candidate from one committed sealed raw generation without publishing it or
 changing store authority. An already parsed in-memory candidate supports one
 hard-bounded, recent-first observation query for an exact series and optional
-canonical effective-time interval. It does **not** yet provide durable segment
-publication, a store/runtime historical query path, retention/reclamation,
-unbounded or time-based retry, or current/held-value behavior.
+canonical effective-time interval. A synchronous read-only `ManifestStore`
+method composes that builder, parser, and query for exactly one catalog-committed
+sealed generation and returns only the owned non-authorizing result. It does
+**not** provide durable segment publication/authority, runtime or
+multiple-generation historical query, retention/reclamation, unbounded or
+time-based retry, or current/held-value behavior.
 
 ## Current status
 
@@ -96,7 +99,10 @@ in one SeriesId-ordered block per series, plus global append and recent-observat
 directories. Candidate bytes remain in memory/offline, are rejected as store
 inventory, and grant no declaration, runtime, durable query, retention, or
 reclamation authority. Query results remain bounded non-authorizing projections
-of already hostile-validated candidate bytes.
+of already hostile-validated candidate bytes. The store bridge remains a
+heavyweight synchronous full-generation read/build/parse validation: result and
+decoded-cache allocation are `O(limit)` for `limit <= 16`, but maximum transient
+working memory can exceed 700 MB and has no new typed allocation-recovery contract.
 
 The current workspace contains:
 
@@ -104,7 +110,7 @@ The current workspace contains:
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model, bounded series declaration authority, and a measurement-only example |
 | [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, durable retry replay/guard classification, automatic safe-boundary rotation, recovery/pressure inspection, writer-serialized registry control, manifest-backed receipts, and volatile latest snapshots |
-| [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, offline Native Segment V1 candidates and bounded in-memory observation query, conservative terminal-suffix recovery, typed pressure/reopen custody, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
+| [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, Native Segment V1 candidates and one-generation read-only observation query, conservative terminal-suffix recovery, typed pressure/reopen custody, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
 `och-core` has no dependencies. `och-store` depends inward on `och-core`, and
@@ -236,6 +242,10 @@ through nextest rather than being repeated with `cargo test`.
 - [M03-PR02a implementation brief](docs/implementation-brief-m03-pr02a.md) and
   [continuation](docs/continuation-m03-pr02a.md) record the in-memory query proof,
   focused evidence, and durable publication/cursor/merge deferrals.
+- [M03-PR02b implementation brief](docs/implementation-brief-m03-pr02b.md) and
+  [continuation](docs/continuation-m03-pr02b.md) record the exact one-generation
+  read-only store bridge, heavyweight bounds, refusal evidence, and remaining
+  durable-authority/runtime/multi-generation boundary.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

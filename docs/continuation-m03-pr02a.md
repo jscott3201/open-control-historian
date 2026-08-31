@@ -30,9 +30,12 @@ series' already validated index slice.
 
 ## Remaining boundary
 
-The query is not durable segment authority and does not read store inventory.
-Segment publication/naming/reference, startup or crash convergence, store/runtime
-query integration, raw Journal fallback, multiple-generation merge, cursor
+The parsed-view query is not durable segment authority and does not itself read
+store inventory. M03-PR02b now composes it with the existing candidate builder and
+hostile parser for one exact catalog-committed sealed generation; that successor
+does not change these query semantics or create segment authority. Segment
+publication/naming/reference, startup or crash convergence, runtime query
+integration, raw Journal fallback, multiple-generation merge, cursor
 pagination, gap/no-change result semantics, retention/pins/reclamation, raw
 deletion, compression, rollups, memory mapping, adapters/providers, and a Store
 Format successor remain absent. The exact sealed raw Journal V1 remains the sole
