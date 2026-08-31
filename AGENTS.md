@@ -33,7 +33,9 @@ reopen custody to direct active journals and composed manifest stores. M02-PR03b
 projects that already-typed pressure into sticky bounded runtime evidence,
 fail-stop health, and reaper-joined pressure shutdown. M03-PR01a adds one
 dependency-free, bounded, offline Native Segment V1 candidate with exact
-complete-frame fidelity and non-authorizing indexes. `och-runtime` depends
+complete-frame fidelity and non-authorizing indexes. M03-PR02a adds one bounded
+current-only observation query over an already parsed in-memory candidate.
+`och-runtime` depends
 inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05
 `CanonicalAdmission` evidence, reserves exact encoded bytes before allocation,
@@ -82,7 +84,8 @@ receipt, or declaration authority. Runtime pressure is fail-stop: first evidence
 wins, unresolved receipt stages stop, future latest capture becomes unavailable,
 and consuming shutdown waits for the fixed reaper before returning that evidence.
 Durable segment publication/authority, retention/reclamation, unbounded or
-time-based retry, query, adapters, manifest-backed latest projection, pressure retry/clear or
+time-based retry, durable or multi-segment query, adapters, manifest-backed latest
+projection, pressure retry/clear or
 continued degraded ingress, stale-restore custody, and broad repair remain absent.
 Published observations never imply current or held values.
 

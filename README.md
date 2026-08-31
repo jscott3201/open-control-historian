@@ -1,7 +1,7 @@
 # OpenControl Historian
 
 OpenControl Historian is at its canonical-model, manifest-rooted active-journal,
-and offline Native Segment V1 candidate stage.
+and bounded offline Native Segment V1 candidate/query stage.
 This repository provides a small Rust workspace, an enforceable native dependency
 boundary, the dependency-free canonical Historian data model, bounded series
 declaration authority, source/capture provenance and admission boundary,
@@ -19,9 +19,11 @@ first bounded typed pressure evidence, closes ingress before waking waiters, and
 joins the existing fixed reaper before pressure shutdown returns. `och-store` can
 also build and hostile-parse one bounded non-authorizing Native Segment V1
 candidate from one committed sealed raw generation without publishing it or
-changing store authority. It does **not** yet provide durable segment publication,
-retention/reclamation, unbounded or time-based retry, current/held-value, or query
-behavior.
+changing store authority. An already parsed in-memory candidate supports one
+hard-bounded, recent-first observation query for an exact series and optional
+canonical effective-time interval. It does **not** yet provide durable segment
+publication, a store/runtime historical query path, retention/reclamation,
+unbounded or time-based retry, or current/held-value behavior.
 
 ## Current status
 
@@ -92,7 +94,9 @@ pressure retry, clear, continued degraded ingress, or new receipt/latest variant
 Its dependency-free Native Segment V1 candidate retains complete original frames
 in one SeriesId-ordered block per series, plus global append and recent-observation
 directories. Candidate bytes remain in memory/offline, are rejected as store
-inventory, and grant no declaration, runtime, query, retention, or reclamation authority.
+inventory, and grant no declaration, runtime, durable query, retention, or
+reclamation authority. Query results remain bounded non-authorizing projections
+of already hostile-validated candidate bytes.
 
 The current workspace contains:
 
@@ -100,7 +104,7 @@ The current workspace contains:
 | --- | --- | --- |
 | [`och-core`](crates/och-core/) | native | Dependency-free canonical model, bounded series declaration authority, and a measurement-only example |
 | [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, durable retry replay/guard classification, automatic safe-boundary rotation, recovery/pressure inspection, writer-serialized registry control, manifest-backed receipts, and volatile latest snapshots |
-| [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, offline Native Segment V1 candidates, conservative terminal-suffix recovery, typed pressure/reopen custody, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
+| [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, offline Native Segment V1 candidates and bounded in-memory observation query, conservative terminal-suffix recovery, typed pressure/reopen custody, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
 | [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
 
 `och-core` has no dependencies. `och-store` depends inward on `och-core`, and
@@ -226,6 +230,12 @@ through nextest rather than being repeated with `cargo test`.
   [continuation](docs/continuation-m03-pr01a.md) record the exact one-generation
   Native Segment V1 candidate, independent oracle, read-only bridge, and deferred
   publication/query/reclamation boundary.
+- [Native Segment V1 observation query](docs/native-segment-query-v1.md) defines
+  the bounded one-series recent-first result, interval, truncation, complexity,
+  and non-authority contract.
+- [M03-PR02a implementation brief](docs/implementation-brief-m03-pr02a.md) and
+  [continuation](docs/continuation-m03-pr02a.md) record the in-memory query proof,
+  focused evidence, and durable publication/cursor/merge deferrals.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 
