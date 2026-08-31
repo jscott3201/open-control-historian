@@ -36,10 +36,11 @@ The owner accepts these numbers as **standalone tooling resource evidence only**
 Standalone elapsed values are not writer delay, rotation latency, eager-open
 latency, or SLOs. Writer-delay and eager-open SLOs remain `UNKNOWN`.
 
-V2 product work remains blocked on a separately reviewed native timing/
-transaction/fault/cleanup/pressure/receipt evidence plan, measured native
-results, and a fresh owner checkpoint. M03-PR03b's transaction and failure matrix
-remains mandatory.
+V2 product work remains blocked. M03-PR03e now defines the separately reviewed
+[native execution-evidence plan](m03-pr03e-native-execution-evidence-plan.md) and
+authorizes only a later private harness review. That harness, measured Linux
+native results, and a fresh owner checkpoint remain mandatory. M03-PR03b's
+transaction and failure matrix remains `UNSATISFIED`.
 
 ## PR acceptance commands
 

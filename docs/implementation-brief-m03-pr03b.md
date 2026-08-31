@@ -122,7 +122,9 @@ prototype, a 160 MiB absolute target, zero external-sort plan, deterministic
 fixtures, and a reproducible measurement protocol. M03-PR03d records the
 owner-accepted standalone Linux x86_64 measurements and satisfies only that
 tooling measurement condition. It does not satisfy native integration. Before
-implementation, the complete successor evidence must still define and prove:
+implementation, M03-PR03e now defines the executable successor protocol, but its
+complete [native execution-evidence matrix](m03-pr03e-native-execution-evidence-plan.md)
+must still be implemented and proved:
 
 - fixed buffer, index, and temporary-workspace limits;
 - an exact peak resident-memory bound for writer rotation and open;
@@ -135,12 +137,14 @@ implementation, the complete successor evidence must still define and prove:
 - explicit owner approval of the measured resource and latency budget.
 
 The prototype memory target is 160 MiB. M03-PR03d's accepted standalone values are
-not writer delay, rotation latency, eager-open latency, or SLOs. Writer-delay and
-open-latency SLOs remain `UNKNOWN`. A separately reviewed native timing/
-transaction/fault/cleanup/pressure/receipt evidence plan, measured native results,
-and a fresh owner checkpoint remain mandatory. This contract makes no publication
-benchmark claim. See the [M03-PR03c resource plan](m03-pr03c-segment-resource-plan.md)
-and [M03-PR03d evidence record](m03-pr03d-linux-resource-evidence.md).
+not writer delay, rotation latency, eager-open latency, or SLOs. Writer-delay,
+open-latency, native RSS, and total-runtime budgets/SLOs remain `UNKNOWN`.
+M03-PR03e authorizes only later private-harness review; that harness, measured
+Linux native results, and a fresh owner checkpoint remain mandatory. This
+contract makes no publication benchmark claim. See the
+[M03-PR03c resource plan](m03-pr03c-segment-resource-plan.md),
+[M03-PR03d evidence record](m03-pr03d-linux-resource-evidence.md), and
+[M03-PR03e execution-evidence plan](m03-pr03e-native-execution-evidence-plan.md).
 
 ## Future acceptance evidence matrix
 
@@ -149,17 +153,20 @@ implementation is incomplete until each row has independent, deterministic proof
 
 | Future requirement | Required evidence | Docs-PR status |
 | --- | --- | --- |
-| Marker, intent, catalog, and manifest primitives | Independent primitive-only byte oracles for every field, reserved range, endian rule, checksum, exact length, and hostile variant | Not implemented or claimed |
-| Published segment bytes | Independent full-segment oracle proving exact unchanged `OCHSEG01` bytes, source reconstruction, indexes, and trailer | Not implemented or claimed |
-| Namespace and inventory | Exact recognized-name oracle, 156-entry maximum, unknown-name refusal, and no orphan/gap/alternate segment | Not implemented or claimed |
-| Epoch fence | V1, V2, markerless, historical, and mixed-format refusal before lock creation/acquisition or mutation, with before/after equality | Not implemented or claimed |
-| Transaction convergence | Fault injection at every publication phase proving exact prior-root rollback only before commit and exact committed-root adoption only after commit | Not implemented or claimed |
-| Committed cleanup convergence | Inject failure before, between, and after predecessor active deletion, predecessor checkpoint deletion, each fixed staging-name deletion, intent-last removal, and each directory sync; prove no retained raw/segment deletion, no postcommit prior-root fallback, no extra inventory, and eventual exact committed-root reopen | Not implemented or claimed |
-| Pressure and receipts | Storage-pressure custody, no false manifest/catalog/segment commit, and no false durable receipt | Not implemented or claimed |
-| Committed fail-closed behavior | Missing, corrupt, foreign, malformed, truncated, excessive, and catalog-mismatched segment refusal with exact inventory equality | Not implemented or claimed |
-| Raw/segment linkage | Full checksum/hostile parse proving exact StoreId, generation, range, registry, raw length/CRC, frame coverage, and catalog identity | Not implemented or claimed |
-| Bounds | Catalog entries 1 and 64 succeed, entry 65 refuses; inventory 156 is accepted only in a valid state and 157 refuses | Not implemented or claimed |
-| Streaming resources | Exact peak resident-memory bound plus writer-delay/open-latency evidence for minimum, representative, and maximum legal inputs | M03-PR03d accepts standalone Linux tooling RSS only; native timing/product acceptance still blocked |
+| Marker, intent, catalog, and manifest primitives | Independent primitive-only byte oracles for every field, reserved range, endian rule, checksum, exact length, and hostile variant | `UNSATISFIED` |
+| Published segment bytes | Independent full-segment oracle proving exact unchanged `OCHSEG01` bytes, source reconstruction, indexes, and trailer | `UNSATISFIED` |
+| Namespace and inventory | Exact recognized-name oracle, 156-entry maximum, unknown-name refusal, and no orphan/gap/alternate segment | `UNSATISFIED` |
+| Epoch fence | V1, V2, markerless, historical, and mixed-format refusal before lock creation/acquisition or mutation, with before/after equality | `UNSATISFIED` |
+| Transaction convergence | Fault injection at every publication phase proving exact prior-root rollback only before commit and exact committed-root adoption only after commit | `UNSATISFIED` |
+| Committed cleanup convergence | Inject failure before, between, and after predecessor active deletion, predecessor checkpoint deletion, each fixed staging-name deletion, intent-last removal, and each directory sync; prove no retained raw/segment deletion, no postcommit prior-root fallback, no extra inventory, and eventual exact committed-root reopen | `UNSATISFIED` |
+| Pressure and receipts | Storage-pressure custody, no false manifest/catalog/segment commit, and no false durable receipt | `UNSATISFIED` |
+| Committed fail-closed behavior | Missing, corrupt, foreign, malformed, truncated, excessive, and catalog-mismatched segment refusal with exact inventory equality | `UNSATISFIED` |
+| Raw/segment linkage | Full checksum/hostile parse proving exact StoreId, generation, range, registry, raw length/CRC, frame coverage, and catalog identity | `UNSATISFIED` |
+| Bounds | Catalog entries 1 and 64 succeed, entry 65 refuses; inventory 156 is accepted only in a valid state and 157 refuses | `UNSATISFIED` |
+| Streaming resources | Exact peak resident-memory bound plus writer-delay/open-latency evidence for minimum, representative, and maximum legal inputs | `UNSATISFIED`; PR03d is standalone comparison data only |
+
+M03-PR03e maps these 11 rows one-for-one to literal future harness and report
+obligations. Plan acceptance does not satisfy a row.
 
 ## Explicit deferrals
 

@@ -49,10 +49,13 @@ resource ledger, deterministic fixtures, and exploratory measurement protocol fo
 the unchanged Native Segment V1. Its 160 MiB target and zero external-sort plan do
 not authorize V2 product code. M03-PR03d records owner-accepted standalone tooling
 Linux x86_64 resource evidence for that unchanged prototype and satisfies only
-the PR03c standalone measurement condition. Writer-delay and eager-open SLOs
-remain `UNKNOWN`; a separately reviewed native timing/transaction/fault/cleanup/
-pressure/receipt evidence plan, measured native results, and a fresh owner
-checkpoint still block implementation.
+the PR03c standalone measurement condition. M03-PR03e adds only the executable
+native timing/transaction/fault/cleanup/pressure/receipt plan and maps every
+PR03b evidence row to a later private harness/report obligation. It adds no
+harness or result and authorizes only later private-harness review. Writer-delay,
+eager-open, RSS, and total-runtime budgets/SLOs remain `UNKNOWN`; the later
+harness, measured Linux native results, and a fresh owner checkpoint still block
+implementation.
 `och-runtime` depends
 inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05
@@ -106,8 +109,8 @@ time-based retry, multi-segment or runtime query, adapters, manifest-backed late
 projection, pressure retry/clear or
 continued degraded ingress, stale-restore custody, and broad repair remain absent.
 The reviewed future V2 publication contract does not make any of those behaviors
-present and remains blocked on the separately reviewed native evidence plan,
-measured native results, and fresh owner checkpoint described above.
+present and remains blocked on the PR03e plan's separate private harness, measured
+native results, and fresh owner checkpoint described above.
 Published observations never imply current or held values.
 
 The ignored `_roadmap/` directory is local and unpublished.

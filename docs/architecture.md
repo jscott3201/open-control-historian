@@ -34,7 +34,10 @@ M03-PR03c adds a separate private tooling-only exact streaming/resource prototyp
 and measurement protocol. It is not on a native call path, changes no current
 format, and grants no V2 authority. M03-PR03d records owner-accepted standalone
 tooling Linux x86_64 resource evidence and closes only that measurement condition.
-Native timing/failure evidence and fresh owner review still block V2 work.
+M03-PR03e adds only an executable plan for the later private native
+timing/transaction/fault/cleanup/pressure/receipt harness and report. It adds no
+harness or result and grants no V2 authority. Measured Linux native evidence and
+fresh owner review still block V2 work.
 Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
@@ -227,6 +230,8 @@ The separately reviewed but unimplemented future authority is defined by
 [Manifest V2](manifest-v2-contract.md),
 [Generation Catalog V2](generation-catalog-v2-contract.md), and
 [Published Native Segment V1](published-native-segment-v1-contract.md).
+Its still-unimplemented private harness and evidence protocol is defined by the
+[M03-PR03e Native V2 execution-evidence plan](m03-pr03e-native-execution-evidence-plan.md).
 
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`

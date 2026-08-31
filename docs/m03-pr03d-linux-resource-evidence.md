@@ -11,9 +11,10 @@ This record adds no code under `crates/`, product API, durable byte or name,
 writer/rotation/open integration, or Store Format V2 authority. Standalone
 elapsed values are not writer delay, rotation latency, eager-open latency, or
 SLOs. Writer-delay and eager-open SLOs remain `UNKNOWN`. V2 product work remains
-blocked on a separately reviewed native timing/transaction/fault/cleanup/
-pressure/receipt evidence plan, measured native results, and a fresh owner
-checkpoint.
+blocked. M03-PR03e now defines the separately reviewed
+[native execution-evidence plan](m03-pr03e-native-execution-evidence-plan.md) and
+authorizes only later private-harness review; that harness, measured native
+results, and a fresh owner checkpoint remain mandatory.
 
 ## Measured source and functional gate
 
