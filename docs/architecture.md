@@ -26,6 +26,10 @@ hostile-validated in-memory candidate. M03-PR02b adds one synchronous read-only
 raw generation. M03-PR03a adds an intentionally separate crate-test-only typed-value
 block proof for exact raw values and bounded Boolean bit-pack/RLE selection. No
 product call path reaches it and no durable or Native Segment V1 byte changes.
+M03-PR03b adds only a documentation review barrier for a future new-store Store
+Format V2 that would publish the unchanged raw-frame Native Segment V1 beside
+every retained raw seal. Current topology and authority remain Store Format
+V1-only; no proposed V2 name or byte is accepted today.
 Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
@@ -212,6 +216,11 @@ Exact contracts are in [Store Format V1](store-format-v1.md),
 [sealed raw Journal V1](sealed-journal-v1-format.md),
 [Recovery State V1](recovery-state-v1-format.md), and
 [Native Segment V1](native-segment-v1-format.md).
+The separately reviewed but unimplemented future authority is defined by
+[Store Format V2](store-format-v2-contract.md),
+[Manifest V2](manifest-v2-contract.md),
+[Generation Catalog V2](generation-catalog-v2-contract.md), and
+[Published Native Segment V1](published-native-segment-v1-contract.md).
 
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`
@@ -396,4 +405,7 @@ in-memory query successor is recorded by [M03-PR02a](continuation-m03-pr02a.md),
 and its one-generation read-only store composition is recorded by
 [M03-PR02b](continuation-m03-pr02b.md). The private transient typed-value codec
 evidence and its no-format boundary are recorded by
-[M03-PR03a](continuation-m03-pr03a.md).
+[M03-PR03a](continuation-m03-pr03a.md). The future Store Format V2 publication
+contract, fail-closed relationship, and bounded-resource implementation hard stop
+are recorded by [M03-PR03b](continuation-m03-pr03b.md); they do not change the
+current implemented topology.
