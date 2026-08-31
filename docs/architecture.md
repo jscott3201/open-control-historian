@@ -23,7 +23,9 @@ committed sealed raw generation without changing durable store authority.
 M03-PR02a adds one hard-bounded current-only observation query over an already
 hostile-validated in-memory candidate. M03-PR02b adds one synchronous read-only
 `ManifestStore` bridge that composes those proofs for exactly one committed sealed
-raw generation.
+raw generation. M03-PR03a adds an intentionally separate crate-test-only typed-value
+block proof for exact raw values and bounded Boolean bit-pack/RLE selection. No
+product call path reaches it and no durable or Native Segment V1 byte changes.
 Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
@@ -190,6 +192,10 @@ result of at most 16 observations without cursor or runtime integration. Result
 and decoded-cache allocation are `O(limit)`, but the synchronous store composition
 fully reads/builds/parses one generation and can transiently require more than
 700 MB at maximum bounds; allocation exhaustion has no typed recovery contract.
+Separately, crate tests compile one private transient typed-value block codec and
+an independent primitive-only oracle. This evidence has no public symbol, file
+I/O, inventory name, persisted artifact, query/sealing/runtime caller, authority,
+or compatibility contract; a future persisted successor may replace it.
 The store still owns no
 broad repair, latest projection, stale-restore custody, runtime degraded mode, or
 durable query integration.
@@ -388,4 +394,6 @@ The exact offline Native Segment V1 foundation and its publication/query/reclama
 hard stop are recorded by [M03-PR01a](continuation-m03-pr01a.md). The bounded
 in-memory query successor is recorded by [M03-PR02a](continuation-m03-pr02a.md),
 and its one-generation read-only store composition is recorded by
-[M03-PR02b](continuation-m03-pr02b.md).
+[M03-PR02b](continuation-m03-pr02b.md). The private transient typed-value codec
+evidence and its no-format boundary are recorded by
+[M03-PR03a](continuation-m03-pr03a.md).

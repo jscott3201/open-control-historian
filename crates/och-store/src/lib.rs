@@ -30,6 +30,9 @@ mod retry;
 mod segment;
 
 #[cfg(test)]
+mod typed_value_block;
+
+#[cfg(test)]
 #[path = "../tests/support/mod.rs"]
 mod test_support;
 
