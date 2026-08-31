@@ -31,9 +31,12 @@ No physical capacity probe or reservation exists, and no V1 byte or inventory
 contract changed. Default tests use deterministic fault seams; no `/dev/full` or
 provisioned-filesystem claim is required.
 
-## Deferred successor
+## Completed successor handoff
 
-M02-PR03b2 owns runtime degraded health, latest preservation, receipt, shutdown,
-and recovery policy. Stale-restore custody, broad repair, retention/reclamation,
-segments, query, providers, adapters, and platform-wide physical guarantees also
-remain absent.
+M02-PR03b2 now consumes the typed store boundary as a bounded fail-stop runtime
+lifecycle: first evidence and composed reopen custody are retained before ingress
+waiters wake, existing receipt/latest truth is preserved, and consuming pressure
+shutdown waits for the fixed reaper. It adds no store classifier, physical probe,
+durable pressure state, or V1 change. Pressure retry/clear, continued degraded
+ingress, stale-restore custody, broad repair, retention/reclamation, segments,
+query, providers, adapters, and platform-wide physical guarantees remain absent.
