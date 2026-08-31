@@ -32,7 +32,9 @@ every retained raw seal. Current topology and authority remain Store Format
 V1-only; no proposed V2 name or byte is accepted today.
 M03-PR03c adds a separate private tooling-only exact streaming/resource prototype
 and measurement protocol. It is not on a native call path, changes no current
-format, and leaves V2 implementation blocked on Linux evidence and owner review.
+format, and grants no V2 authority. M03-PR03d records owner-accepted standalone
+tooling Linux x86_64 resource evidence and closes only that measurement condition.
+Native timing/failure evidence and fresh owner review still block V2 work.
 Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
@@ -419,4 +421,7 @@ evidence and its no-format boundary are recorded by
 contract, fail-closed relationship, and bounded-resource implementation hard stop
 are recorded by [M03-PR03b](continuation-m03-pr03b.md); they do not change the
 current implemented topology. The tooling-only resource successor and remaining
-Linux/owner stop are recorded by [M03-PR03c](continuation-m03-pr03c.md).
+standalone measurement protocol are recorded by
+[M03-PR03c](continuation-m03-pr03c.md). The accepted standalone Linux result and
+remaining native evidence/owner stop are recorded by
+[M03-PR03d](continuation-m03-pr03d.md).

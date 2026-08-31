@@ -1,0 +1,7 @@
+case	operation	repetition	elapsed_seconds	peak_rss_bytes	fixture_logical_high_water_bytes	fixture_allocated_high_water_bytes	final_logical_high_water_bytes	final_allocated_high_water_bytes	external_workspace_logical_high_water_bytes	external_workspace_allocated_high_water_bytes
+max-bytes	stream-build	1	18.180000000	9379840	536870912	536870912	543361192	543367168	0	0
+max-bytes	stream-build	2	18.170000000	9363456	536870912	536870912	543361192	543367168	0	0
+max-bytes	stream-build	3	18.170000000	9375744	536870912	536870912	543361192	543367168	0	0
+max-bytes	stream-validate	1	19.240000000	10067968	536870912	536870912	543361192	543367168	0	0
+max-bytes	stream-validate	2	19.200000000	9891840	536870912	536870912	543361192	543367168	0	0
+max-bytes	stream-validate	3	19.240000000	9887744	536870912	536870912	543361192	543367168	0	0

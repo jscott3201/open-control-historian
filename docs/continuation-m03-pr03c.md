@@ -81,13 +81,17 @@ OCH_V2_EVIDENCE_ROOT=target/v2-evidence-max-bytes \
   ./scripts/measure-v2-evidence.sh --cases max-bytes --repetitions 3
 ```
 
+M03-PR03d subsequently records the clean Linux x86_64 repetition of this full
+matrix plus open-64 and its owner acceptance as standalone tooling resource
+evidence. See the [accepted evidence record](m03-pr03d-linux-resource-evidence.md).
+
 ## Remaining hard stop
 
-Linux x86_64 release evidence must still exercise maximum legal bounds, report
-all elapsed and maximum-RSS samples, stay below 160 MiB, and return to the owner
-with measured latency. Numeric writer-delay and eager-open latency ceilings remain
-`UNKNOWN`. A fresh owner checkpoint must accept both memory and latency before any
-Store Format V2 implementation starts.
+M03-PR03d satisfies only the standalone Linux resource-measurement condition.
+Its elapsed values are not writer delay, rotation latency, eager-open latency, or
+SLOs. Writer-delay and eager-open SLOs remain `UNKNOWN`. Store Format V2 work
+requires a separately reviewed native timing/transaction/fault/cleanup/pressure/
+receipt evidence plan, measured native results, and a fresh owner checkpoint.
 
 The tool does not prove native sole-writer pre-intent integration, Manifest-last
 publication, crash/cleanup convergence, pressure custody, receipts, or final

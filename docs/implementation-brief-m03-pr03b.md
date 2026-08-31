@@ -119,9 +119,10 @@ open, whose latency and workspace have not been approved.
 
 M03-PR03c now supplies a separately reviewed tooling-only streaming/multipass
 prototype, a 160 MiB absolute target, zero external-sort plan, deterministic
-fixtures, and a reproducible measurement protocol. It does not satisfy native
-integration or Linux acceptance. Before implementation, the complete successor
-evidence must still define and prove:
+fixtures, and a reproducible measurement protocol. M03-PR03d records the
+owner-accepted standalone Linux x86_64 measurements and satisfies only that
+tooling measurement condition. It does not satisfy native integration. Before
+implementation, the complete successor evidence must still define and prove:
 
 - fixed buffer, index, and temporary-workspace limits;
 - an exact peak resident-memory bound for writer rotation and open;
@@ -133,10 +134,13 @@ evidence must still define and prove:
   and directory-sync boundary; and
 - explicit owner approval of the measured resource and latency budget.
 
-The prototype memory target is 160 MiB. Linux x86_64 maximum-bound acceptance and
-all writer-delay/open-latency SLOs remain `UNKNOWN` pending measurement and a fresh
-owner checkpoint. This contract makes no publication benchmark claim. See the
-[M03-PR03c resource plan](m03-pr03c-segment-resource-plan.md).
+The prototype memory target is 160 MiB. M03-PR03d's accepted standalone values are
+not writer delay, rotation latency, eager-open latency, or SLOs. Writer-delay and
+open-latency SLOs remain `UNKNOWN`. A separately reviewed native timing/
+transaction/fault/cleanup/pressure/receipt evidence plan, measured native results,
+and a fresh owner checkpoint remain mandatory. This contract makes no publication
+benchmark claim. See the [M03-PR03c resource plan](m03-pr03c-segment-resource-plan.md)
+and [M03-PR03d evidence record](m03-pr03d-linux-resource-evidence.md).
 
 ## Future acceptance evidence matrix
 
@@ -155,7 +159,7 @@ implementation is incomplete until each row has independent, deterministic proof
 | Committed fail-closed behavior | Missing, corrupt, foreign, malformed, truncated, excessive, and catalog-mismatched segment refusal with exact inventory equality | Not implemented or claimed |
 | Raw/segment linkage | Full checksum/hostile parse proving exact StoreId, generation, range, registry, raw length/CRC, frame coverage, and catalog identity | Not implemented or claimed |
 | Bounds | Catalog entries 1 and 64 succeed, entry 65 refuses; inventory 156 is accepted only in a valid state and 157 refuses | Not implemented or claimed |
-| Streaming resources | Exact peak resident-memory bound plus writer-delay/open-latency evidence for minimum, representative, and maximum legal inputs | Tooling prototype delivered by M03-PR03c; Linux/product acceptance still blocked |
+| Streaming resources | Exact peak resident-memory bound plus writer-delay/open-latency evidence for minimum, representative, and maximum legal inputs | M03-PR03d accepts standalone Linux tooling RSS only; native timing/product acceptance still blocked |
 
 ## Explicit deferrals
 
