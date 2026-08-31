@@ -20,6 +20,8 @@ transaction preflight plus typed observed pressure and sticky reopen custody.
 M02-PR03b2 projects that custody into one bounded fail-stop runtime lifecycle.
 M03-PR01a adds one bounded offline Native Segment V1 candidate derived from one
 committed sealed raw generation without changing durable store authority.
+M03-PR02a adds one hard-bounded current-only observation query over an already
+hostile-validated in-memory candidate.
 Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
@@ -177,9 +179,12 @@ raw generation into SeriesId-ascending blocks, adds a strict global append
 directory and canonical recent-observation indexes, and reconstructs source
 length/checksum during parse. The read-only store bridge selects only committed
 catalog evidence and never adds an inventory artifact or durable reference.
-Segment decode remains non-authorizing; durable publication, query, and
-reclamation remain absent. The store still owns no broad repair, latest
-projection, stale-restore custody, runtime degraded mode, or query behavior.
+Segment decode remains non-authorizing; durable publication, durable query, and
+reclamation remain absent. The in-memory parsed view alone supports an exact
+one-series, optional-effective-time, recent-first result of at most 16
+observations without cursor or store/runtime integration. The store still owns no
+broad repair, latest projection, stale-restore custody, runtime degraded mode, or
+durable query integration.
 At a store-owned create/write/resize/truncate/sync/rename/publish/remove boundary,
 only `StorageFull` and `QuotaExceeded` are typed as pressure. The first such live
 failure makes the direct active journal or composed manifest store require reopen;
@@ -335,7 +340,8 @@ evidence rather than graceful or generic success.
 ## Intentionally absent
 
 There is currently no async/blocking admission wait, eviction, subscription/wait
-API, mutable read guard, durable segment publication/authority, sealed-history query
+API, mutable read guard, durable segment publication/authority, durable
+sealed-history query
 API, retention/reclamation, unbounded/time-based retry, manifest-backed latest
 reconstruction, broad repair or stale-restore event model, pressure retry/clear,
 continued degraded ingress, query
@@ -371,4 +377,5 @@ Store-only pressure custody and its runtime-policy handoff are recorded by
 [M02-PR03b1](continuation-m02-pr03b1.md). The bounded fail-stop runtime pressure
 lifecycle is recorded by [M02-PR03b2](continuation-m02-pr03b2.md).
 The exact offline Native Segment V1 foundation and its publication/query/reclamation
-hard stop are recorded by [M03-PR01a](continuation-m03-pr01a.md).
+hard stop are recorded by [M03-PR01a](continuation-m03-pr01a.md). The bounded
+in-memory query successor is recorded by [M03-PR02a](continuation-m03-pr02a.md).

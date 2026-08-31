@@ -12,8 +12,9 @@
 //! Store-owned mutation boundaries report typed storage pressure and retain
 //! volatile reopen custody without changing durable formats. One committed sealed
 //! generation can also produce a bounded in-memory Native Segment V1 candidate
-//! with non-authorizing indexes. The crate owns no runtime scheduling, degraded
-//! policy, segment publication/authority, reclamation, or query behavior.
+//! with non-authorizing indexes. An already parsed candidate supports one bounded
+//! one-series recent-observation query. The crate owns no runtime scheduling,
+//! degraded policy, durable segment publication/query authority, or reclamation.
 
 mod active;
 mod codec;
@@ -73,10 +74,12 @@ pub use retry::{
     RetryStateReference, RetryStateSnapshot,
 };
 pub use segment::{
-    MAX_SEGMENT_V1_BYTES, MAX_SEGMENT_V1_OBSERVATIONS, MAX_SEGMENT_V1_SERIES, PreparedSegmentV1,
-    SEGMENT_V1_APPEND_ENTRY_LEN, SEGMENT_V1_CRC_LEN, SEGMENT_V1_HEADER_LEN, SEGMENT_V1_MAGIC,
-    SEGMENT_V1_OBSERVATION_ENTRY_LEN, SEGMENT_V1_SERIES_ENTRY_LEN, SEGMENT_V1_VERSION,
-    SegmentAppendEntryV1, SegmentObservationEntryV1, SegmentSeriesEntryV1, SegmentV1,
+    MAX_SEGMENT_QUERY_RESULTS_V1, MAX_SEGMENT_V1_BYTES, MAX_SEGMENT_V1_OBSERVATIONS,
+    MAX_SEGMENT_V1_SERIES, PreparedSegmentV1, SEGMENT_V1_APPEND_ENTRY_LEN, SEGMENT_V1_CRC_LEN,
+    SEGMENT_V1_HEADER_LEN, SEGMENT_V1_MAGIC, SEGMENT_V1_OBSERVATION_ENTRY_LEN,
+    SEGMENT_V1_SERIES_ENTRY_LEN, SEGMENT_V1_VERSION, SegmentAppendEntryV1,
+    SegmentObservationEntryV1, SegmentObservationQueryItemV1, SegmentObservationQueryResultV1,
+    SegmentObservationQueryV1, SegmentObservationQueryV1Error, SegmentSeriesEntryV1, SegmentV1,
     SegmentV1Error, SegmentV1Inspection, build_segment_v1, parse_segment_v1,
 };
 

@@ -9,12 +9,13 @@ use crate::{
     encode_decoded_admission_frame_v1,
 };
 use och_core::{
-    MAX_SOURCE_OBSERVATION_CONTEXTS, ObservationId, RawObservationOrderKey, SeriesId, StoreId,
-    Timestamp,
+    MAX_SOURCE_OBSERVATION_CONTEXTS, Observation, ObservationId, RawObservationOrderKey, SeriesId,
+    StoreId, TimeInterval, Timestamp,
 };
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 /// Exact eight-byte Native Segment V1 magic.
 pub const SEGMENT_V1_MAGIC: [u8; 8] = *b"OCHSEG01";
@@ -42,6 +43,8 @@ pub const MAX_SEGMENT_V1_BYTES: u64 = SEGMENT_V1_HEADER_LEN as u64
     + SEGMENT_V1_APPEND_ENTRY_LEN as u64 * MAX_ACTIVE_JOURNAL_RECORDS as u64
     + SEGMENT_V1_OBSERVATION_ENTRY_LEN as u64 * MAX_SEGMENT_V1_OBSERVATIONS as u64
     + SEGMENT_V1_CRC_LEN as u64;
+/// Maximum observations materialized by one Native Segment V1 query.
+pub const MAX_SEGMENT_QUERY_RESULTS_V1: usize = 16;
 
 const SEGMENT_FLAGS_NONE: u32 = 0;
 
@@ -73,6 +76,194 @@ impl fmt::Display for SegmentV1Error {
 }
 
 impl Error for SegmentV1Error {}
+
+/// Closed, path- and content-free Native Segment V1 observation-query refusals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegmentObservationQueryV1Error {
+    /// The requested result limit is zero or exceeds the fixed public hard cap.
+    InvalidLimit,
+    /// Validated segment/index/frame evidence became impossibly inconsistent.
+    InconsistentSegment,
+}
+
+impl fmt::Display for SegmentObservationQueryV1Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidLimit => "invalid Native Segment V1 query result limit",
+            Self::InconsistentSegment => "inconsistent Native Segment V1 query evidence",
+        })
+    }
+}
+
+impl Error for SegmentObservationQueryV1Error {}
+
+/// Validated bounded selection for one series' Native Segment V1 observations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentObservationQueryV1 {
+    series_id: SeriesId,
+    interval: Option<TimeInterval>,
+    limit: usize,
+}
+
+impl SegmentObservationQueryV1 {
+    /// Constructs a one-series query with an optional canonical effective-time filter.
+    ///
+    /// # Errors
+    ///
+    /// Refuses zero and limits above [`MAX_SEGMENT_QUERY_RESULTS_V1`] before any
+    /// segment inspection or result allocation.
+    pub const fn new(
+        series_id: SeriesId,
+        interval: Option<TimeInterval>,
+        limit: usize,
+    ) -> Result<Self, SegmentObservationQueryV1Error> {
+        if limit == 0 || limit > MAX_SEGMENT_QUERY_RESULTS_V1 {
+            return Err(SegmentObservationQueryV1Error::InvalidLimit);
+        }
+        Ok(Self {
+            series_id,
+            interval,
+            limit,
+        })
+    }
+
+    /// Returns the exact selected series.
+    #[must_use]
+    pub const fn series_id(self) -> SeriesId {
+        self.series_id
+    }
+
+    /// Returns the optional start-inclusive, end-exclusive effective-time filter.
+    #[must_use]
+    pub const fn interval(self) -> Option<TimeInterval> {
+        self.interval
+    }
+
+    /// Returns the positive result limit, at most the fixed public hard cap.
+    #[must_use]
+    pub const fn limit(self) -> usize {
+        self.limit
+    }
+}
+
+/// One exact non-authorizing observation selected from a Native Segment V1 frame.
+pub struct SegmentObservationQueryItemV1 {
+    entry: SegmentObservationEntryV1,
+    admission: Arc<DecodedAdmissionV1>,
+    observation_index: usize,
+}
+
+impl SegmentObservationQueryItemV1 {
+    /// Returns the exact proven recent-observation index entry.
+    #[must_use]
+    pub const fn entry(&self) -> SegmentObservationEntryV1 {
+        self.entry
+    }
+
+    /// Borrows the exact decoded source admission containing this observation.
+    ///
+    /// The admission remains inspection evidence and cannot authorize registry,
+    /// retry, runtime, receipt, or durable-store state.
+    #[must_use]
+    pub fn admission(&self) -> &DecodedAdmissionV1 {
+        &self.admission
+    }
+
+    /// Borrows the exact canonical observation selected by the index ordinal.
+    #[must_use]
+    pub fn observation(&self) -> &Observation {
+        &self.admission.envelope().observations()[self.observation_index]
+    }
+
+    /// Borrows the decoded source lineage associated with the observation.
+    #[must_use]
+    pub fn lineage(&self) -> &crate::DecodedObservationLineageV1 {
+        &self.admission.observations()[self.observation_index]
+    }
+}
+
+impl fmt::Debug for SegmentObservationQueryItemV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SegmentObservationQueryItemV1")
+            .field("entry", &self.entry)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Immutable bounded result of one Native Segment V1 observation query.
+pub struct SegmentObservationQueryResultV1 {
+    series_id: SeriesId,
+    interval: Option<TimeInterval>,
+    requested_limit: usize,
+    items: Box<[SegmentObservationQueryItemV1]>,
+    is_truncated: bool,
+}
+
+impl SegmentObservationQueryResultV1 {
+    /// Returns the exact selected series.
+    #[must_use]
+    pub const fn series_id(&self) -> SeriesId {
+        self.series_id
+    }
+
+    /// Returns the requested canonical effective-time interval.
+    #[must_use]
+    pub const fn interval(&self) -> Option<TimeInterval> {
+        self.interval
+    }
+
+    /// Returns the caller's positive bounded result limit.
+    #[must_use]
+    pub const fn requested_limit(&self) -> usize {
+        self.requested_limit
+    }
+
+    /// Borrows exact items in canonical recent-first order.
+    #[must_use]
+    pub fn items(&self) -> &[SegmentObservationQueryItemV1] {
+        &self.items
+    }
+
+    /// Returns the number of materialized items, never above the requested limit.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Reports whether no observation matched the selection.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Reports whether at least one additional matching index entry exists.
+    ///
+    /// No continuation token is supplied by this bounded current-only contract.
+    #[must_use]
+    pub const fn is_truncated(&self) -> bool {
+        self.is_truncated
+    }
+
+    /// Alias for [`Self::is_truncated`] emphasizing additional-result evidence.
+    #[must_use]
+    pub const fn has_more(&self) -> bool {
+        self.is_truncated
+    }
+}
+
+impl fmt::Debug for SegmentObservationQueryResultV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SegmentObservationQueryResultV1")
+            .field("series_id", &self.series_id)
+            .field("interval", &self.interval)
+            .field("requested_limit", &self.requested_limit)
+            .field("item_count", &self.items.len())
+            .field("is_truncated", &self.is_truncated)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Complete bounded metadata carried by one Native Segment V1 header and trailer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -476,6 +667,161 @@ impl SegmentV1<'_> {
     ) -> Result<DecodedAdmissionV1, SegmentV1Error> {
         decode_admission_frame_v1(self.frame_bytes(entry)?, DecodeLimitsV1::maximum(), None)
             .map_err(|_| SegmentV1Error::InvalidSegment)
+    }
+
+    /// Selects exact observations for one series in canonical recent-first order.
+    ///
+    /// The optional interval is applied to canonical effective time with
+    /// [`TimeInterval`]'s start-inclusive, end-exclusive law. The method decodes
+    /// no unrelated series frames, retains at most the requested number of
+    /// distinct decoded frames, and inspects only through the first additional
+    /// matching index entry when reporting truncation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentObservationQueryV1Error::InconsistentSegment`] rather
+    /// than panicking if the parser's immutable index/frame invariants become
+    /// impossibly inconsistent.
+    #[allow(clippy::too_many_lines)]
+    pub fn query_observations_v1(
+        &self,
+        query: &SegmentObservationQueryV1,
+    ) -> Result<SegmentObservationQueryResultV1, SegmentObservationQueryV1Error> {
+        let empty = || SegmentObservationQueryResultV1 {
+            series_id: query.series_id,
+            interval: query.interval,
+            requested_limit: query.limit,
+            items: Box::new([]),
+            is_truncated: false,
+        };
+        let Ok(series_index) = self
+            .series
+            .binary_search_by_key(&query.series_id, |entry| entry.series_id)
+        else {
+            return Ok(empty());
+        };
+        let series = self.series[series_index];
+        let relative_offset = series
+            .recent_offset
+            .checked_sub(self.inspection.recent_directory_offset)
+            .ok_or(SegmentObservationQueryV1Error::InconsistentSegment)?;
+        if relative_offset % SEGMENT_V1_OBSERVATION_ENTRY_LEN as u64 != 0 {
+            return Err(SegmentObservationQueryV1Error::InconsistentSegment);
+        }
+        let start = usize::try_from(relative_offset / SEGMENT_V1_OBSERVATION_ENTRY_LEN as u64)
+            .map_err(|_| SegmentObservationQueryV1Error::InconsistentSegment)?;
+        let count = usize::try_from(series.observation_count)
+            .map_err(|_| SegmentObservationQueryV1Error::InconsistentSegment)?;
+        let expected_length = count
+            .checked_mul(SEGMENT_V1_OBSERVATION_ENTRY_LEN)
+            .and_then(|length| u64::try_from(length).ok())
+            .ok_or(SegmentObservationQueryV1Error::InconsistentSegment)?;
+        if series.recent_length != expected_length {
+            return Err(SegmentObservationQueryV1Error::InconsistentSegment);
+        }
+        let end = start
+            .checked_add(count)
+            .ok_or(SegmentObservationQueryV1Error::InconsistentSegment)?;
+        let entries = self
+            .observations
+            .get(start..end)
+            .ok_or(SegmentObservationQueryV1Error::InconsistentSegment)?;
+        if entries.is_empty() {
+            return Ok(empty());
+        }
+
+        let mut items = Vec::with_capacity(query.limit);
+        let mut decoded_frames = Vec::<(u64, Arc<DecodedAdmissionV1>)>::with_capacity(query.limit);
+        let mut is_truncated = false;
+        for entry in entries {
+            if entry.series_id != query.series_id {
+                return Err(SegmentObservationQueryV1Error::InconsistentSegment);
+            }
+            if query
+                .interval
+                .is_some_and(|interval| !interval.contains(entry.raw_order_key.effective()))
+            {
+                continue;
+            }
+            if items.len() == query.limit {
+                is_truncated = true;
+                break;
+            }
+
+            let append_index = self
+                .appends
+                .binary_search_by_key(&entry.append_sequence, |append| append.append_sequence)
+                .map_err(|_| SegmentObservationQueryV1Error::InconsistentSegment)?;
+            let append = self.appends[append_index];
+            if append.append_sequence != entry.append_sequence
+                || append.series_id != entry.series_id
+                || append.frame_offset != entry.frame_offset
+                || append.frame_length != entry.frame_length
+                || append.frame_ordinal != entry.frame_ordinal
+            {
+                return Err(SegmentObservationQueryV1Error::InconsistentSegment);
+            }
+
+            let admission = if let Some((_, decoded)) = decoded_frames
+                .iter()
+                .find(|(sequence, _)| *sequence == append.append_sequence)
+            {
+                Arc::clone(decoded)
+            } else {
+                let frame = checked_slice(self.bytes, append.frame_offset, append.frame_length)
+                    .ok_or(SegmentObservationQueryV1Error::InconsistentSegment)?;
+                note_query_decode();
+                let decoded = Arc::new(
+                    decode_admission_frame_v1(frame, DecodeLimitsV1::maximum(), None)
+                        .map_err(|_| SegmentObservationQueryV1Error::InconsistentSegment)?,
+                );
+                decoded_frames.push((append.append_sequence, Arc::clone(&decoded)));
+                decoded
+            };
+            if admission.append_sequence() != append.append_sequence
+                || admission.store_id() != self.inspection.store_id
+                || admission.declaration().store_id() != self.inspection.store_id
+                || admission.declaration().series_id() != query.series_id
+                || admission.envelope().series().series_id() != query.series_id
+                || admission.retry().series_id() != query.series_id
+            {
+                return Err(SegmentObservationQueryV1Error::InconsistentSegment);
+            }
+            let observation_ordinal = u8::try_from(entry.observation_ordinal)
+                .map_err(|_| SegmentObservationQueryV1Error::InconsistentSegment)?;
+            let observation_index = usize::from(observation_ordinal);
+            let observation = admission
+                .envelope()
+                .observations()
+                .get(observation_index)
+                .ok_or(SegmentObservationQueryV1Error::InconsistentSegment)?;
+            let lineage = admission
+                .observations()
+                .get(observation_index)
+                .ok_or(SegmentObservationQueryV1Error::InconsistentSegment)?;
+            if observation.raw_order_key() != entry.raw_order_key
+                || observation.observation_id() != entry.observation_id()
+                || lineage.canonical_observation_id() != observation.observation_id()
+                || lineage.raw().snapshot_id() != admission.lifecycle().snapshot().evidence_id()
+                || lineage.normalized().raw_record_id() != lineage.raw().evidence_id()
+                || lineage.normalized().observation_evidence_id()
+                    != lineage.observation().evidence_id()
+            {
+                return Err(SegmentObservationQueryV1Error::InconsistentSegment);
+            }
+            items.push(SegmentObservationQueryItemV1 {
+                entry: *entry,
+                admission,
+                observation_index,
+            });
+        }
+        Ok(SegmentObservationQueryResultV1 {
+            series_id: query.series_id,
+            interval: query.interval,
+            requested_limit: query.limit,
+            items: items.into_boxed_slice(),
+            is_truncated,
+        })
     }
 }
 
@@ -1361,6 +1707,26 @@ fn checked_slice(bytes: &[u8], offset: u64, length: u64) -> Option<&[u8]> {
     bytes.get(start..end)
 }
 
+fn note_query_decode() {
+    #[cfg(test)]
+    QUERY_DECODE_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static QUERY_DECODE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_query_decode_count() {
+    QUERY_DECODE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn query_decode_count() -> usize {
+    QUERY_DECODE_COUNT.with(std::cell::Cell::get)
+}
+
 fn read_count(bytes: &[u8], offset: usize, maximum: usize) -> Result<usize, SegmentV1Error> {
     let count = read_u32(bytes, offset)
         .and_then(|value| usize::try_from(value).ok())
@@ -1610,6 +1976,424 @@ mod tests {
             test_support::observation_id(10_000)
         );
         assert_eq!(recent[3].raw_order_key().effective().unix_seconds(), 5);
+        let queried = parsed
+            .query_observations_v1(
+                &SegmentObservationQueryV1::new(test_support::series_id(2), None, 16)
+                    .expect("valid recent-order query"),
+            )
+            .expect("query out-of-order-time candidate");
+        assert_eq!(
+            queried
+                .items()
+                .iter()
+                .map(SegmentObservationQueryItemV1::entry)
+                .collect::<Vec<_>>(),
+            recent
+        );
+    }
+
+    #[test]
+    fn query_bound_refuses_zero_and_above_sixteen_before_segment_access() {
+        for invalid in [0, MAX_SEGMENT_QUERY_RESULTS_V1 + 1] {
+            assert_eq!(
+                SegmentObservationQueryV1::new(test_support::series_id(2), None, invalid)
+                    .expect_err("invalid result limit must refuse"),
+                SegmentObservationQueryV1Error::InvalidLimit
+            );
+        }
+        assert!(SegmentObservationQueryV1::new(test_support::series_id(2), None, 1).is_ok());
+        assert!(
+            SegmentObservationQueryV1::new(
+                test_support::series_id(2),
+                None,
+                MAX_SEGMENT_QUERY_RESULTS_V1,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn query_returns_exact_recent_items_and_shares_each_decoded_frame() {
+        let first = frame(
+            test_support::observed_admission(
+                vec![ExactValue::Boolean(true), ExactValue::Boolean(false)],
+                ValueFamily::Boolean,
+                1,
+                false,
+            ),
+            9,
+        );
+        let revised = frame(
+            test_support::observed_admission(
+                vec![ExactValue::Boolean(true)],
+                ValueFamily::Boolean,
+                0,
+                true,
+            ),
+            10,
+        );
+        let gap_only = frame(
+            test_support::observed_admission(Vec::new(), ValueFamily::Boolean, 1, true),
+            11,
+        );
+        let other_series = frame(
+            test_support::observed_admission_for_series(
+                vec![ExactValue::Boolean(false)],
+                ValueFamily::Boolean,
+                0,
+                false,
+                6,
+                7,
+                30_000,
+            ),
+            12,
+        );
+        let no_change = frame(test_support::no_change_admission(), 13);
+        let raw = raw_journal(
+            test_support::store_id(1),
+            &[&first, &revised, &gap_only, &other_series, &no_change],
+        );
+        let candidate =
+            build_segment_v1(test_support::store_id(1), sealed(&raw, 3, 8, 13, 4), &raw)
+                .expect("build selected-series query candidate");
+        let before = candidate.bytes().to_vec();
+        let segment = parse_segment_v1(candidate.bytes(), test_support::store_id(1))
+            .expect("parse selected-series query candidate");
+        let query = SegmentObservationQueryV1::new(
+            test_support::series_id(2),
+            None,
+            MAX_SEGMENT_QUERY_RESULTS_V1,
+        )
+        .expect("valid selected-series query");
+
+        let result = segment
+            .query_observations_v1(&query)
+            .expect("query validated segment");
+        assert_eq!(result.series_id(), test_support::series_id(2));
+        assert_eq!(result.interval(), None);
+        assert_eq!(result.requested_limit(), MAX_SEGMENT_QUERY_RESULTS_V1);
+        assert_eq!(result.len(), 3);
+        assert!(!result.is_empty());
+        assert!(!result.is_truncated());
+        assert!(!result.has_more());
+        assert!(
+            result
+                .items()
+                .iter()
+                .all(|item| item.entry().series_id() == test_support::series_id(2))
+        );
+        assert_eq!(
+            result
+                .items()
+                .iter()
+                .map(|item| (
+                    item.entry().observation_id(),
+                    item.entry().append_sequence(),
+                    item.entry().observation_ordinal(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (test_support::observation_id(10_001), 9, 1),
+                (test_support::observation_id(10_000), 10, 0),
+                (test_support::observation_id(10_000), 9, 0),
+            ]
+        );
+
+        let expected = segment
+            .decode_frame(&segment.append_directory()[0])
+            .expect("decode expected first admission");
+        let item = &result.items()[0];
+        let expected_observation = &expected.envelope().observations()[1];
+        let expected_lineage = &expected.observations()[1];
+        assert_eq!(item.admission(), &expected);
+        assert_eq!(item.observation(), expected_observation);
+        assert_eq!(
+            item.observation().observation_id(),
+            item.entry().observation_id()
+        );
+        assert_eq!(item.observation().value(), &ExactValue::Boolean(false));
+        assert_eq!(item.observation().times(), expected_observation.times());
+        assert_eq!(item.observation().quality(), expected_observation.quality());
+        assert_eq!(
+            item.observation().native_status(),
+            expected_observation.native_status()
+        );
+        assert_eq!(
+            item.observation().producer_position(),
+            expected_observation.producer_position()
+        );
+        assert_eq!(item.lineage(), expected_lineage);
+        assert_eq!(
+            item.lineage().canonical_observation_id(),
+            item.observation().observation_id()
+        );
+        assert_eq!(item.admission().declaration(), expected.declaration());
+        assert_eq!(item.admission().retry(), expected.retry());
+        assert_eq!(item.admission().batch(), expected.batch());
+        assert_eq!(item.admission().lifecycle(), expected.lifecycle());
+        assert!(std::ptr::eq(
+            result.items()[0].admission(),
+            result.items()[2].admission()
+        ));
+        assert!(!std::ptr::eq(
+            result.items()[0].admission(),
+            result.items()[1].admission()
+        ));
+
+        let repeated = segment
+            .query_observations_v1(&query)
+            .expect("repeat identical query");
+        assert_eq!(
+            result
+                .items()
+                .iter()
+                .map(SegmentObservationQueryItemV1::entry)
+                .collect::<Vec<_>>(),
+            repeated
+                .items()
+                .iter()
+                .map(SegmentObservationQueryItemV1::entry)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(candidate.bytes(), before);
+    }
+
+    #[test]
+    fn query_interval_is_start_inclusive_end_exclusive_at_negative_time() {
+        let observed = frame(
+            test_support::observed_admission_with_raw_times(&[
+                (10_000, -3, 0, -2, 0),
+                (10_001, -2, 0, -1, 0),
+                (10_002, 99, 0, 0, 0),
+                (10_003, 1, 0, 1, 0),
+            ]),
+            1,
+        );
+        let raw = raw_journal(test_support::store_id(1), &[&observed]);
+        let candidate = build_segment_v1(test_support::store_id(1), sealed(&raw, 3, 0, 1, 4), &raw)
+            .expect("build interval query candidate");
+        let segment = parse_segment_v1(candidate.bytes(), test_support::store_id(1))
+            .expect("parse interval query candidate");
+        let interval = TimeInterval::new(
+            Timestamp::new(-1, 0).expect("negative inclusive start"),
+            Timestamp::new(0, 0).expect("exclusive epoch end"),
+        )
+        .expect("nonempty negative interval");
+        let query = SegmentObservationQueryV1::new(test_support::series_id(2), Some(interval), 1)
+            .expect("valid interval query");
+
+        let result = segment
+            .query_observations_v1(&query)
+            .expect("query negative interval");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.interval(), Some(interval));
+        assert!(!result.is_truncated());
+        assert_eq!(
+            result.items()[0].observation().observation_id(),
+            test_support::observation_id(10_001)
+        );
+        assert_eq!(
+            result.items()[0].observation().times().effective(),
+            interval.start()
+        );
+    }
+
+    #[test]
+    fn query_limits_one_and_sixteen_decode_only_materialized_unique_frames() {
+        let values = (0..17)
+            .map(|index| ExactValue::Signed(i64::from(index)))
+            .collect();
+        let observed = frame(
+            test_support::observed_admission(values, ValueFamily::Signed, 0, false),
+            1,
+        );
+        let raw = raw_journal(test_support::store_id(1), &[&observed]);
+        let candidate = build_segment_v1(test_support::store_id(1), sealed(&raw, 3, 0, 1, 4), &raw)
+            .expect("build result-bound query candidate");
+        let segment = parse_segment_v1(candidate.bytes(), test_support::store_id(1))
+            .expect("parse result-bound query candidate");
+
+        for limit in [1, MAX_SEGMENT_QUERY_RESULTS_V1] {
+            reset_query_decode_count();
+            let query = SegmentObservationQueryV1::new(test_support::series_id(2), None, limit)
+                .expect("valid bounded query");
+            let result = segment
+                .query_observations_v1(&query)
+                .expect("query bounded result");
+            assert_eq!(result.len(), limit);
+            assert!(result.is_truncated());
+            assert!(result.has_more());
+            assert_eq!(query_decode_count(), 1);
+            assert_eq!(
+                result.items()[0].observation().observation_id(),
+                test_support::observation_id(10_016)
+            );
+            assert!(
+                result.items()[1..]
+                    .iter()
+                    .all(|item| std::ptr::eq(item.admission(), result.items()[0].admission()))
+            );
+        }
+
+        let two_frames = frame(
+            test_support::observed_admission_with_raw_times(&[(20_000, 10, 11, 10, 12)]),
+            2,
+        );
+        let raw = raw_journal(test_support::store_id(1), &[&observed, &two_frames]);
+        let candidate = build_segment_v1(test_support::store_id(1), sealed(&raw, 3, 0, 2, 4), &raw)
+            .expect("build distinct-frame query candidate");
+        let segment = parse_segment_v1(candidate.bytes(), test_support::store_id(1))
+            .expect("parse distinct-frame query candidate");
+        reset_query_decode_count();
+        let one = segment
+            .query_observations_v1(
+                &SegmentObservationQueryV1::new(test_support::series_id(2), None, 1)
+                    .expect("valid one-result distinct-frame query"),
+            )
+            .expect("query first of two matching frames");
+        assert_eq!(one.len(), 1);
+        assert!(one.is_truncated());
+        assert_eq!(query_decode_count(), 1);
+
+        reset_query_decode_count();
+        let result = segment
+            .query_observations_v1(
+                &SegmentObservationQueryV1::new(test_support::series_id(2), None, 16)
+                    .expect("valid distinct-frame query"),
+            )
+            .expect("query distinct frames");
+        assert_eq!(result.len(), 16);
+        assert!(result.is_truncated());
+        assert_eq!(query_decode_count(), 2);
+    }
+
+    #[test]
+    fn query_returns_empty_for_absent_nonmatching_gap_and_no_change_evidence() {
+        let gap_only = frame(
+            test_support::observed_admission(Vec::new(), ValueFamily::Boolean, 1, false),
+            1,
+        );
+        let no_change = frame(test_support::no_change_admission(), 2);
+        let raw = raw_journal(test_support::store_id(1), &[&gap_only, &no_change]);
+        let candidate = build_segment_v1(test_support::store_id(1), sealed(&raw, 3, 0, 2, 4), &raw)
+            .expect("build empty query candidate");
+        let segment = parse_segment_v1(candidate.bytes(), test_support::store_id(1))
+            .expect("parse empty query candidate");
+
+        for series in [
+            test_support::series_id(2),
+            test_support::series_id(4),
+            test_support::series_id(99),
+        ] {
+            let result = segment
+                .query_observations_v1(
+                    &SegmentObservationQueryV1::new(series, None, 16)
+                        .expect("valid empty-result query"),
+                )
+                .expect("query empty result");
+            assert!(result.is_empty());
+            assert!(!result.is_truncated());
+        }
+
+        let observed = frame(
+            test_support::observed_admission(
+                vec![ExactValue::Boolean(true)],
+                ValueFamily::Boolean,
+                0,
+                false,
+            ),
+            1,
+        );
+        let raw = raw_journal(test_support::store_id(1), &[&observed]);
+        let candidate = build_segment_v1(test_support::store_id(1), sealed(&raw, 3, 0, 1, 4), &raw)
+            .expect("build nonmatching interval candidate");
+        let segment = parse_segment_v1(candidate.bytes(), test_support::store_id(1))
+            .expect("parse nonmatching interval candidate");
+        let interval = TimeInterval::new(
+            Timestamp::new(-100, 0).expect("nonmatching start"),
+            Timestamp::new(-99, 0).expect("nonmatching end"),
+        )
+        .expect("nonempty nonmatching interval");
+        let result = segment
+            .query_observations_v1(
+                &SegmentObservationQueryV1::new(test_support::series_id(2), Some(interval), 16)
+                    .expect("valid nonmatching query"),
+            )
+            .expect("query nonmatching interval");
+        assert!(result.is_empty());
+        assert!(!result.has_more());
+    }
+
+    #[test]
+    fn query_refuses_test_only_index_inconsistency_without_panicking() {
+        let observed = frame(
+            test_support::observed_admission(
+                vec![ExactValue::Boolean(true)],
+                ValueFamily::Boolean,
+                0,
+                false,
+            ),
+            1,
+        );
+        let raw = raw_journal(test_support::store_id(1), &[&observed]);
+        let candidate = build_segment_v1(test_support::store_id(1), sealed(&raw, 3, 0, 1, 4), &raw)
+            .expect("build inconsistency query candidate");
+        let query = SegmentObservationQueryV1::new(test_support::series_id(2), None, 1)
+            .expect("valid inconsistency query");
+
+        let mut bad_range = parse_segment_v1(candidate.bytes(), test_support::store_id(1))
+            .expect("parse range inconsistency candidate");
+        bad_range.series[0].recent_length += SEGMENT_V1_OBSERVATION_ENTRY_LEN as u64;
+        assert_eq!(
+            bad_range
+                .query_observations_v1(&query)
+                .expect_err("impossible series range must refuse"),
+            SegmentObservationQueryV1Error::InconsistentSegment
+        );
+
+        let mut bad_append = parse_segment_v1(candidate.bytes(), test_support::store_id(1))
+            .expect("parse append inconsistency candidate");
+        bad_append.observations[0].frame_ordinal += 1;
+        assert_eq!(
+            bad_append
+                .query_observations_v1(&query)
+                .expect_err("impossible frame location must refuse"),
+            SegmentObservationQueryV1Error::InconsistentSegment
+        );
+
+        let mut bad_ordinal = parse_segment_v1(candidate.bytes(), test_support::store_id(1))
+            .expect("parse ordinal inconsistency candidate");
+        bad_ordinal.observations[0].observation_ordinal = u32::MAX;
+        assert_eq!(
+            bad_ordinal
+                .query_observations_v1(&query)
+                .expect_err("impossible observation ordinal must refuse"),
+            SegmentObservationQueryV1Error::InconsistentSegment
+        );
+    }
+
+    #[test]
+    fn query_returns_associated_lineage_with_independent_source_ordinal() {
+        let observed = frame(test_support::observed_admission_with_lineage_ordinal(7), 1);
+        let raw = raw_journal(test_support::store_id(1), &[&observed]);
+        let candidate = build_segment_v1(test_support::store_id(1), sealed(&raw, 3, 0, 1, 4), &raw)
+            .expect("build lineage-ordinal query candidate");
+        let segment = parse_segment_v1(candidate.bytes(), test_support::store_id(1))
+            .expect("parser accepts independently valid source ordinal");
+        let query = SegmentObservationQueryV1::new(test_support::series_id(2), None, 1)
+            .expect("valid lineage-ordinal query");
+
+        let result = segment
+            .query_observations_v1(&query)
+            .expect("source ordinal is independent of canonical observation ordinal");
+        let item = &result.items()[0];
+        assert_eq!(item.entry().observation_ordinal(), 0);
+        assert_eq!(item.lineage().ordinal(), 7);
+        assert_eq!(
+            item.lineage().canonical_observation_id(),
+            item.observation().observation_id()
+        );
     }
 
     #[test]

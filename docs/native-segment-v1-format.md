@@ -9,10 +9,14 @@ codec.
 
 A segment candidate is never Store Format V1 inventory or durable authority. No
 Manifest V1 or Generation Catalog V1 field names it; `och-runtime` never opens or
-submits it; and it cannot authorize registry state, query results, retention,
-reclamation, or deletion of the exact sealed raw Journal V1 source. Publication,
-crash convergence, query/cursor semantics, merged generations, retention, and
-reclamation are explicit successors.
+submits it; and neither it nor its query projection can authorize registry or
+durable query state, retention, reclamation, or deletion of the exact sealed raw
+Journal V1 source. Publication,
+crash convergence, durable query/cursor semantics, merged generations, retention,
+and reclamation are explicit successors. An already hostile-validated parsed view
+does support the separate bounded non-authorizing
+[Native Segment V1 observation query](native-segment-query-v1.md); that proof
+changes no format byte or durable authority.
 
 ## Primitive law and complete layout
 
@@ -181,3 +185,7 @@ validation, bounded-reads that immutable raw artifact, and invokes the same pure
 builder. It rejects active, unknown, and uncommitted generations and never writes,
 renames, synchronizes, cleans up, or changes manifest/catalog/registry/retry/write
 state. Candidate bytes remain outside the recognized store inventory.
+
+Query execution is not part of this byte format. The current-only bounded query
+contract is defined separately in
+[Native Segment V1 observation query](native-segment-query-v1.md).

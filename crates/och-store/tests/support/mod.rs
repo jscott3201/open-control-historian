@@ -222,7 +222,12 @@ fn observation_with_times(
     )
 }
 
-fn context(index: usize, canonical_id: ObservationId, revised: bool) -> SourceObservationContext {
+fn context(
+    index: usize,
+    canonical_id: ObservationId,
+    revised: bool,
+    ordinal: u8,
+) -> SourceObservationContext {
     let index_u64 = u64::try_from(index).expect("bounded index");
     let index_u8 = u8::try_from(index).expect("source ordinal");
     let observation_evidence = SourceObservationEvidence::new(
@@ -262,7 +267,7 @@ fn context(index: usize, canonical_id: ObservationId, revised: bool) -> SourceOb
         observation_evidence.evidence_id(),
     );
     SourceObservationContext::new(
-        index_u8,
+        ordinal,
         canonical_id,
         SourceInterpretation::new(
             source(),
@@ -286,13 +291,34 @@ pub fn observed_admission(
     gap_count: usize,
     revised: bool,
 ) -> CanonicalAdmission {
+    observed_admission_for_series(values, family, gap_count, revised, 2, 3, 10_000)
+}
+
+pub fn observed_admission_for_series(
+    values: Vec<ExactValue>,
+    family: ValueFamily,
+    gap_count: usize,
+    revised: bool,
+    series_number: u64,
+    producer_number: u64,
+    first_observation_number: u64,
+) -> CanonicalAdmission {
     let positioned = !values.is_empty();
     let observations: Vec<_> = values
         .into_iter()
         .enumerate()
-        .map(|(index, value)| observation(10_000 + index as u64, value, positioned))
+        .map(|(index, value)| {
+            observation(first_observation_number + index as u64, value, positioned)
+        })
         .collect();
-    observed_admission_from_observations(observations, family, gap_count, revised)
+    observed_admission_from_observations(
+        observations,
+        family,
+        gap_count,
+        revised,
+        series_id(series_number),
+        producer_id(producer_number),
+    )
 }
 
 pub fn observed_admission_with_raw_times(
@@ -314,7 +340,26 @@ pub fn observed_admission_with_raw_times(
             },
         )
         .collect();
-    observed_admission_from_observations(observations, ValueFamily::Boolean, 0, false)
+    observed_admission_from_observations(
+        observations,
+        ValueFamily::Boolean,
+        0,
+        false,
+        series_id(2),
+        producer_id(3),
+    )
+}
+
+pub fn observed_admission_with_lineage_ordinal(ordinal: u8) -> CanonicalAdmission {
+    observed_admission_from_observations_with_ordinal(
+        vec![observation(10_000, ExactValue::Boolean(true), true)],
+        ValueFamily::Boolean,
+        0,
+        false,
+        series_id(2),
+        producer_id(3),
+        ordinal,
+    )
 }
 
 fn observed_admission_from_observations(
@@ -322,9 +367,29 @@ fn observed_admission_from_observations(
     family: ValueFamily,
     gap_count: usize,
     revised: bool,
+    series: SeriesId,
+    producer: ProducerId,
 ) -> CanonicalAdmission {
-    let series = series_id(2);
-    let producer = producer_id(3);
+    observed_admission_from_observations_with_ordinal(
+        observations,
+        family,
+        gap_count,
+        revised,
+        series,
+        producer,
+        0,
+    )
+}
+
+fn observed_admission_from_observations_with_ordinal(
+    observations: Vec<Observation>,
+    family: ValueFamily,
+    gap_count: usize,
+    revised: bool,
+    series: SeriesId,
+    producer: ProducerId,
+    first_ordinal: u8,
+) -> CanonicalAdmission {
     let gaps: Vec<_> = (0..gap_count)
         .map(|index| {
             let start = 20_000 + index as u128 * 2;
@@ -347,7 +412,17 @@ fn observed_admission_from_observations(
         .observations()
         .iter()
         .enumerate()
-        .map(|(index, observation)| context(index, observation.observation_id(), revised))
+        .map(|(index, observation)| {
+            let index = u8::try_from(index).expect("bounded source context index");
+            context(
+                usize::from(index),
+                observation.observation_id(),
+                revised,
+                first_ordinal
+                    .checked_add(index)
+                    .expect("bounded source ordinal fixture"),
+            )
+        })
         .collect();
     let source_gaps = envelope
         .gaps()
