@@ -32,6 +32,12 @@ format, Native Segment V1 byte, or compatibility promise. The store does
 multiple-generation historical query, retention/reclamation, unbounded or
 time-based retry, or current/held-value behavior.
 
+M03-PR03b adds a documentation-only review barrier for a future new-store Store
+Format V2 that would require the unchanged raw-frame Native Segment V1 on every
+nonempty rotation. It adds no implementation: current code remains Store Format
+V1-only and continues to reject all proposed V2 names and bytes. Future work is
+blocked on a separately reviewed bounded streaming resource and latency plan.
+
 ## Current status
 
 `och-core` now defines canonical store/series identity, immutable declaration
@@ -254,6 +260,16 @@ through nextest rather than being repeated with `cargo test`.
   [proof contract](docs/typed-value-block-codec-proof.md), and
   [continuation](docs/continuation-m03-pr03a.md) record private transient exact
   raw/Boolean codec evidence and its strict no-product/no-format boundary.
+- [Store Format V2 design contract](docs/store-format-v2-contract.md),
+  [Manifest V2](docs/manifest-v2-contract.md),
+  [Generation Catalog V2](docs/generation-catalog-v2-contract.md), and
+  [Published Native Segment V1](docs/published-native-segment-v1-contract.md)
+  freeze a future unimplemented publication authority without changing current
+  Store Format V1 or Native Segment V1 bytes.
+- [M03-PR03b implementation brief](docs/implementation-brief-m03-pr03b.md) and
+  [continuation](docs/continuation-m03-pr03b.md) record the single-writer
+  transaction, fail-closed open law, implementation hard stop, and required
+  future evidence matrix.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 

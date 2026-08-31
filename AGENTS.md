@@ -40,6 +40,10 @@ one catalog-committed sealed raw-Journal generation. M03-PR03a adds only a
 private crate-test transient typed-value block codec proof: exact raw coverage for
 all current value families plus bounded Boolean bit-pack/RLE selection. It is not
 a product API, durable format, Native Segment V1 change, or compatibility promise.
+M03-PR03b adds only a checked-in Store Format V2 design/authority review barrier
+for future mandatory publication of the unchanged raw-frame Native Segment V1 on
+every nonempty rotation. It adds no implementation or accepted durable byte;
+current product authority remains Store Format V1-only.
 `och-runtime` depends
 inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05
@@ -92,6 +96,8 @@ Durable segment publication/authority, retention/reclamation, unbounded or
 time-based retry, multi-segment or runtime query, adapters, manifest-backed latest
 projection, pressure retry/clear or
 continued degraded ingress, stale-restore custody, and broad repair remain absent.
+The reviewed future V2 publication contract does not make any of those behaviors
+present and is blocked on a separately approved bounded streaming resource plan.
 Published observations never imply current or held values.
 
 The ignored `_roadmap/` directory is local and unpublished.
