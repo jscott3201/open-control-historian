@@ -67,10 +67,12 @@ The existing in-memory segment builder can exceed 700 MB and is not authorized o
 the sole-writer path. M03-PR03c supplies a separately reviewed tooling-only
 streaming/multipass prototype with a 160 MiB target and zero external sort
 workspace. M03-PR03d accepts its standalone Linux x86_64 resource evidence, but
-that is not native integration or product timing evidence. Implementation still
-requires a separately reviewed native timing/transaction/fault/cleanup/pressure/
-receipt evidence plan, measured native results, complete native fault evidence,
-and fresh owner approval. Writer/open SLOs remain `UNKNOWN`; see the
+that is not native integration or product timing evidence. M03-PR03e now defines
+the [native execution-evidence plan](m03-pr03e-native-execution-evidence-plan.md)
+and maps every row below, but authorizes only later private-harness review.
+Implementation still requires that harness, measured Linux native results,
+complete native fault evidence, and fresh owner approval. Writer/open/RSS/
+total-runtime budgets and SLOs remain `UNKNOWN`; see the
 [M03-PR03c resource plan](m03-pr03c-segment-resource-plan.md) and
 [M03-PR03d evidence record](m03-pr03d-linux-resource-evidence.md).
 
@@ -78,7 +80,7 @@ The required future implementation matrix is recorded in the
 [M03-PR03b implementation brief](implementation-brief-m03-pr03b.md). This docs PR
 claims none of its byte-oracle, namespace, epoch-refusal, convergence, pressure,
 fail-closed, predecessor/staging/intent-last cleanup-fault, bound, memory, or
-latency evidence.
+latency evidence. Every row remains `UNSATISFIED`.
 
 No migration, codec-backed bytes, query/runtime integration, multi-generation
 merge, cursor, compaction, pin, retention/reclamation, raw deletion, fallback,

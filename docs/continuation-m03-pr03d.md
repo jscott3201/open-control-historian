@@ -36,10 +36,12 @@ gate or production benchmark is claimed.
 ## Successor handoff
 
 Store Format V2 implementation remains blocked. A separately reviewed native
-timing/transaction/fault/cleanup/pressure/receipt evidence plan must define the
-integration proof, then measured native results must return for a fresh owner
-checkpoint. The complete M03-PR03b transaction, crash, cleanup, pressure,
-receipt, fail-closed, and authority matrix remains mandatory.
+timing/transaction/fault/cleanup/pressure/receipt
+[execution-evidence plan](m03-pr03e-native-execution-evidence-plan.md) now defines
+the later private-harness integration proof without implementing it. That harness
+and measured Linux native results must return for a fresh owner checkpoint. The
+complete M03-PR03b transaction, crash, cleanup, pressure, receipt, fail-closed,
+and authority matrix remains mandatory and `UNSATISFIED`.
 
 There is still no current V2 decoder/opener/publication path, native streaming
 module, durable segment authority, migration, fallback, deletion, repair, runtime

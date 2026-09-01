@@ -41,9 +41,12 @@ deterministic fixtures, checked 160 MiB/zero-external-sort ledger, and measureme
 protocol. It changes no native behavior or durable format; Darwin measurements
 are exploratory. M03-PR03d records the owner-accepted standalone tooling Linux
 x86_64 resource evidence and closes only that standalone measurement condition.
-Writer/open SLOs remain `UNKNOWN`; V2 product work still requires a separately
-reviewed native evidence plan, measured native results, and a fresh owner
-checkpoint.
+M03-PR03e adds the executable native transaction/timing/fault/pressure/receipt
+evidence plan and authorizes only a later private harness review. It adds no
+harness or result, and PR03c's zero external workspace is tooling comparison data,
+not a native threshold. Writer/open/RSS/total-runtime/native-workspace budgets and
+SLOs remain `UNKNOWN`; V2 product work still requires that harness, measured Linux
+native results, and a fresh owner checkpoint.
 
 ## Current status
 
@@ -287,6 +290,11 @@ through nextest rather than being repeated with `cargo test`.
   [implementation brief](docs/implementation-brief-m03-pr03d.md), and
   [continuation](docs/continuation-m03-pr03d.md) record the accepted standalone
   Linux x86_64 result and the still-mandatory native evidence/owner hard stop.
+- [M03-PR03e native execution-evidence plan](docs/m03-pr03e-native-execution-evidence-plan.md),
+  [implementation brief](docs/implementation-brief-m03-pr03e.md), and
+  [continuation](docs/continuation-m03-pr03e.md) define the later private-harness,
+  native timing/fault/pressure/receipt, bounded-report, and fresh-owner-checkpoint
+  protocol without adding a harness, result, or V2 product authority.
 - [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
   handoff into this model delivery.
 
