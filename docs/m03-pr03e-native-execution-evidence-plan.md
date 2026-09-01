@@ -2,21 +2,26 @@
 
 ## Status, authority, and evidence vocabulary
 
-This document is the normative, executable evidence plan for a possible future
-private Native V2 harness and report bundle. It is a **review barrier only**.
-M03-PR03e adds no harness, product-reachable code, accepted V2 artifact, measured
+This document is the normative, executable evidence plan for the private Native
+V2 harness and a later evidence report bundle. M03-PR03e itself was a
+**review barrier only** and added no harness, product-reachable code, accepted V2 artifact, measured
 result, numeric SLO or budget, opener, decoder, publication path, or Store Format
 V2 authority. Store Format V1 remains the only implemented and accepted format.
 
 Plan acceptance first authorized a separate bounded prerequisite review, now
 delivered by M03-PR03f as disabled-by-default, rustdoc-hidden current-V1 native
 instrumentation. It is not the private harness and binds no V2 source site.
-Acceptance next authorizes only a separate, bounded review of the complete
-private/test-only harness consuming that seam. Every row in the
+M03-PR03g1 supplies only the separately reviewed capability-contained disposable
+V2 executor foundation consuming that seam. Its opaque child capability and
+compiled literal registry are finite current-revision Rust privacy/source-review
+evidence, not a universal or future-source filesystem-I/O proof. It does not
+authorize collection.
+M03-PR03g2 must separately complete collection/report/supervisor infrastructure
+before any collection authorization. Every row in the
 [M03-PR03b future evidence matrix](#pr03b-evidence-crosswalk)
-remains `UNSATISFIED` until the required harness exists, the measurements and
-fault results exist, and the evidence returns through the authority progression
-defined below. M03-PR03d is comparison evidence for a standalone tooling
+remains `UNSATISFIED` until the complete acceptance-candidate measurements and
+fault results exist and the evidence returns through the authority progression
+defined below. A structural harness `PASS` never satisfies a row. M03-PR03d is comparison evidence for a standalone tooling
 prototype only; it establishes no native budget or result.
 
 This plan uses these terms strictly:
@@ -110,7 +115,8 @@ public opener, decoder, migration, compatibility promise, durable publication
 authority, runtime path, or supported command. V2 fixture bytes are not current
 store bytes and must never be placed in or beside a real V1 store.
 
-Harness review authorizes measured evidence collection only. A later product
+Only completed M03-PR03g2 harness review may authorize measured evidence
+collection. The g1 executor foundation does not. A later product
 implementation must run this complete matrix against the actual production call
 path; a harness-only pass cannot be carried forward as product proof.
 
@@ -731,16 +737,22 @@ distinct records. No row may cite PR03d as native proof.
 2. **M03-PR03f instrumentation prerequisite:** supplies only disabled-by-default,
    rustdoc-hidden current-V1 source observation/fault/crash plumbing. It accepts
    no harness, report, measurement, V2 source binding, or product authority.
-3. **Later complete private harness review:** must consume the reviewed seam and
-   pass plan-schema, closed-registry,
-   matrix-completeness, disposable-root, sanitization, and functional structural
-   checks. Acceptance authorizes evidence collection only.
-4. **Measured native evidence:** the complete Linux x86_64 acceptance-candidate
+3. **M03-PR03g1 capability-contained executor foundation:** proves the compiled
+   private literal descriptor/source-site/generated-wrapper bijection and compact
+   disposable P0-P7, rollback, and eager-open execution behind one opaque V2 child
+   capability subtree. This is finite reviewed-revision evidence, not a universal
+   Rust I/O-source proof. It adds no report, collector, all-boundary crash campaign,
+   or collection authorization; all crosswalk rows remain `UNSATISFIED`.
+4. **M03-PR03g2 complete harness infrastructure:** must add the closed matrix,
+   nonempty timing/fault reports, every-boundary parent-owned crash/reopen campaign,
+   sanitization, and collection entry point. Only g2 acceptance may authorize
+   collection.
+5. **Measured native evidence:** the complete Linux x86_64 acceptance-candidate
    bundle is collected from a clean reviewed harness/measured SHA on the approved
    AgentBox. Darwin evidence remains exploratory. No SLO or budget is inferred.
-5. **Fresh owner checkpoint:** the owner reviews the complete native results and
+6. **Fresh owner checkpoint:** the owner reviews the complete native results and
    decides whether any measured budgets and an implementation plan are accepted.
-6. **Separate product implementation:** only after that explicit checkpoint may
+7. **Separate product implementation:** only after that explicit checkpoint may
    a Store Format V2 product PR be planned. Its actual code must rerun the entire
    matrix; harness-only evidence cannot substitute.
 

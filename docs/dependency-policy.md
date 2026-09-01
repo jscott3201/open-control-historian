@@ -95,7 +95,7 @@ root metadata. This metadata check is the authoritative native-closure proof.
 advisory policy for the whole lockfile; it does not replace direction-aware
 traversal.
 
-## Non-default native evidence feature
+## Non-default native evidence feature and private tooling consumer
 
 M03-PR03f adds the exact `m03-pr03e-native-harness` feature to `och-store` and
 `och-runtime`, with explicit `default = []` in both manifests. Runtime forwards
@@ -104,11 +104,22 @@ rustdoc-hidden, unsupported current-V1 instrumentation prerequisite for a later
 private tooling package; it is not a product capability or a general extension
 API.
 
-The feature adds no dependency declaration or resolved package. Standard Cargo
-feature unification during explicit `--workspace --all-features` validation is
-accepted, while root defaults remain exactly the three native crates and select
-no tooling. Native code retains no edge to tooling, and no harness package or
-lockfile package is present.
+M03-PR03g1 extends the existing `och-v2-evidence` tooling package rather than
+adding a package. It adds one normal direct dependency on `och-runtime` with
+`default-features = false` and only `m03-pr03e-native-harness`, plus one normal
+direct Tokio declaration at the exact existing `1.53.1` pin with default features
+disabled and only `rt` and `sync`. This tooling edge drives a current-thread
+executor around the hidden facade for narrow success/pressure smoke and is not a
+native-product exception. It supplies no collector or report machinery.
+The private V2 executor's opaque child capability is an internal Rust-privacy
+boundary within this tooling package; it adds no package edge, supported API, or
+claim about arbitrary present or future filesystem-I/O source.
+
+Standard Cargo feature unification during explicit workspace validation remains
+exactly `rt` plus `sync`. The existing native `och-runtime -> tokio` structured
+exception therefore also fails if the tooling edge broadens Tokio. Root defaults
+remain exactly the three native crates, the native closure remains five resolved
+packages, native code retains no edge to tooling, and no `sha2` package is added.
 
 ## Test obligations
 
@@ -119,7 +130,8 @@ also proves the exact direct Tokio exception, aliases, core/other-native and
 transitive rejection, dependency-free roots, malformed/duplicate/unused
 exceptions, non-native sources, non-forbidden targets, manifest default-feature,
 kind, optionality, target, exact-feature failures, and resolved feature
-broadening. An integration test loads the actual workspace with Cargo metadata
+broadening. An integration test loads the actual workspace with Cargo metadata,
+exact-compares both tooling declarations and the lockfile edge, rejects `sha2`,
 and proves both the feature contract and three native roots with a five-package
 union closure: `och-core`, `och-runtime`, `och-store`, `tokio`, and
 `pin-project-lite`.
@@ -129,4 +141,5 @@ Do not weaken the forbidden list or add broad exceptions merely to admit a new
 dependency; justify the boundary change in architecture documentation first.
 The actual-workspace fixture also checks the evidence feature's exact empty
 defaults, runtime-to-store forwarding, unchanged native dependency declarations,
-default-member containment, and absence of a harness/`sha2` lockfile addition.
+default-member containment, unchanged package membership, and absence of a
+`sha2` lockfile addition.

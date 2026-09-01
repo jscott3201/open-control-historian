@@ -81,7 +81,9 @@ name = "och-v2-evidence"
 version = "0.0.0"
 dependencies = [
  "och-core",
+ "och-runtime",
  "och-store",
+ "tokio",
 ]
 
 [[package]]

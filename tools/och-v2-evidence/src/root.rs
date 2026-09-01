@@ -3,9 +3,25 @@ use crate::model::valid_case_name;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod v1_smoke;
+mod v2_io;
+
+const MAX_PARENT_ENTRIES: usize = 8;
+const PARENT_DIRECTORIES: [&str; 5] = ["artifacts", "cases", "control", "fixtures", "reports"];
+
 #[derive(Clone, Debug)]
 pub(crate) struct EvidenceRoot {
     path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FoundationSummary {
+    pub(crate) schema: &'static str,
+    pub(crate) descriptor_count: usize,
+    pub(crate) source_site_count: usize,
+    pub(crate) site_executions: usize,
+    pub(crate) flow_count: usize,
+    pub(crate) deferred_crash_obligations: usize,
 }
 
 impl EvidenceRoot {
@@ -82,6 +98,73 @@ impl EvidenceRoot {
         Ok(())
     }
 
+    pub(crate) fn run_v2_foundation(&self) -> Result<FoundationSummary> {
+        self.foundation_layout()?;
+        v2_io::run_foundation(self)
+    }
+
+    pub(crate) fn run_v1_success_smoke(&self) -> Result<()> {
+        self.foundation_layout()?;
+        v1_smoke::run_success(self)
+    }
+
+    pub(crate) fn run_v1_pressure_smoke(
+        &self,
+        kind: och_runtime::__m03_pr03e_native_harness::InjectedErrorKind,
+        partial: bool,
+    ) -> Result<()> {
+        self.foundation_layout()?;
+        v1_smoke::run_pressure(self, kind, partial)
+    }
+
+    fn foundation_layout(&self) -> Result<()> {
+        self.validate_parent_inventory()?;
+        self.validate_cases_empty()?;
+        for name in ["cases", "control"] {
+            fs::create_dir_all(self.path.join(name)).map_err(|_| EvidenceError::Io)?;
+        }
+        self.validate_parent_inventory()?;
+        self.validate_cases_empty()
+    }
+
+    fn validate_parent_inventory(&self) -> Result<()> {
+        let mut count = 0_usize;
+        for entry in fs::read_dir(&self.path).map_err(|_| EvidenceError::Io)? {
+            let entry = entry.map_err(|_| EvidenceError::Io)?;
+            count = count.checked_add(1).ok_or(EvidenceError::Bounds)?;
+            if count > MAX_PARENT_ENTRIES
+                || !entry.file_type().map_err(|_| EvidenceError::Io)?.is_dir()
+            {
+                return Err(EvidenceError::UnsafeInventory);
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| EvidenceError::UnsafeInventory)?;
+            if !PARENT_DIRECTORIES.contains(&name.as_str()) {
+                return Err(EvidenceError::UnsafeInventory);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_cases_empty(&self) -> Result<()> {
+        let cases = self.path.join("cases");
+        if !cases.exists() {
+            return Ok(());
+        }
+        let mut entries = fs::read_dir(cases).map_err(|_| EvidenceError::UnsafeInventory)?;
+        if entries
+            .next()
+            .transpose()
+            .map_err(|_| EvidenceError::Io)?
+            .is_some()
+        {
+            return Err(EvidenceError::UnsafeInventory);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn path_for_test(&self) -> String {
         self.path.to_string_lossy().into_owned()
@@ -121,13 +204,31 @@ fn contains_recognized_store_name(directory: &Path) -> Result<bool> {
         let entry = entry.map_err(|_| EvidenceError::Io)?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
-            continue;
+            return Ok(true);
         };
-        if is_recognized_store_name(name) {
+        if is_recognized_store_name(name) || is_authority_like_name(name) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn is_authority_like_name(name: &str) -> bool {
+    [
+        "store-format-",
+        "manifest-",
+        "generation-catalog-",
+        "journal-rotation-",
+        "active-journal-",
+        "sealed-journal-",
+        "native-segment-",
+        "series-registry-",
+        "retry-state-",
+        "recovery-state-",
+        "store-v1.lock",
+    ]
+    .into_iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 fn is_recognized_store_name(name: &str) -> bool {
@@ -194,6 +295,9 @@ fn recognized_slot_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn v1_and_future_v2_authority_names_are_recognized_but_evidence_names_are_not() {
@@ -219,5 +323,65 @@ mod tests {
         }
         assert!(!is_recognized_store_name("min.ochseg01-evidence"));
         assert!(!is_recognized_store_name("min.raw-journal-v1-evidence"));
+    }
+
+    #[test]
+    fn authority_like_unknown_ancestor_refuses_before_child_creation() {
+        let parent = std::env::temp_dir().join(format!(
+            "och-v2-evidence-root-hostile-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).expect("create hostile parent");
+        fs::write(parent.join("manifest-v9-unknown.och"), []).expect("write unknown authority");
+        let child = parent.join("evidence");
+        assert!(matches!(
+            EvidenceRoot::prepare(&child),
+            Err(EvidenceError::UnsafeEvidenceRoot)
+        ));
+        assert!(!child.exists());
+        fs::remove_dir_all(parent).expect("remove hostile parent");
+    }
+
+    #[test]
+    fn nonempty_cases_inventory_refuses_before_foundation_mutation() {
+        for (label, names, directory_entry) in [
+            ("v1", vec!["store-format-v1.och"], false),
+            ("v2", vec!["store-format-v2.och"], false),
+            (
+                "mixed",
+                vec!["store-format-v1.och", "store-format-v2.och"],
+                false,
+            ),
+            ("markerless", vec!["series-registry-v1-slot-0.och"], false),
+            ("unknown", vec!["unknown.bin"], false),
+            ("non-file", vec!["unknown-directory"], true),
+        ] {
+            let parent = std::env::temp_dir().join(format!(
+                "och-v2-evidence-cases-hostile-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&parent);
+            fs::create_dir(&parent).expect("create hostile cases parent");
+            let root = EvidenceRoot::prepare(&parent.join("evidence"))
+                .expect("prepare initially safe evidence root");
+            fs::create_dir(root.path.join("cases")).expect("create cases directory");
+            for name in names {
+                let entry = root.path.join("cases").join(name);
+                if directory_entry {
+                    fs::create_dir(entry).expect("create hostile directory entry");
+                } else {
+                    fs::write(entry, []).expect("create hostile file entry");
+                }
+            }
+            assert!(matches!(
+                root.foundation_layout(),
+                Err(EvidenceError::UnsafeInventory)
+            ));
+            assert!(!root.path.join("control").exists());
+            fs::remove_dir_all(parent).expect("remove hostile cases parent");
+        }
     }
 }

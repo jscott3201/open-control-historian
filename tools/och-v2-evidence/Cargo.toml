@@ -14,7 +14,9 @@ role = "tooling"
 
 [dependencies]
 och-core = { version = "=0.0.0", path = "../../crates/och-core" }
+och-runtime = { version = "=0.0.0", path = "../../crates/och-runtime", default-features = false, features = ["m03-pr03e-native-harness"] }
 och-store = { version = "=0.0.0", path = "../../crates/och-store" }
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "sync"] }
 
 [lints]
 workspace = true

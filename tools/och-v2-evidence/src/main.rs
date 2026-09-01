@@ -5,9 +5,11 @@
 mod crc32c;
 mod error;
 mod fixture;
+mod harness;
 mod ledger;
 mod model;
 mod root;
+mod sha256;
 mod stream;
 
 #[cfg(test)]
@@ -38,6 +40,7 @@ fn run(arguments: &[String]) -> Result<()> {
             ledger::print_ledger();
             Ok(())
         }
+        "native-foundation-check" => harness::foundation_check_command(arguments),
         _ => Err(EvidenceError::Usage),
     }
 }
