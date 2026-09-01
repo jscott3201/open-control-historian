@@ -12,6 +12,7 @@ use och_store::{
 };
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -52,16 +53,16 @@ fn setup(case: &str, profile: &str) -> (TempDirectory, EvidenceRoot, FixtureMeta
 #[test]
 fn streaming_minimum_matches_independent_primitive_oracle_and_is_repeatable() {
     let (_directory, root, meta) = setup("oracle-min", "min");
+    let files = root.pr03c_case(&meta.case).expect("opaque case capability");
     let first = stream::build(&root, &meta.case, false).expect("build minimum segment");
-    let first_bytes =
-        fs::read(root.segment_path(&meta.case).expect("segment path")).expect("read test segment");
-    let raw = fs::read(root.raw_path(&meta.case).expect("raw path")).expect("read test raw");
+    let first_bytes = read_file(files.open_segment().expect("open test segment"));
+    let raw = read_file(files.open_raw().expect("open test raw"));
     let expected = primitive_min_oracle(&meta, &raw);
     assert_eq!(first_bytes, expected);
     let repeated = stream::build(&root, &meta.case, false).expect("repeat minimum segment");
     assert_eq!(first.identity, repeated.identity);
     assert_eq!(
-        fs::read(root.segment_path(&meta.case).expect("segment path")).expect("read repeated"),
+        read_file(files.open_segment().expect("open repeated")),
         expected
     );
     let validated = stream::validate(&root, &meta.case).expect("stream validate minimum");
@@ -77,6 +78,22 @@ fn streaming_minimum_matches_independent_primitive_oracle_and_is_repeatable() {
     );
     assert_eq!(validated.controlled_bytes_after, active_controlled_bytes());
     assert_eq!(active_controlled_bytes(), 0);
+}
+
+#[test]
+fn non_v2_fixture_owner_uses_only_fixed_path_free_case_operations() {
+    let (_directory, root, meta) = setup("path-free-owner", "test-small");
+    let files = root.pr03c_case(&meta.case).expect("opaque case capability");
+    let decoded = FixtureMeta::read(files.open_fixture_meta().expect("open fixture metadata"))
+        .expect("decode fixture metadata");
+    assert_eq!(decoded, meta);
+    assert!(!read_file(files.open_raw().expect("open exact raw fixture")).is_empty());
+    stream::build(&root, &meta.case, false).expect("build through fixed case operations");
+    assert!(!read_file(files.open_segment().expect("open exact segment")).is_empty());
+    assert!(
+        root.artifact_partials_absent()
+            .expect("inspect partial status")
+    );
 }
 
 #[test]
@@ -139,11 +156,11 @@ fn streaming_bytes_match_current_public_manifest_store_builder_evidence() {
         .path()
         .join("sealed-journal-v1-g00000000000000000001.och");
     let case = "product-compare";
-    fs::copy(
-        raw_source,
-        root.raw_path(case).expect("comparison raw path"),
-    )
-    .expect("copy public source evidence outside store");
+    let files = root.pr03c_case(case).expect("comparison case capability");
+    let mut raw_source = fs::File::open(raw_source).expect("open public source evidence");
+    files
+        .replace_raw_from(&mut raw_source)
+        .expect("copy public source evidence outside store");
     let meta = FixtureMeta {
         case: case.to_owned(),
         seed: 11,
@@ -158,15 +175,11 @@ fn streaming_bytes_match_current_public_manifest_store_builder_evidence() {
         series_count: inspection.series_count(),
         observation_count: inspection.observation_count(),
     };
-    fs::write(
-        root.fixture_meta_path(case)
-            .expect("comparison metadata path"),
-        meta.encode(),
-    )
-    .expect("write comparison metadata");
+    files
+        .write_fixture_meta(meta.encode().as_bytes())
+        .expect("write comparison metadata");
     stream::build(&root, case, false).expect("stream-build copied public source");
-    let streamed = fs::read(root.segment_path(case).expect("comparison segment path"))
-        .expect("read streamed comparison");
+    let streamed = read_file(files.open_segment().expect("open streamed comparison"));
     assert_eq!(streamed, candidate.bytes());
     drop(store);
 }
@@ -252,10 +265,16 @@ fn observation_bearing_multi_series_bytes_match_current_public_product_evidence(
             .join("sealed-journal-v1-g00000000000000000001.och"),
     )
     .expect("read representative sealed source");
+    let files = root
+        .pr03c_case(CASE)
+        .expect("representative case capability");
     assert_eq!(
         sealed,
-        fs::read(root.raw_path(CASE).expect("representative raw path"))
-            .expect("read generated representative source")
+        read_file(
+            files
+                .open_raw()
+                .expect("open generated representative source")
+        )
     );
     let product_meta = FixtureMeta {
         case: CASE.to_owned(),
@@ -271,18 +290,11 @@ fn observation_bearing_multi_series_bytes_match_current_public_product_evidence(
         series_count: inspection.series_count(),
         observation_count: inspection.observation_count(),
     };
-    fs::write(
-        root.fixture_meta_path(CASE)
-            .expect("representative metadata path"),
-        product_meta.encode(),
-    )
-    .expect("write product-rooted representative metadata");
+    files
+        .write_fixture_meta(product_meta.encode().as_bytes())
+        .expect("write product-rooted representative metadata");
     stream::build(&root, CASE, false).expect("stream-build representative source");
-    let streamed = fs::read(
-        root.segment_path(CASE)
-            .expect("representative segment path"),
-    )
-    .expect("read streamed representative segment");
+    let streamed = read_file(files.open_segment().expect("open representative segment"));
     assert_eq!(streamed, candidate.bytes());
 }
 
@@ -290,8 +302,10 @@ fn observation_bearing_multi_series_bytes_match_current_public_product_evidence(
 fn hostile_segment_classes_refuse_closed_without_unbounded_reads_or_temp_files() {
     let (_directory, root, meta) = setup("hostile-small", "test-small");
     stream::build(&root, &meta.case, false).expect("build hostile baseline");
-    let segment_path = root.segment_path(&meta.case).expect("segment path");
-    let canonical = fs::read(&segment_path).expect("read canonical segment");
+    let files = root
+        .pr03c_case(&meta.case)
+        .expect("hostile case capability");
+    let canonical = read_file(files.open_segment().expect("open canonical segment"));
 
     let mut variants = Vec::new();
     variants.push(canonical[..canonical.len() - 1].to_vec());
@@ -329,7 +343,9 @@ fn hostile_segment_classes_refuse_closed_without_unbounded_reads_or_temp_files()
     variants.push(bad_checksum);
 
     for hostile in variants {
-        fs::write(&segment_path, hostile).expect("write hostile segment");
+        files
+            .replace_segment(&hostile)
+            .expect("write hostile segment");
         let error = stream::validate(&root, &meta.case).expect_err("hostile segment must refuse");
         assert!(matches!(
             error,
@@ -338,36 +354,45 @@ fn hostile_segment_classes_refuse_closed_without_unbounded_reads_or_temp_files()
         assert!(!error.to_string().contains(meta.case.as_str()));
         assert_eq!(active_controlled_bytes(), 0);
     }
-    fs::write(&segment_path, &canonical).expect("restore canonical segment");
+    files
+        .replace_segment(&canonical)
+        .expect("restore canonical segment");
     stream::validate(&root, &meta.case).expect("restored segment validates");
     assert_no_partial_files(&root);
 }
 
 #[test]
 fn repeated_hostile_and_sixty_four_pair_runs_drop_controlled_state() {
-    let (_directory, root, meta) = setup("repeat-min", "min");
+    let (directory, root, meta) = setup("repeat-min", "min");
     stream::build(&root, &meta.case, false).expect("build repeat baseline");
-    let segment_path = root.segment_path(&meta.case).expect("segment path");
-    let canonical = fs::read(&segment_path).expect("read canonical segment");
+    let files = root.pr03c_case(&meta.case).expect("repeat case capability");
+    let canonical = read_file(files.open_segment().expect("open canonical segment"));
     let mut hostile = canonical.clone();
     hostile[0] ^= 1;
     repair_segment_checksum(&mut hostile);
     for _ in 0..64 {
-        fs::write(&segment_path, &hostile).expect("write repeated hostile segment");
+        files
+            .replace_segment(&hostile)
+            .expect("write repeated hostile segment");
         assert!(stream::validate(&root, &meta.case).is_err());
         assert_eq!(active_controlled_bytes(), 0);
     }
-    fs::write(&segment_path, canonical).expect("restore repeat segment");
+    files
+        .replace_segment(&canonical)
+        .expect("restore repeat segment");
     let mut set = String::from("schema=och-v2-evidence-set-v1\n");
     for _ in 0..64 {
         set.push_str(&meta.case);
         set.push('\n');
     }
-    fs::write(root.set_path("repeat-64").expect("set path"), set).expect("write set");
+    root.pr03c_set("repeat-64")
+        .expect("repeat set capability")
+        .write(set.as_bytes())
+        .expect("write set");
     run(&[
         "validate-set".to_owned(),
         "--root".to_owned(),
-        root.path_for_test(),
+        directory.path().to_string_lossy().into_owned(),
         "--set".to_owned(),
         "repeat-64".to_owned(),
     ])
@@ -392,15 +417,19 @@ fn roots_containing_current_or_future_store_names_refuse_before_output() {
         let store_like = directory.path().join(format!("store-like-{index}"));
         fs::create_dir(&store_like).expect("create store-like test root");
         fs::write(store_like.join(recognized_name), []).expect("write recognized artifact name");
-        assert_eq!(
-            EvidenceRoot::open(&store_like).expect_err("store-like root must refuse"),
-            EvidenceError::UnsafeEvidenceRoot,
+        assert!(
+            matches!(
+                EvidenceRoot::open(&store_like),
+                Err(EvidenceError::UnsafeEvidenceRoot)
+            ),
             "{recognized_name}"
         );
         let child = store_like.join("evidence-child");
-        assert_eq!(
-            EvidenceRoot::prepare(&child).expect_err("child of store-like root must refuse"),
-            EvidenceError::UnsafeEvidenceRoot,
+        assert!(
+            matches!(
+                EvidenceRoot::prepare(&child),
+                Err(EvidenceError::UnsafeEvidenceRoot)
+            ),
             "{recognized_name}"
         );
         assert!(!child.exists());
@@ -463,11 +492,10 @@ fn prepare_root_cli_creates_only_a_missing_safe_root() {
 #[test]
 fn oversized_fixture_metadata_refuses_before_pair_state_or_partial_output() {
     let (_directory, root, meta) = setup("oversized-meta", "min");
-    fs::write(
-        root.fixture_meta_path(&meta.case).expect("metadata path"),
-        vec![b'x'; 2_049],
-    )
-    .expect("write oversized fixture metadata");
+    root.pr03c_case(&meta.case)
+        .expect("metadata case capability")
+        .write_fixture_meta(&vec![b'x'; 2_049])
+        .expect("write oversized fixture metadata");
     assert_eq!(
         stream::build(&root, &meta.case, false).expect_err("oversized metadata must refuse"),
         EvidenceError::InvalidFixture
@@ -480,12 +508,10 @@ fn oversized_fixture_metadata_refuses_before_pair_state_or_partial_output() {
 fn oversized_segment_identity_refuses_before_pair_state_or_partial_output() {
     let (_directory, root, meta) = setup("oversized-identity", "min");
     stream::build(&root, &meta.case, false).expect("build identity baseline");
-    fs::write(
-        root.segment_identity_path(&meta.case)
-            .expect("identity path"),
-        vec![b'x'; 513],
-    )
-    .expect("write oversized segment identity");
+    root.pr03c_case(&meta.case)
+        .expect("identity case capability")
+        .write_segment_identity(&vec![b'x'; 513])
+        .expect("write oversized segment identity");
     assert_eq!(
         stream::validate(&root, &meta.case).expect_err("oversized identity must refuse"),
         EvidenceError::InvalidFixture
@@ -496,18 +522,17 @@ fn oversized_segment_identity_refuses_before_pair_state_or_partial_output() {
 
 #[test]
 fn oversized_fixture_set_refuses_before_pair_state_or_partial_output() {
-    let (_directory, root, meta) = setup("oversized-set", "min");
+    let (directory, root, meta) = setup("oversized-set", "min");
     stream::build(&root, &meta.case, false).expect("build set baseline");
-    fs::write(
-        root.set_path("oversized-set").expect("set path"),
-        vec![b'x'; 8_193],
-    )
-    .expect("write oversized fixture set");
+    root.pr03c_set("oversized-set")
+        .expect("oversized set capability")
+        .write(&vec![b'x'; 8_193])
+        .expect("write oversized fixture set");
     assert_eq!(
         run(&[
             "validate-set".to_owned(),
             "--root".to_owned(),
-            root.path_for_test(),
+            directory.path().to_string_lossy().into_owned(),
             "--set".to_owned(),
             "oversized-set".to_owned(),
         ])
@@ -627,12 +652,17 @@ fn uuid_bytes(number: u64) -> [u8; 16] {
 }
 
 fn assert_no_partial_files(root: &EvidenceRoot) {
-    let entries = fs::read_dir(root.artifacts_dir()).expect("read evidence artifacts");
     assert!(
-        entries
-            .filter_map(std::result::Result::ok)
-            .all(|entry| { !entry.file_name().to_string_lossy().ends_with(".partial") })
+        root.artifact_partials_absent()
+            .expect("inspect partial status")
     );
+}
+
+fn read_file(mut file: fs::File) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .expect("read exact evidence file");
+    bytes
 }
 
 fn direct_inventory(directory: &Path) -> BTreeMap<String, Vec<u8>> {

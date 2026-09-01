@@ -3,7 +3,6 @@ use crate::ledger::{MAX_FRAMES, MAX_OBSERVATIONS, MAX_SERIES};
 use och_core::StoreId;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
 
 pub(crate) const FIXTURE_SCHEMA: &str = "och-v2-evidence-fixture-v1";
 pub(crate) const IDENTITY_SCHEMA: &str = "och-v2-evidence-segment-identity-v1";
@@ -82,8 +81,8 @@ impl FixtureMeta {
         )
     }
 
-    pub(crate) fn read(path: &Path) -> Result<Self> {
-        let text = read_bounded_text(path, 2_048, EvidenceError::InvalidFixture)?;
+    pub(crate) fn read(file: File) -> Result<Self> {
+        let text = read_bounded_text(file, 2_048, EvidenceError::InvalidFixture)?;
         let mut fields = Fields::new(&text)?;
         if fields.take("schema")? != FIXTURE_SCHEMA {
             return Err(EvidenceError::InvalidFixture);
@@ -138,8 +137,8 @@ impl SegmentIdentity {
         )
     }
 
-    pub(crate) fn read(path: &Path) -> Result<Self> {
-        let text = read_bounded_text(path, 512, EvidenceError::InvalidFixture)?;
+    pub(crate) fn read(file: File) -> Result<Self> {
+        let text = read_bounded_text(file, 512, EvidenceError::InvalidFixture)?;
         let mut fields = Fields::new(&text)?;
         if fields.take("schema")? != IDENTITY_SCHEMA {
             return Err(EvidenceError::InvalidFixture);
@@ -156,12 +155,11 @@ impl SegmentIdentity {
 }
 
 pub(crate) fn read_bounded_text(
-    path: &Path,
+    mut file: File,
     limit: usize,
     excess_error: EvidenceError,
 ) -> Result<String> {
     let read_limit = limit.checked_add(1).ok_or(EvidenceError::Bounds)?;
-    let mut file = File::open(path).map_err(|_| EvidenceError::Io)?;
     let mut bytes = vec![0_u8; read_limit];
     let mut filled = 0_usize;
     while filled < read_limit {

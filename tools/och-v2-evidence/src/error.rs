@@ -8,6 +8,9 @@ pub(crate) enum EvidenceError {
     InvalidFixture,
     InvalidSource,
     InvalidSegment,
+    InvalidHarness,
+    UnsafeInventory,
+    Replan,
     Bounds,
     Io,
 }
@@ -20,6 +23,9 @@ impl fmt::Display for EvidenceError {
             Self::InvalidFixture => "invalid evidence fixture metadata",
             Self::InvalidSource => "invalid evidence raw Journal V1 source",
             Self::InvalidSegment => "invalid evidence Native Segment V1 bytes",
+            Self::InvalidHarness => "invalid private native harness structure",
+            Self::UnsafeInventory => "unsafe or unsupported disposable inventory",
+            Self::Replan => "native evidence collection requires replanning",
             Self::Bounds => "evidence hard bound exceeded",
             Self::Io => "sanitized evidence I/O failure",
         })

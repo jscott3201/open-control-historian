@@ -17,7 +17,6 @@ use och_core::{
     ValueFamily,
 };
 use och_store::{AppendSequenceV1, JournalHeaderV1, encode_admission_frame_v1};
-use std::fs::{self, OpenOptions};
 use std::io::Write;
 
 const MAX_TEXT_BYTES: usize = 16_384;
@@ -88,20 +87,12 @@ fn generate_profile(
     profile: FixtureProfile,
 ) -> Result<FixtureMeta> {
     root.ensure_layout()?;
-    let raw_path = root.raw_path(case)?;
-    let meta_path = root.fixture_meta_path(case)?;
-    let temporary = raw_path.with_extension("raw-journal-v1-evidence.partial");
-    remove_if_present(&temporary)?;
-    remove_if_present(&raw_path)?;
-    remove_if_present(&meta_path)?;
+    let files = root.pr03c_case(case)?;
+    files.reset_fixture()?;
 
     let result = (|| {
         let store_id = store_id(seed)?;
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|_| EvidenceError::Io)?;
+        let mut file = files.create_raw_partial()?;
         let header = JournalHeaderV1::new(store_id).encode();
         file.write_all(&header).map_err(|_| EvidenceError::Io)?;
         let mut source_crc = Crc32c::new();
@@ -152,7 +143,7 @@ fn generate_profile(
         }
         file.sync_all().map_err(|_| EvidenceError::Io)?;
         drop(file);
-        fs::rename(&temporary, &raw_path).map_err(|_| EvidenceError::Io)?;
+        files.publish_raw()?;
         let observation_count = frame_count
             .checked_mul(observations_per_frame)
             .ok_or(EvidenceError::Bounds)?;
@@ -174,11 +165,11 @@ fn generate_profile(
             observation_count,
         };
         meta.validate()?;
-        fs::write(&meta_path, meta.encode()).map_err(|_| EvidenceError::Io)?;
+        files.write_fixture_meta(meta.encode().as_bytes())?;
         Ok(meta)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let _ = files.remove_raw_partial();
     }
     result
 }
@@ -543,6 +534,14 @@ fn store_id(seed: u64) -> Result<StoreId> {
         .map_err(|_| EvidenceError::InvalidFixture)
 }
 
+pub(crate) fn harness_store_id(seed: u64) -> Result<StoreId> {
+    store_id(seed)
+}
+
+pub(crate) fn harness_admission(store: StoreId, seed: u64) -> Result<CanonicalAdmission> {
+    admission(store, seed, 0, 1, 0, None)
+}
+
 fn series_id(number: u64) -> Result<SeriesId> {
     SeriesId::from_bytes(uuid_bytes(number)).map_err(|_| EvidenceError::InvalidFixture)
 }
@@ -594,14 +593,6 @@ fn exact_text(bytes: usize) -> String {
         _ => unreachable!(),
     });
     output
-}
-
-fn remove_if_present(path: &std::path::Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(EvidenceError::Io),
-    }
 }
 
 #[cfg(test)]
