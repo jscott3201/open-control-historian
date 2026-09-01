@@ -1,0 +1,77 @@
+name: Bug report
+description: Report a reproducible problem in the source workspace
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem.
+
+        **Do not disclose security vulnerabilities here.** Public issues are not a security channel. Follow [SECURITY.md](https://github.com/jscott3201/open-control-historian/security/policy) instead.
+  - type: input
+    id: revision
+    attributes:
+      label: Exact revision
+      description: Provide the full commit SHA or exact source revision you tested.
+      placeholder: af67792cbd28eb74cead673a0044c5f54d27ee6c
+    validations:
+      required: true
+  - type: input
+    id: package
+    attributes:
+      label: Affected package or documentation area
+      description: Name the workspace package, tool, script, or document involved.
+      placeholder: och-store
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS/version, architecture, Rust/Cargo versions, and relevant pinned tool versions.
+      placeholder: |-
+        OS: Ubuntu 24.04
+        Architecture: x86_64
+        rustc/cargo: 1.98.0
+        cargo-nextest: 0.9.143
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction and exact commands
+      description: Provide the smallest deterministic sequence that reproduces the problem.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect under the current documented contract?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Sanitized output
+      description: Include relevant output with secrets, credentials, private paths, hostnames, and sensitive payloads removed.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Public-report checks
+      options:
+        - label: I removed secrets, credentials, private data, and sensitive payloads from this report.
+          required: true
+        - label: This is not a security vulnerability report.
+          required: true

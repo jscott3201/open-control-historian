@@ -1,309 +1,113 @@
 # OpenControl Historian
 
-OpenControl Historian is at its canonical-model, manifest-rooted active-journal,
-and bounded one-generation Native Segment V1 candidate/query stage.
-This repository provides a small Rust workspace, an enforceable native dependency
-boundary, the dependency-free canonical Historian data model, bounded series
-declaration authority, source/capture provenance and admission boundary,
-independent deterministic contract evidence, and one filesystem-backed runtime
-path with exact byte reservation, a dedicated blocking writer, Journal V1 append,
-group barriers, crash-safe manifest-backed durable receipts, bounded canonical
-registry persistence, a bounded durable replay/guard horizon, bounded
-successor rotation and raw-Journal sealing, bounded reopen evidence, and volatile
-latest-observation snapshots. Current-V1 reopen may also commit one bounded report
-while removing only a proven terminal invalid/torn active suffix; valid post-root
-frames and ambiguity refuse unchanged. Store-owned mutating boundaries also
-report typed standard-library storage pressure and put that live store handle in
-sticky reopen custody without adding durable state. The runtime now retains the
-first bounded typed pressure evidence, closes ingress before waking waiters, and
-joins the existing fixed reaper before pressure shutdown returns. `och-store` can
-also build and hostile-parse one bounded non-authorizing Native Segment V1
-candidate from one committed sealed raw generation without publishing it or
-changing store authority. An already parsed in-memory candidate supports one
-hard-bounded, recent-first observation query for an exact series and optional
-canonical effective-time interval. A synchronous read-only `ManifestStore`
-method composes that builder, parser, and query for exactly one catalog-committed
-sealed generation and returns only the owned non-authorizing result. It does
-not consume the separate M03-PR03a transient typed-value block evidence. That
-proof exists only in `och-store` crate tests and covers exact raw values plus
-deterministic Boolean bit-pack/RLE selection; it is not a product API, persisted
-format, Native Segment V1 byte, or compatibility promise. The store does
-**not** provide durable segment publication/authority, runtime or
-multiple-generation historical query, retention/reclamation, unbounded or
-time-based retry, or current/held-value behavior.
+[![PR gate](https://github.com/jscott3201/open-control-historian/actions/workflows/pr.yml/badge.svg)](https://github.com/jscott3201/open-control-historian/actions/workflows/pr.yml)
 
-M03-PR03b adds a documentation-only review barrier for a future new-store Store
-Format V2 that would require the unchanged raw-frame Native Segment V1 on every
-nonempty rotation. It adds no implementation: current code remains Store Format
-V1-only and continues to reject all proposed V2 names and bytes.
-M03-PR03c supplies the private tooling-only streaming/multipass resource prototype,
-deterministic fixtures, checked 160 MiB/zero-external-sort ledger, and measurement
-protocol. It changes no native behavior or durable format; Darwin measurements
-are exploratory. M03-PR03d records the owner-accepted standalone tooling Linux
-x86_64 resource evidence and closes only that standalone measurement condition.
-M03-PR03e adds the executable native transaction/timing/fault/pressure/receipt
-evidence plan and authorizes only a later private harness review. It adds no
-harness or result, and PR03c's zero external workspace is tooling comparison data,
-not a native threshold. Writer/open/RSS/total-runtime/native-workspace budgets and
-SLOs remain `UNKNOWN`; V2 product work still requires that harness, measured Linux
-native results, and a fresh owner checkpoint.
+> **Early-stage, source-only Rust workspace.** The workspace version is `0.0.0`,
+> every package has `publish = false`, and there is no supported product CLI,
+> published crate release, network service, or production-readiness, support, or
+> SLA claim.
 
-## Current status
+OpenControl Historian is building a small, bounded Historian foundation around a
+dependency-free **canonical Historian data model**. The repository currently
+contains reviewed canonical contracts, a Store Format V1 durability path, bounded
+runtime ingress and publication, and an offline one-generation Native Segment V1
+candidate/query proof.
 
-`och-core` now defines canonical store/series identity, immutable declaration
-revisions, terminal retirement, exact value/content, timestamp, quality/status,
-producer-order, collection-mode, gap/no-change, atomic envelope, registry-issued
-declaration binding, declaration-authorized source/capture admission, and
-content-qualified retry contracts described in the
-[model contract](docs/model-contract.md). M00 also has an independent raw-fixture
-oracle for both the original model and series lifecycle, public-model adapter
-comparison, and checked-in schema-v1 ASCII golden
-ledger under [`crates/och-core/tests/`](crates/och-core/tests/).
-`och-runtime` now opens one explicit immutable store scope asynchronously after
-the dedicated blocking writer has created or validated and locked the active
-artifacts. Its synchronous fixed 16-command ingress accepts only complete
-`CanonicalAdmission` evidence, reserves exact frame bytes before allocation,
-preserves FIFO across protected/normal/bulk resource classes, and coalesces only
-equivalent outstanding retries. Handled receipts identify an append after its
-volatile publication decision; distinct durable receipts are released only after
-the group barrier covers that append in the journal, checkpoint, Retry State V1,
-and committed Manifest V1. At a safe nonempty size/count/age boundary,
-the sole writer completes ordinary durability, seals the raw Journal V1 bytes,
-commits an empty successor through Generation Catalog V1 and Manifest V1, and
-then continues the same global append sequence. Completed equivalents replay their original exact
-handled/durable proof while the FIFO outcome tier retains them; overflow becomes
-a bounded expired/conflict guard, and only eviction from both tiers makes a key
-fresh. Public lifecycle and bind requests cross a fixed 16-request
-nonblocking admission bound before sharing the same control gate and sole writer
-as append publication. New bindings require the current active declaration,
-while append validates the admission's exact retained historical declaration.
-Slots and byte reservations remain held through durability. Cloneable read handles
-capture store-scoped immutable latest snapshots; latest restarts empty and never
-becomes recovery or declaration authority. Graceful shutdown drains, forces a
-final barrier, seals latest, and joins. Drop signals fail-stop without blocking;
-a fixed reaper owns the eventual blocking-thread join.
+![Architecture diagram showing the current native dependency path from och-runtime through och-store to och-core, the direct runtime-to-core type relation, and external tooling and future boundaries](docs/assets/architecture.svg)
 
-`och-store` owns the fixed Store Format V1 reset marker, store-scoped Journal V1
-framing and hostile bounded decode, generation-one names plus deterministic
-successor active pairs, a never-renamed stable store lock, generation-scoped
-journal locks, two reusable 160-byte Manifest V1 slots, three reusable complete
-registry and retry slots, three Generation Catalog V1 slots, three Recovery State
-V1 report slots, and at most 64 immutable sealed raw-Journal generations. It
-restores registry state only through public core lifecycle replay, requires exact
-historical declarations for recovered and new admission bytes, and commits a
-manifest only after the mechanical cutoff. Reopen exposes decoded records only
-as non-authorizing evidence, restores only the manifest-referenced retry
-projection, and does not rebuild latest. Normal open reads bounded catalog/header
-metadata rather than every sealed payload byte. Each Manifest V1 root binds the exact
-active successor/floor to the last sealed catalog entry; consecutive catalogs
-append one entry to an identical prefix, and extra recognized generation files
-refuse. A verified strict-prefix catalog left by an ordinary postcommit cleanup
-interruption is the sole narrow redundant-catalog exception. A durable receipt proves the
-manifest names the exact active generation/cutoff and retains its original commit
-across later rotation under the stated platform contract; it is not a final
-queryable-segment or universal physical-power-loss claim. Recovery first proves
-the selected current root and every registry, retry, catalog/seal,
-active/checkpoint, declaration, and report relationship under both retained
-locks. A successful recovery remains runtime `Healthy`; inspection exposes the
-latest committed report as event history, not proof it occurred during that open.
-Direct active-journal and manifest-store inspection also expose volatile write
-custody. Logical bounds and all knowable exact candidate records are preflighted
-before each transaction's first mutation; this is not a physical-space or
-future-I/O guarantee. Runtime inspection projects composed write custody and
-first-wins path-free pressure evidence. Pressure atomically establishes
-`StoragePressure` health before fail-stop wakes receipt/latest waiters; consuming
-shutdown then waits for the fixed reaper and returns that exact evidence. No
-pressure retry, clear, continued degraded ingress, or new receipt/latest variant exists.
-Its dependency-free Native Segment V1 candidate retains complete original frames
-in one SeriesId-ordered block per series, plus global append and recent-observation
-directories. Candidate bytes remain in memory/offline, are rejected as store
-inventory, and grant no declaration, runtime, durable query, retention, or
-reclamation authority. Query results remain bounded non-authorizing projections
-of already hostile-validated candidate bytes. The store bridge remains a
-heavyweight synchronous full-generation read/build/parse validation: result and
-decoded-cache allocation are `O(limit)` for `limit <= 16`, but maximum transient
-working memory can exceed 700 MB and has no new typed allocation-recovery contract.
+**Text alternative:** The current native product boundary contains
+`och-runtime -> och-store -> och-core`, with runtime also using canonical core
+types directly. Runtime alone may depend on Tokio with only `rt` and `sync`.
+Repository tooling is outside native default members. Future adapters are absent
+and may point only inward. Store Format V2 is outside the current boundary as an
+unimplemented review contract.
 
-The current workspace contains:
+## What exists today
 
-| Package | Role | Purpose |
-| --- | --- | --- |
-| [`och-core`](crates/och-core/) | native | Dependency-free canonical model, bounded series declaration authority, and a measurement-only example |
-| [`och-runtime`](crates/och-runtime/) | native | Store-scoped byte admission, durable retry replay/guard classification, automatic safe-boundary rotation, recovery/pressure inspection, writer-serialized registry control, manifest-backed receipts, and volatile latest snapshots |
-| [`och-store`](crates/och-store/) | native | Journal V1, bounded generation rotation/sealing, Native Segment V1 candidates and one-generation read-only observation query, conservative terminal-suffix recovery, typed pressure/reopen custody, stable locking, canonical registry/retry/catalog snapshots, manifests, and reopen inspection |
-| [`och-policy`](tools/och-policy/) | tooling | Private Cargo-metadata dependency-law checker |
-| [`och-v2-evidence`](tools/och-v2-evidence/) | tooling | Private exact Native Segment V1 streaming/resource evidence and measurement CLI |
+- **`och-core`:** dependency-free canonical identity, exact value/time/quality,
+  declaration lifecycle, source/capture provenance, collection, admission, and
+  retry-comparison contracts.
+- **`och-store`:** Store Format V1 Journal, Manifest, registry/retry/catalog,
+  raw-seal, conservative recovery, and typed storage-pressure behavior under the
+  documented V1 filesystem contract.
+- **`och-runtime`:** bounded ingress, one dedicated blocking writer, handled and
+  durable receipt stages, bounded lifecycle control, and volatile latest
+  observation snapshots.
+- **Native Segment V1 candidate/query:** a dependency-free, offline, read-only,
+  non-authorizing candidate and bounded observation query for exactly one
+  catalog-committed sealed raw-Journal generation. It is not a published segment,
+  durable query authority, or runtime query service.
 
-`och-core` has no dependencies. `och-store` depends inward on `och-core`, and
-`och-runtime` depends inward on both. The
-only forbidden-dependency exception remains the direct `och-runtime -> tokio`
-edge with Tokio default features disabled and only `rt` and `sync`. Because core
-is shared, the union native closure is three roots and five packages:
-`och-core`, `och-runtime`, `och-store`, `tokio`, and `pin-project-lite`.
-`och-policy`, `och-v2-evidence`, and their tooling-only dependencies are excluded
-from defaults and the native product closure.
+> **Durable-format boundary:** current product authority is **Store Format V1
+> only**. Store Format V2 and the M03-PR03e native evidence plan are design and
+> evidence review barriers for possible future work. Current code neither accepts
+> nor emits V2 product bytes and does not implement Native Segment publication.
 
-## Toolchain and checks
+Durability claims are limited to the documented Store Format V1 process,
+filesystem-operation, synchronization, and recovery contract. They are not a
+universal physical-power-loss or physical-media guarantee. Latest observations
+restart empty and never imply current or held values.
 
-The repository pins Rust 1.98.0 (edition 2024), cargo-nextest 0.9.143, and
-cargo-deny 0.20.2. Install the Rust components with rustup and install the two
-Cargo tools from their prebuilt releases. Then run:
+## Build from source
+
+The crates are not published. To verify the workspace from source:
+
+```console
+git clone https://github.com/jscott3201/open-control-historian.git
+cd open-control-historian
+rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
+cargo +1.98.0 check --workspace --locked
+```
+
+This checks the source workspace; it does not start a Historian product. The full
+PR gate additionally requires cargo nextest 0.9.143 and cargo-deny 0.20.2:
 
 ```console
 ./scripts/gate.sh pr
 ```
 
-The PR gate formats, builds and checks the default native members, runs strict
-workspace clippy, executes tests with cargo nextest, runs doctests separately,
-proves the native metadata graph, builds rustdoc, checks repository hygiene, and
-enforces non-advisory cargo-deny policy. Nextest does not execute doctests, so
-`cargo test --workspace --doc --locked` remains an explicit non-redundant gate.
+GitHub PR CI runs that gate on Linux. This is evidence for that CI environment,
+not a complete platform support matrix. See [Contributing](CONTRIBUTING.md) for
+the exact development and validation workflow.
 
-The network-capable and clean-build release evidence is intentionally separate:
+## Workspace map
 
-```console
-./scripts/gate.sh release
-```
+| Package | Role | Current purpose |
+| --- | --- | --- |
+| [`och-core`](crates/och-core/) | native, default member | Canonical model, declaration, provenance, admission, and retry contracts; its example is only a build/measurement sanity marker, not a Historian CLI |
+| [`och-store`](crates/och-store/) | native, default member | Store Format V1 persistence/recovery and offline Native Segment V1 candidate/query |
+| [`och-runtime`](crates/och-runtime/) | native, default member | Bounded store-scoped ingress, sole-writer ordering, receipts, and volatile latest observations |
+| [`och-policy`](tools/och-policy/) | private tooling | Repository dependency-policy validation outside the native product closure |
+| [`och-v2-evidence`](tools/och-v2-evidence/) | private tooling | Standalone evidence tooling outside default members; not a user or product CLI |
 
-That mode adds fresh advisory checking, clean default/no-default/all-present
-feature checks, and a bounded native baseline measurement. Tests still run once
-through nextest rather than being repeated with `cargo test`.
+The current product dependency direction is `och-runtime -> och-store ->
+och-core`, while runtime also depends directly on core for canonical types.
+`och-core` has no dependencies. The only external product exception is the direct
+`och-runtime -> tokio` edge with default features disabled and only `rt` and
+`sync` enabled.
 
-## Design boundaries
+## Deliberate non-goals
 
-- [Architecture](docs/architecture.md) describes the current package roles,
-  canonical model boundary, and intentionally absent components.
-- [Canonical model contract](docs/model-contract.md) records the exact public
-  semantics, bounds, validation, and non-goals.
-- [Dependency policy](docs/dependency-policy.md) explains the executable native
-  closure law, the exact Tokio exception, and how future adapters must point inward.
-- [M01-PR01 lifecycle contract and implementation brief](docs/implementation-brief-m01-pr01.md)
-  records startup, shutdown, cancellation, error, and non-goal semantics.
-- [M01-PR02 bounded-ingress delivery record](docs/continuation-m01-pr02.md)
-  records admission, retry, receipt, drain, failure, bound, and non-goal evidence.
-- [M01-PR03 latest-publication delivery record](docs/continuation-m01-pr03.md)
-  records eligibility, producer-position ordering, registry bounds, immutable
-  snapshots, and normal-seal/abnormal-unavailable behavior.
-- [M00-PR02 implementation brief](docs/implementation-brief-m00-pr02.md) records
-  this model slice's scope and acceptance evidence.
-- [Foundation implementation brief](docs/implementation-brief.md) remains the
-  historical M00-PR01 record.
-- [Baseline](docs/baseline.md) records the initial dependency and binary-size
-  evidence without inventing runtime measurements.
-- [M00-PR03 evidence record](docs/continuation-m00-pr03.md) inventories the
-  delivered independent oracle, golden, fixture builders, and non-goals.
-- [M00-PR04 alignment and declaration-authority record](docs/continuation-m00-pr04.md)
-  records the accepted predecessor baseline, bounded lifecycle contract,
-  then-required pre-M02 source/capture successor, and explicit deferred ledger.
-- [M00-PR05 source/capture crosswalk record](docs/continuation-m00-pr05.md)
-  records the pinned Studio field crosswalk, bounded canonical admission contract,
-  original M02-PR01 input boundary, and remaining deferred ledger.
-- [M02-PR01a canonical-admission runtime record](docs/continuation-m02-pr01a.md)
-  records the store-scoped runtime authority transition, exact volatile proof,
-  accepted durable-journal split, and remaining M02 hard boundary.
-- [M02-PR01b0 implementation brief](docs/implementation-brief-m02-pr01b0.md)
-  specifies the dependency-light Journal V1 semantic framing slice.
-- [M02-PR01b0 continuation](docs/continuation-m02-pr01b0.md) records exact
-  framing/decode evidence and its historical hard boundary before PR01b1.
-- [M02-PR01b1 implementation brief](docs/implementation-brief-m02-pr01b1.md)
-  specifies the sole active-journal durable runtime vertical and its bounds.
-- [M02-PR01b1 continuation](docs/continuation-m02-pr01b1.md) records its exact
-  ownership, evidence, platform qualification, and remaining PR02 boundary.
-- [M02-PR02a implementation brief](docs/implementation-brief-m02-pr02a.md)
-  specifies the manifest-rooted canonical registry authority transition.
-- [M02-PR02a continuation](docs/continuation-m02-pr02a.md) records the delivered
-  historical header fence, bootstrap, commit ordering, evidence, and successor ledger;
-  it is superseded for current durable-format behavior by the reset record below.
-- [M02-PR02b implementation brief](docs/implementation-brief-m02-pr02b.md)
-  specifies the bounded durable two-tier retry authority transition.
-- [M02-PR02b continuation](docs/continuation-m02-pr02b.md) records exact retry
-  historical publication, atomic runtime handoff, compatibility, evidence, and successors.
-- [M02-PR02c implementation brief](docs/implementation-brief-m02-pr02c.md)
-  specifies the bounded rotation/seal authority transition and exclusions.
-- [M02-PR02c continuation](docs/continuation-m02-pr02c.md) records exact
-  historical generation, convergence, compatibility, evidence, and successor boundaries.
-- [Store Format V1](docs/store-format-v1.md) defines the fixed reset epoch marker
-  and mutation-free refusal fence.
-- [M02 durable-format reset brief](docs/implementation-brief-m02-v1-durable-format-reset.md)
-  records the current-only authority transition and exclusions.
-- [M02 durable-format reset continuation](docs/continuation-m02-v1-durable-format-reset.md)
-  records implementation evidence, bounds, and the then-deferred recovery handoff.
-- [Journal V1 format](docs/journal-v1-format.md) defines the exact version-one
-  header, frame, payload, active-artifact, checkpoint, byte-order, bound,
-  checksum, and refusal contracts.
-- [Manifest V1 format](docs/manifest-v1-format.md) defines the fixed inventory,
-  reset fence, manifest and registry bytes, retry reference, publication order,
-  bounds, and strict-reopen contract.
-- [Retry State V1 format](docs/retry-state-v1-format.md) defines exact durable
-  replay/guard bytes, capacities, canonical ordering, and refusal law.
-- [Generation Catalog V1](docs/generation-catalog-v1-format.md) defines the fixed
-  bounded sealed-generation inventory and reference law.
-- [Sealed raw Journal V1](docs/sealed-journal-v1-format.md) defines the immutable
-  pre-segment artifact and streaming verification contract.
-- [Recovery State V1](docs/recovery-state-v1-format.md) defines the exact durable
-  report bytes, manifest reference, convergence law, and diagnostic semantics.
-- [Native Segment V1](docs/native-segment-v1-format.md) defines the exact bounded
-  offline candidate bytes, source proof, hostile parser law, indexes, and explicit
-  non-authority boundary.
-- [M02-PR03a implementation brief](docs/implementation-brief-m02-pr03a.md) and
-  [continuation](docs/continuation-m02-pr03a.md) record conservative current-V1
-  recovery evidence and the remaining deferrals.
-- [M02-PR03b1 implementation brief](docs/implementation-brief-m02-pr03b1.md) and
-  [continuation](docs/continuation-m02-pr03b1.md) record store-only logical
-  preflight, typed pressure evidence, sticky reopen custody, and the completed PR03b2 handoff.
-- [M02-PR03b2 implementation brief](docs/implementation-brief-m02-pr03b2.md) and
-  [continuation](docs/continuation-m02-pr03b2.md) record runtime pressure evidence,
-  fail-stop ordering, receipt/latest preservation, and reaper-joined shutdown.
-- [M03-PR01a implementation brief](docs/implementation-brief-m03-pr01a.md) and
-  [continuation](docs/continuation-m03-pr01a.md) record the exact one-generation
-  Native Segment V1 candidate, independent oracle, read-only bridge, and deferred
-  publication/query/reclamation boundary.
-- [Native Segment V1 observation query](docs/native-segment-query-v1.md) defines
-  the bounded one-series recent-first result, interval, truncation, complexity,
-  and non-authority contract.
-- [M03-PR02a implementation brief](docs/implementation-brief-m03-pr02a.md) and
-  [continuation](docs/continuation-m03-pr02a.md) record the in-memory query proof,
-  focused evidence, and durable publication/cursor/merge deferrals.
-- [M03-PR02b implementation brief](docs/implementation-brief-m03-pr02b.md) and
-  [continuation](docs/continuation-m03-pr02b.md) record the exact one-generation
-  read-only store bridge, heavyweight bounds, refusal evidence, and remaining
-  durable-authority/runtime/multi-generation boundary.
-- [M03-PR03a implementation brief](docs/implementation-brief-m03-pr03a.md),
-  [proof contract](docs/typed-value-block-codec-proof.md), and
-  [continuation](docs/continuation-m03-pr03a.md) record private transient exact
-  raw/Boolean codec evidence and its strict no-product/no-format boundary.
-- [Store Format V2 design contract](docs/store-format-v2-contract.md),
-  [Manifest V2](docs/manifest-v2-contract.md),
-  [Generation Catalog V2](docs/generation-catalog-v2-contract.md), and
-  [Published Native Segment V1](docs/published-native-segment-v1-contract.md)
-  freeze a future unimplemented publication authority without changing current
-  Store Format V1 or Native Segment V1 bytes.
-- [M03-PR03b implementation brief](docs/implementation-brief-m03-pr03b.md) and
-  [continuation](docs/continuation-m03-pr03b.md) record the single-writer
-  transaction, fail-closed open law, implementation hard stop, and required
-  future evidence matrix.
-- [M03-PR03c resource plan](docs/m03-pr03c-segment-resource-plan.md),
-  [implementation brief](docs/implementation-brief-m03-pr03c.md), and
-  [continuation](docs/continuation-m03-pr03c.md) record the tooling-only exact
-  streaming prototype, controlled-memory ledger, and measurement protocol.
-- [M03-PR03d accepted Linux resource evidence](docs/m03-pr03d-linux-resource-evidence.md),
-  [implementation brief](docs/implementation-brief-m03-pr03d.md), and
-  [continuation](docs/continuation-m03-pr03d.md) record the accepted standalone
-  Linux x86_64 result and the still-mandatory native evidence/owner hard stop.
-- [M03-PR03e native execution-evidence plan](docs/m03-pr03e-native-execution-evidence-plan.md),
-  [implementation brief](docs/implementation-brief-m03-pr03e.md), and
-  [continuation](docs/continuation-m03-pr03e.md) define the later private-harness,
-  native timing/fault/pressure/receipt, bounded-report, and fresh-owner-checkpoint
-  protocol without adding a harness, result, or V2 product authority.
-- [M00-PR02 continuation](docs/continuation-m00-pr02.md) remains the historical
-  handoff into this model delivery.
+The repository does not currently provide a network service, SQL/query engine,
+multi-generation or runtime historical query, durable latest-state projection,
+retention/reclamation, adapters, cloud/object storage, migration or compatibility
+decoder, or Store Format V2 implementation. Published observations do not imply
+hold, interpolation, freshness, or current-value semantics.
 
-Contributor workflow is in [CONTRIBUTING.md](CONTRIBUTING.md), and automation or
-coding-agent constraints are in [AGENTS.md](AGENTS.md).
+## Documentation and community
+
+- [Documentation index](docs/README.md) — current contracts, historical delivery
+  records, and clearly separated future design/evidence material
+- [Architecture](docs/architecture.md), [canonical model contract](docs/model-contract.md),
+  and [dependency policy](docs/dependency-policy.md)
+- [Store Format V1](docs/store-format-v1.md), [Journal V1](docs/journal-v1-format.md),
+  and [Native Segment V1 candidate](docs/native-segment-v1-format.md)
+- [Contributing](CONTRIBUTING.md) and [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md) — never report vulnerabilities in public issues,
+  pull requests, or discussions
+- [Repository automation constraints](AGENTS.md)
 
 ## License
 
-This repository is licensed under either of
-[Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option. The
-workspace is private to this repository (`publish = false`); no public crate
-publication is configured.
+Licensed under either the [Apache License 2.0](LICENSE-APACHE) or
+[MIT License](LICENSE-MIT), at your option.

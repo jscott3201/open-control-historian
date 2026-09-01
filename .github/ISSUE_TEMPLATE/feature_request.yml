@@ -1,0 +1,54 @@
+name: Feature request
+description: Propose one bounded outcome for the source workspace
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem and desired outcome rather than prescribing a broad implementation. Opening a request does not imply acceptance, scheduling, support, or a response-time commitment.
+
+        **Do not disclose security vulnerabilities here.** Public issues are not a security channel. Follow [SECURITY.md](https://github.com/jscott3201/open-control-historian/security/policy) instead.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and desired outcome
+      description: What bounded problem should be addressed, for whom, and what observable outcome would help?
+    validations:
+      required: true
+  - type: dropdown
+    id: boundary
+    attributes:
+      label: Affected boundary
+      description: Select the primary current or proposed boundary.
+      options:
+        - Canonical model (och-core)
+        - Store Format V1 or offline query (och-store)
+        - Runtime ingress, writer, receipts, or latest observations (och-runtime)
+        - Repository tooling or policy
+        - Documentation or community health
+        - Future design requiring separate authority review
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What existing behavior, workaround, or smaller alternative did you consider?
+    validations:
+      required: true
+  - type: textarea
+    id: authority_impact
+    attributes:
+      label: API, durable-format, and compatibility implications
+      description: State whether this changes a public API, accepted/emitted durable bytes, migration/compatibility behavior, platform claim, or support claim. Use "none known" only after checking current contracts.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Public-request checks
+      options:
+        - label: I understand that this request has no acceptance or delivery schedule promise.
+          required: true
+        - label: This request contains no vulnerability details, secrets, credentials, or private data.
+          required: true

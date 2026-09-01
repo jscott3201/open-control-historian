@@ -1,8 +1,50 @@
 # Contributing
 
-The repository is intentionally smaller than the product its name anticipates.
-Keep changes bounded and describe why a boundary or behavior belongs before
-adding implementation.
+Thank you for considering a contribution. OpenControl Historian is an early-stage,
+unpublished source workspace: package version `0.0.0`, `publish = false`, and no
+supported product CLI, release, production-readiness claim, or support/response
+SLA. Keep proposals and pull requests bounded, and explain why a behavior belongs
+inside the current authority before adding implementation.
+
+Participation must follow the [Code of Conduct](CODE_OF_CONDUCT.md). Never report
+a vulnerability in an issue, pull request, or discussion; follow
+[SECURITY.md](SECURITY.md). The conduct enforcement address is not a security
+reporting fallback.
+
+## Start here
+
+Before proposing a change, read:
+
+- the public [README](README.md) and curated [documentation index](docs/README.md);
+- the current [architecture](docs/architecture.md),
+  [canonical model contract](docs/model-contract.md), and
+  [dependency policy](docs/dependency-policy.md);
+- the relevant current format or historical delivery record; and
+- [AGENTS.md](AGENTS.md), which records repository authority and implementation
+  constraints that contributions must preserve.
+
+Current durable authority is Store Format V1 only. Future V2 documents are
+unimplemented review barriers, not permission to emit or accept V2 bytes, publish
+Native Segment artifacts, add compatibility, or broaden runtime behavior.
+
+## Issues and pull requests
+
+Use the bug or feature issue form when it fits; blank issues remain available.
+Search for existing reports first, remove sensitive information, and describe the
+smallest reproducible problem or outcome. Opening an issue does not imply
+acceptance, scheduling, support, or a response-time commitment.
+
+Pull requests should address one coherent concern. State the motivation, bounded
+scope and non-goals, API/durable-format/compatibility impact, exact validation
+commands and platform, and every relevant skip or unavailable environment. Do not
+mix dependency upgrades, formatting, renames, or cleanup into an unrelated change.
+Never claim an unrun gate or untested platform as evidence.
+
+Public capability, support, platform, security, compatibility, or contract claims
+must be truthful and updated in the appropriate README, architecture, contract,
+format, or delivery record in the same bounded change. Historical evidence must
+remain labeled with its actual tool, platform, profile, and product/non-product
+scope.
 
 ## Prerequisites
 
