@@ -46,6 +46,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "m03-pr03e-native-harness")]
+use crate::__m03_pr03e_native_harness::{
+    BoundaryId, BoundaryOutcome, BoundaryToken, begin_worker_boundary, finish_worker_boundary,
+};
+
 /// Exact never-renamed store-level writer lock artifact.
 pub const STORE_LOCK_FILE_NAME: &str = "store-v1.lock";
 /// Exact Store Format V1 reset marker artifact.
@@ -1102,9 +1107,7 @@ impl ManifestStore {
         };
         let mut slots = self.manifest_slots;
         slots[slot] = Some(next);
-        self.manifest_slots = slots;
-        self.current_slot = slot;
-        self.current = next;
+        self.adopt_published_manifest(slot, next, &slots);
         self.recovery_report = Some(artifact.report);
         remove_unreferenced_catalog_slots(&self.directory_path, &self.directory, slots)?;
         remove_unreferenced_retry_slots(&self.directory_path, &self.directory, slots)?;
@@ -1262,9 +1265,7 @@ impl ManifestStore {
         )?;
         let slot = store.publish_manifest(record)?;
         manifest_slots[slot] = Some(record);
-        store.manifest_slots = manifest_slots;
-        store.current_slot = slot;
-        store.current = record;
+        store.adopt_published_manifest(slot, record, &manifest_slots);
         Ok(store)
     }
 
@@ -1856,10 +1857,23 @@ impl ManifestStore {
         ) {
             return Err(self.record_terminal_error(error));
         }
-        self.manifest_slots = manifest_slots;
+        self.adopt_published_manifest(slot, record, &manifest_slots);
+        Ok(self.commit())
+    }
+
+    fn adopt_published_manifest(
+        &mut self,
+        slot: usize,
+        record: ManifestRecord,
+        manifest_slots: &[Option<ManifestRecord>; 2],
+    ) {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let adoption = begin_worker_boundary(BoundaryId::ManifestAdopt, record.generation, 1);
+        self.manifest_slots = *manifest_slots;
         self.current_slot = slot;
         self.current = record;
-        Ok(self.commit())
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        finish_worker_boundary(adoption, BoundaryOutcome::Success);
     }
 
     fn publish_registry_snapshot(
@@ -2136,6 +2150,8 @@ impl ManifestStore {
     }
 
     fn record_terminal_error(&mut self, error: ManifestStoreError) -> ManifestStoreError {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let was_writable = self.write_state == StoreWriteState::Writable;
         self.write_state = if matches!(
             error,
             ManifestStoreError::StoragePressure(_)
@@ -2148,6 +2164,10 @@ impl ManifestStore {
         } else {
             StoreWriteState::Faulted
         };
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        if was_writable && self.write_state == StoreWriteState::ReopenRequired {
+            crate::pressure::record_pressure_transition();
+        }
         error
     }
 }
@@ -4181,6 +4201,7 @@ fn remove_unreferenced_catalog_slots(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn publish_reusable_slot(
     directory_path: &Path,
     directory: &File,
@@ -4195,36 +4216,150 @@ fn publish_reusable_slot(
     }
     let staging_path = directory_path.join(staging_name);
     let target_path = directory_path.join(target_name);
-    let mut staging = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&staging_path)
-        .map_err(|error| {
-            if error.kind() == ErrorKind::AlreadyExists {
-                ManifestStoreError::InterruptedPublication
-            } else {
-                manifest_io(ManifestIoOperation::CreateArtifact, &error)
-            }
-        })?;
-    injected_publication_fault(staging_name, PublicationPoint::Write)?;
-    staging
-        .write_all(bytes)
-        .map_err(|error| manifest_io(ManifestIoOperation::Write, &error))?;
-    injected_publication_fault(staging_name, PublicationPoint::SyncArtifact)?;
-    staging
-        .sync_all()
-        .map_err(|error| manifest_io(ManifestIoOperation::SyncArtifact, &error))?;
-    injected_publication_fault(staging_name, PublicationPoint::Readback)?;
-    let candidate = read_required_bounded(&staging_path, maximum)?;
-    verify(&candidate)?;
-    injected_publication_fault(staging_name, PublicationPoint::Publish)?;
-    std::fs::rename(&staging_path, &target_path)
-        .map_err(|error| manifest_io(ManifestIoOperation::Publish, &error))?;
-    injected_publication_fault(staging_name, PublicationPoint::SyncDirectory)?;
-    directory
-        .sync_all()
-        .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let subject = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let records_ordinary = crate::__m03_pr03e_native_harness::records_worker_ordinary_publication();
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let mut retry_publication = (records_ordinary && staging_name == RETRY_STAGING_FILE_NAME)
+        .then(|| begin_worker_boundary(BoundaryId::RetryStatePublish, subject, 1))
+        .flatten();
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let mut manifest_prepare = (records_ordinary && staging_name == MANIFEST_STAGING_FILE_NAME)
+        .then(|| begin_worker_boundary(BoundaryId::ManifestPrepare, subject, 1))
+        .flatten();
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    if let Some(kind) =
+        publication_pre_operation_error(retry_publication.as_ref(), manifest_prepare.as_ref())
+    {
+        finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Error);
+        finish_publication_boundary(&mut manifest_prepare, BoundaryOutcome::Error);
+        return Err(classify_manifest_io(
+            ManifestIoOperation::CreateArtifact,
+            kind.error_kind(),
+            None,
+        ));
+    }
+
+    let preparation = (|| {
+        let mut staging = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)
+            .map_err(|error| {
+                if error.kind() == ErrorKind::AlreadyExists {
+                    ManifestStoreError::InterruptedPublication
+                } else {
+                    manifest_io(ManifestIoOperation::CreateArtifact, &error)
+                }
+            })?;
+        injected_publication_fault(staging_name, PublicationPoint::Write)?;
+        staging
+            .write_all(bytes)
+            .map_err(|error| manifest_io(ManifestIoOperation::Write, &error))?;
+        injected_publication_fault(staging_name, PublicationPoint::SyncArtifact)?;
+        staging
+            .sync_all()
+            .map_err(|error| manifest_io(ManifestIoOperation::SyncArtifact, &error))?;
+        injected_publication_fault(staging_name, PublicationPoint::Readback)?;
+        let candidate = read_required_bounded(&staging_path, maximum)?;
+        verify(&candidate)
+    })();
+    if let Err(error) = preparation {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        {
+            finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Error);
+            finish_publication_boundary(&mut manifest_prepare, BoundaryOutcome::Error);
+        }
+        return Err(error);
+    }
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    finish_publication_boundary(&mut manifest_prepare, BoundaryOutcome::Success);
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let mut manifest_commit = (records_ordinary && staging_name == MANIFEST_STAGING_FILE_NAME)
+        .then(|| begin_worker_boundary(BoundaryId::ManifestRenameCommit, subject, 1))
+        .flatten();
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    if let Some(kind) =
+        publication_pre_operation_error(retry_publication.as_ref(), manifest_commit.as_ref())
+    {
+        finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Error);
+        finish_publication_boundary(&mut manifest_commit, BoundaryOutcome::Error);
+        return Err(classify_manifest_io(
+            ManifestIoOperation::Publish,
+            kind.error_kind(),
+            None,
+        ));
+    }
+    if let Err(error) = injected_publication_fault(staging_name, PublicationPoint::Publish)
+        .and_then(|()| {
+            std::fs::rename(&staging_path, &target_path)
+                .map_err(|error| manifest_io(ManifestIoOperation::Publish, &error))
+        })
+    {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        {
+            finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Error);
+            finish_publication_boundary(&mut manifest_commit, BoundaryOutcome::Error);
+        }
+        return Err(error);
+    }
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    finish_publication_boundary(&mut manifest_commit, BoundaryOutcome::Success);
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let mut manifest_postcommit = (records_ordinary && staging_name == MANIFEST_STAGING_FILE_NAME)
+        .then(|| begin_worker_boundary(BoundaryId::ManifestPostcommit, subject, 1))
+        .flatten();
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    if let Some(kind) =
+        publication_pre_operation_error(retry_publication.as_ref(), manifest_postcommit.as_ref())
+    {
+        finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Error);
+        finish_publication_boundary(&mut manifest_postcommit, BoundaryOutcome::Error);
+        return Err(classify_manifest_io(
+            ManifestIoOperation::SyncDirectory,
+            kind.error_kind(),
+            None,
+        ));
+    }
+    if let Err(error) = injected_publication_fault(staging_name, PublicationPoint::SyncDirectory)
+        .and_then(|()| {
+            directory
+                .sync_all()
+                .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))
+        })
+    {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        {
+            finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Error);
+            finish_publication_boundary(&mut manifest_postcommit, BoundaryOutcome::Error);
+        }
+        return Err(error);
+    }
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    {
+        finish_publication_boundary(&mut manifest_postcommit, BoundaryOutcome::Success);
+        finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Success);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "m03-pr03e-native-harness")]
+fn publication_pre_operation_error(
+    aggregate: Option<&BoundaryToken>,
+    phase: Option<&BoundaryToken>,
+) -> Option<crate::__m03_pr03e_native_harness::InjectedErrorKind> {
+    aggregate
+        .and_then(BoundaryToken::pre_operation_error)
+        .or_else(|| phase.and_then(BoundaryToken::pre_operation_error))
+}
+
+#[cfg(feature = "m03-pr03e-native-harness")]
+fn finish_publication_boundary(token: &mut Option<BoundaryToken>, outcome: BoundaryOutcome) {
+    finish_worker_boundary(token.take(), outcome);
 }
 
 #[derive(Clone, Copy)]
@@ -4899,6 +5034,10 @@ fn genesis_placeholder(store_id: StoreId) -> DurableCutoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    use crate::__m03_pr03e_native_harness::{
+        BoundaryId, EvidenceStatus, FaultPlan, NativeEvidenceSession, install_worker_session,
+    };
     use crate::{PreparedAdmissionV1, test_support};
     use std::fs;
     use std::io::{Seek, SeekFrom};
@@ -4989,6 +5128,133 @@ mod tests {
             .collect::<Vec<_>>();
         artifacts.sort_by(|left, right| left.0.cmp(&right.0));
         artifacts
+    }
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    #[test]
+    fn native_evidence_create_new_open_only_closes_at_manifest_adoption() {
+        let directory = test_directory(80);
+        let session = NativeEvidenceSession::new(8, FaultPlan::none()).expect("genesis session");
+        let guard = install_worker_session(session.clone());
+        let store = ManifestStore::open(test_config(
+            directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("observed genesis open");
+        drop(store);
+        drop(guard);
+
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.status(), EvidenceStatus::Complete);
+        assert_eq!(
+            snapshot
+                .events()
+                .iter()
+                .map(|event| event.boundary())
+                .collect::<Vec<_>>(),
+            vec![
+                BoundaryId::RetryStatePublish,
+                BoundaryId::ManifestPrepare,
+                BoundaryId::ManifestRenameCommit,
+                BoundaryId::ManifestPostcommit,
+                BoundaryId::ManifestAdopt,
+            ]
+        );
+        snapshot
+            .validate_closed_trace()
+            .expect("genesis open-only trace should close at adoption");
+        fs::remove_dir_all(directory).expect("remove observed genesis directory");
+    }
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    #[test]
+    fn native_evidence_recovery_open_closes_at_actual_manifest_adoption() {
+        let fresh_directory = test_directory(81);
+        let fresh_store = ManifestStore::open(test_config(
+            fresh_directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create fresh recovery fixture");
+        drop(fresh_store);
+        append_raw_suffix(&fresh_directory, 1, b"OCHF\0\x01\x01\0\0");
+
+        let fresh_session =
+            NativeEvidenceSession::new(8, FaultPlan::none()).expect("fresh recovery session");
+        let fresh_guard = install_worker_session(fresh_session.clone());
+        let fresh_recovered = ManifestStore::open(test_config(
+            fresh_directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("observed fresh recovery open");
+        assert!(fresh_recovered.inspection().latest_recovery().is_some());
+        drop(fresh_recovered);
+        drop(fresh_guard);
+
+        let fresh_snapshot = fresh_session.snapshot();
+        assert_eq!(fresh_snapshot.status(), EvidenceStatus::Complete);
+        assert_eq!(
+            fresh_snapshot
+                .events()
+                .iter()
+                .map(|event| event.boundary())
+                .collect::<Vec<_>>(),
+            vec![
+                BoundaryId::ManifestPrepare,
+                BoundaryId::ManifestRenameCommit,
+                BoundaryId::ManifestPostcommit,
+                BoundaryId::ManifestAdopt,
+            ]
+        );
+        fresh_snapshot
+            .validate_closed_trace()
+            .expect("fresh recovery-open trace should close at adoption");
+        fs::remove_dir_all(fresh_directory).expect("remove fresh recovery directory");
+
+        let converged_directory = test_directory(82);
+        let converged_store = ManifestStore::open(test_config(
+            converged_directory.clone(),
+            ActiveJournalOpenMode::CreateNew,
+        ))
+        .expect("create converged recovery fixture");
+        drop(converged_store);
+        append_raw_suffix(&converged_directory, 1, b"OCHF\0\x01\x01\0\0");
+        set_publish_fault(6);
+        assert!(
+            ManifestStore::open(test_config(
+                converged_directory.clone(),
+                ActiveJournalOpenMode::OpenExisting,
+            ))
+            .is_err(),
+            "manifest synchronization fault must leave truthful staging"
+        );
+
+        let converged_session =
+            NativeEvidenceSession::new(4, FaultPlan::none()).expect("converged recovery session");
+        let converged_guard = install_worker_session(converged_session.clone());
+        let converged_recovered = ManifestStore::open(test_config(
+            converged_directory.clone(),
+            ActiveJournalOpenMode::OpenExisting,
+        ))
+        .expect("observed converged recovery open");
+        assert!(converged_recovered.inspection().latest_recovery().is_some());
+        drop(converged_recovered);
+        drop(converged_guard);
+
+        let converged_snapshot = converged_session.snapshot();
+        assert_eq!(converged_snapshot.status(), EvidenceStatus::Complete);
+        assert_eq!(
+            converged_snapshot
+                .events()
+                .iter()
+                .map(|event| event.boundary())
+                .collect::<Vec<_>>(),
+            vec![BoundaryId::ManifestAdopt],
+            "convergence must not fabricate publication phases that did not run"
+        );
+        converged_snapshot
+            .validate_closed_trace()
+            .expect("converged recovery-open trace should close at adoption");
+        fs::remove_dir_all(converged_directory).expect("remove converged recovery directory");
     }
 
     #[test]

@@ -95,6 +95,21 @@ root metadata. This metadata check is the authoritative native-closure proof.
 advisory policy for the whole lockfile; it does not replace direction-aware
 traversal.
 
+## Non-default native evidence feature
+
+M03-PR03f adds the exact `m03-pr03e-native-harness` feature to `och-store` and
+`och-runtime`, with explicit `default = []` in both manifests. Runtime forwards
+only `och-store/m03-pr03e-native-harness`. This is an owner-reviewed,
+rustdoc-hidden, unsupported current-V1 instrumentation prerequisite for a later
+private tooling package; it is not a product capability or a general extension
+API.
+
+The feature adds no dependency declaration or resolved package. Standard Cargo
+feature unification during explicit `--workspace --all-features` validation is
+accepted, while root defaults remain exactly the three native crates and select
+no tooling. Native code retains no edge to tooling, and no harness package or
+lockfile package is present.
+
 ## Test obligations
 
 The fixture suite proves positive traversal with shared/cyclic structure and
@@ -112,3 +127,6 @@ union closure: `och-core`, `och-runtime`, `och-store`, `tokio`, and
 When roles or dependencies change, update policy metadata and tests together.
 Do not weaken the forbidden list or add broad exceptions merely to admit a new
 dependency; justify the boundary change in architecture documentation first.
+The actual-workspace fixture also checks the evidence feature's exact empty
+defaults, runtime-to-store forwarding, unchanged native dependency declarations,
+default-member containment, and absence of a harness/`sha2` lockfile addition.

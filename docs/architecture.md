@@ -46,7 +46,10 @@ tooling Linux x86_64 resource evidence and closes only that measurement conditio
 M03-PR03e adds only an executable plan for the later private native
 timing/transaction/fault/cleanup/pressure/receipt harness and report. It adds no
 harness or result and grants no V2 authority. Measured Linux native evidence and
-fresh owner review still block V2 work.
+fresh owner review still block V2 work. M03-PR03f adds one disabled-by-default,
+rustdoc-hidden native instrumentation/fault/crash prerequisite bound only to
+actual current-V1 source seams. It adds no harness, V2 source site, report,
+measurement, or product authority.
 Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
@@ -241,6 +244,8 @@ The separately reviewed but unimplemented future authority is defined by
 [Published Native Segment V1](published-native-segment-v1-contract.md).
 Its still-unimplemented private harness and evidence protocol is defined by the
 [M03-PR03e Native V2 execution-evidence plan](m03-pr03e-native-execution-evidence-plan.md).
+The current-V1-only, non-default instrumentation prerequisite for that later
+harness is recorded by [M03-PR03f](implementation-brief-m03-pr03f.md).
 
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`
@@ -440,3 +445,7 @@ standalone measurement protocol are recorded by
 [M03-PR03c](continuation-m03-pr03c.md). The accepted standalone Linux result and
 remaining native evidence/owner stop are recorded by
 [M03-PR03d](continuation-m03-pr03d.md).
+The executable native evidence plan and its still-unsatisfied matrix are recorded
+by [M03-PR03e](continuation-m03-pr03e.md); the separate current-V1-only native
+instrumentation prerequisite is recorded by
+[M03-PR03f](continuation-m03-pr03f.md).

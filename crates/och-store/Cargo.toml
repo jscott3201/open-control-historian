@@ -12,6 +12,10 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = []
+m03-pr03e-native-harness = []
+
 [package.metadata.och]
 role = "native"
 unsafe-policy = "forbid"

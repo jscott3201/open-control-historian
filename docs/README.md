@@ -70,8 +70,11 @@ retention, or reclamation state.
   [`docs/evidence/m03-pr03d-linux-x86_64/`](evidence/m03-pr03d-linux-x86_64/).
   None of it proves native writer, open, runtime, or production behavior.
 - [M03-PR03e native execution-evidence plan](m03-pr03e-native-execution-evidence-plan.md)
-  is an unimplemented review plan for a later private harness and report. It adds
-  no harness, result, accepted V2 byte, budget, SLO, or product authority.
+  remains the review plan for a later private harness and report.
+- [M03-PR03f native evidence instrumentation](implementation-brief-m03-pr03f.md)
+  is the disabled-by-default current-V1 native prerequisite for that later
+  harness. It adds no harness, result, V2 source binding, accepted V2 byte,
+  budget, SLO, or product authority.
 
 ## Historical delivery records
 
@@ -138,6 +141,8 @@ a historical record says otherwise.
 - **M03-PR03e:** [future native evidence plan](m03-pr03e-native-execution-evidence-plan.md),
   [implementation brief](implementation-brief-m03-pr03e.md), and
   [continuation](continuation-m03-pr03e.md)
+- **M03-PR03f:** [native evidence-instrumentation brief](implementation-brief-m03-pr03f.md)
+  and [continuation](continuation-m03-pr03f.md)
 
 ## Future Store Format V2 review material
 
@@ -152,8 +157,9 @@ a historical record says otherwise.
 - [Published Native Segment V1 design contract](published-native-segment-v1-contract.md)
 - [M03-PR03b implementation barrier](implementation-brief-m03-pr03b.md)
 - [M03-PR03e private-harness/evidence plan](m03-pr03e-native-execution-evidence-plan.md)
+- [M03-PR03f native evidence-instrumentation prerequisite](implementation-brief-m03-pr03f.md)
 
 The PR03c tooling target and PR03d standalone Linux x86_64 measurements do not set
-a native workspace threshold. The later private harness, measured native results,
-and a fresh owner checkpoint remain prerequisites for any separately reviewed V2
-product proposal.
+a native workspace threshold. PR03f supplies only current-V1 instrumentation; the
+later private harness, measured native results, and a fresh owner checkpoint
+remain prerequisites for any separately reviewed V2 product proposal.

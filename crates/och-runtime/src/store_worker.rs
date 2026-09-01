@@ -96,6 +96,8 @@ pub struct StoreOptions {
     group_commit: GroupCommitPolicy,
     registry: RegistryPersistenceOptions,
     retry: RetryPersistenceOptions,
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    evidence_session: Option<och_store::__m03_pr03e_native_harness::NativeEvidenceSession>,
     #[cfg(test)]
     cleanup_on_reap: bool,
     #[cfg(test)]
@@ -144,6 +146,8 @@ impl StoreOptions {
             group_commit,
             registry,
             retry,
+            #[cfg(feature = "m03-pr03e-native-harness")]
+            evidence_session: None,
             #[cfg(test)]
             cleanup_on_reap: false,
             #[cfg(test)]
@@ -191,6 +195,28 @@ impl StoreOptions {
     #[must_use]
     pub const fn retry(&self) -> RetryPersistenceOptions {
         self.retry
+    }
+
+    /// Attaches one unsupported temporary native evidence session.
+    ///
+    /// This rustdoc-hidden feature-only builder is not a product activation or
+    /// extension point. It is available only under `m03-pr03e-native-harness`.
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_native_evidence_session(
+        mut self,
+        session: crate::__m03_pr03e_native_harness::NativeEvidenceSession,
+    ) -> Self {
+        self.evidence_session = Some(session.into_store_session());
+        self
+    }
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    pub(crate) fn evidence_session(
+        &self,
+    ) -> Option<och_store::__m03_pr03e_native_harness::NativeEvidenceSession> {
+        self.evidence_session.clone()
     }
 
     pub(crate) fn manifest_config(&self) -> Result<ManifestStoreConfig, ManifestStoreError> {
@@ -851,6 +877,10 @@ pub(crate) fn run_store_worker(
     inspection: InspectionShared,
     stop: Arc<AtomicBool>,
 ) {
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let _evidence_guard = options
+        .evidence_session()
+        .map(och_store::__m03_pr03e_native_harness::install_worker_session);
     let config = match options.manifest_config() {
         Ok(config) => config,
         Err(error) => {
@@ -965,7 +995,12 @@ pub(crate) fn run_store_worker(
                         return;
                     }
                 };
-                if age_rotation || fit_rotation {
+                #[cfg(feature = "m03-pr03e-native-harness")]
+                let rotation_demand =
+                    record_rotation_decision(age_rotation || fit_rotation, sequence.get());
+                #[cfg(not(feature = "m03-pr03e-native-harness"))]
+                let rotation_demand = age_rotation || fit_rotation;
+                if rotation_demand {
                     if let Err(error) = flush_pending(
                         &mut store,
                         &mut pending,
@@ -976,7 +1011,11 @@ pub(crate) fn run_store_worker(
                         let _ = response.send(Err(error));
                         return;
                     }
-                    match store.rotate() {
+                    #[cfg(feature = "m03-pr03e-native-harness")]
+                    let rotation = rotate_with_evidence(&mut store);
+                    #[cfg(not(feature = "m03-pr03e-native-harness"))]
+                    let rotation = store.rotate();
+                    match rotation {
                         Ok(_) => {
                             generation_opened_at = Instant::now();
                             inspection.update(&store.inspection(), RuntimeHealth::Healthy);
@@ -1075,7 +1114,11 @@ pub(crate) fn run_store_worker(
                     return;
                 }
                 if rotation_demand && pending.is_empty() {
-                    match store.rotate() {
+                    #[cfg(feature = "m03-pr03e-native-harness")]
+                    let rotation = rotate_with_evidence(&mut store);
+                    #[cfg(not(feature = "m03-pr03e-native-harness"))]
+                    let rotation = store.rotate();
+                    match rotation {
                         Ok(_) => {
                             generation_opened_at = Instant::now();
                             inspection.update(&store.inspection(), RuntimeHealth::Healthy);
@@ -1303,9 +1346,13 @@ fn flush_pending(
             )
         })
         .collect::<Vec<_>>();
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let _batch_id = och_store::__m03_pr03e_native_harness::start_worker_batch();
     let (committed, retry) = match store.sync_pending(&retry_pending) {
         Ok(committed) => committed,
         Err(error) => {
+            #[cfg(feature = "m03-pr03e-native-harness")]
+            och_store::__m03_pr03e_native_harness::clear_worker_batch();
             stop_for_store_failure(
                 store,
                 ingress,
@@ -1317,7 +1364,18 @@ fn flush_pending(
     };
     // Inspection must name the committed manifest before any covered receipt
     // can wake and observe runtime state.
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let inspection_evidence = och_store::__m03_pr03e_native_harness::begin_worker_boundary(
+        och_store::__m03_pr03e_native_harness::BoundaryId::InspectionUpdate,
+        committed.durable_cutoff().append_sequence(),
+        1,
+    );
     inspection.update_store(&store.inspection());
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    och_store::__m03_pr03e_native_harness::finish_worker_boundary(
+        inspection_evidence,
+        och_store::__m03_pr03e_native_harness::BoundaryOutcome::Success,
+    );
     let completed = pending
         .iter()
         .map(|entry| DurableBatchEntry {
@@ -1327,20 +1385,65 @@ fn flush_pending(
         })
         .collect::<Vec<_>>();
     if !ingress.complete_durable_batch(&completed, committed, retry) {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        och_store::__m03_pr03e_native_harness::clear_worker_batch();
         fail_worker(ingress, inspection);
         return Err(ManifestStoreError::Active(
             ActiveJournalError::InvalidLayout,
         ));
     }
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    och_store::__m03_pr03e_native_harness::clear_worker_batch();
     pending.clear();
     Ok(())
 }
 
 fn rotation_required(store: &ManifestStore, options: &StoreOptions, opened_at: Instant) -> bool {
     let active = store.inspection().active();
-    active.active_bytes() >= options.journal_limits.max_active_bytes()
+    let required = active.active_bytes() >= options.journal_limits.max_active_bytes()
         || active.active_records() >= options.journal_limits.max_active_records()
-        || (active.active_records() > 0 && opened_at.elapsed() >= options.group_commit.rotation_age)
+        || (active.active_records() > 0
+            && opened_at.elapsed() >= options.group_commit.rotation_age);
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    return record_rotation_decision(required, active.last_append_sequence());
+    #[cfg(not(feature = "m03-pr03e-native-harness"))]
+    required
+}
+
+#[cfg(feature = "m03-pr03e-native-harness")]
+fn record_rotation_decision(required: bool, subject: u64) -> bool {
+    let evidence = och_store::__m03_pr03e_native_harness::begin_worker_boundary(
+        och_store::__m03_pr03e_native_harness::BoundaryId::RotationDecision,
+        subject,
+        1,
+    );
+    och_store::__m03_pr03e_native_harness::finish_worker_boundary(
+        evidence,
+        och_store::__m03_pr03e_native_harness::BoundaryOutcome::Success,
+    );
+    required
+}
+
+#[cfg(feature = "m03-pr03e-native-harness")]
+fn rotate_with_evidence(store: &mut ManifestStore) -> Result<ManifestCommit, ManifestStoreError> {
+    let subject = store.inspection().active().last_append_sequence();
+    let evidence = och_store::__m03_pr03e_native_harness::begin_worker_boundary(
+        och_store::__m03_pr03e_native_harness::BoundaryId::RotationDelay,
+        subject,
+        1,
+    );
+    och_store::__m03_pr03e_native_harness::suspend_worker_ordinary_publication();
+    let result = store.rotate();
+    och_store::__m03_pr03e_native_harness::resume_worker_ordinary_publication();
+    och_store::__m03_pr03e_native_harness::finish_worker_boundary(
+        evidence,
+        if result.is_ok() {
+            och_store::__m03_pr03e_native_harness::BoundaryOutcome::Success
+        } else {
+            och_store::__m03_pr03e_native_harness::BoundaryOutcome::Error
+        },
+    );
+    result
 }
 
 fn stop_for_store_failure(

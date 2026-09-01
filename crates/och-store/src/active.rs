@@ -14,6 +14,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "m03-pr03e-native-harness")]
+use crate::__m03_pr03e_native_harness::{
+    BoundaryId, BoundaryOutcome, BoundaryToken, begin_worker_boundary, finish_worker_boundary,
+};
+
 /// Exact active Journal V1 artifact name.
 pub const ACTIVE_JOURNAL_FILE_NAME: &str = "active-journal-v1.och";
 /// Exact active durable-high-water artifact name.
@@ -1054,13 +1059,46 @@ impl ActiveJournal {
         self.journal
             .seek(SeekFrom::End(0))
             .map_err(|error| io_error(StoreIoOperation::Seek, error))?;
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let evidence = begin_worker_boundary(
+            BoundaryId::JournalAppendWrite,
+            frame.append_sequence().get(),
+            1,
+        );
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        if let Some(kind) = evidence
+            .as_ref()
+            .and_then(BoundaryToken::pre_operation_error)
+        {
+            finish_worker_boundary(evidence, BoundaryOutcome::Error);
+            let error = classify_io(StoreIoOperation::Write, kind.error_kind(), None);
+            return Err(self.record_mutation_error(error));
+        }
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        if let Some((length, kind)) = evidence
+            .as_ref()
+            .and_then(|token| token.short_partial_write(frame.bytes().len()))
+        {
+            if let Err(error) = self.journal.write_all(&frame.bytes()[..length]) {
+                finish_worker_boundary(evidence, BoundaryOutcome::Error);
+                let error = io_error(StoreIoOperation::Write, error);
+                return Err(self.record_mutation_error(error));
+            }
+            finish_worker_boundary(evidence, BoundaryOutcome::PartialWrite);
+            let error = classify_io(StoreIoOperation::Write, kind.error_kind(), None);
+            return Err(self.record_mutation_error(error));
+        }
         #[cfg(test)]
         if let Some((length, injected)) = self.faults.short_write.take() {
             let partial = length.min(frame.bytes().len());
             if let Err(error) = self.journal.write_all(&frame.bytes()[..partial]) {
+                #[cfg(feature = "m03-pr03e-native-harness")]
+                finish_worker_boundary(evidence, BoundaryOutcome::Error);
                 let error = io_error(StoreIoOperation::Write, error);
                 return Err(self.record_mutation_error(error));
             }
+            #[cfg(feature = "m03-pr03e-native-harness")]
+            finish_worker_boundary(evidence, BoundaryOutcome::Error);
             let error = classify_io(
                 StoreIoOperation::Write,
                 injected.kind,
@@ -1069,9 +1107,13 @@ impl ActiveJournal {
             return Err(self.record_mutation_error(error));
         }
         if let Err(error) = self.journal.write_all(frame.bytes()) {
+            #[cfg(feature = "m03-pr03e-native-harness")]
+            finish_worker_boundary(evidence, BoundaryOutcome::Error);
             let error = io_error(StoreIoOperation::Write, error);
             return Err(self.record_mutation_error(error));
         }
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        finish_worker_boundary(evidence, BoundaryOutcome::Success);
         self.active_bytes = end_offset;
         self.records.push(RecoveredAdmissionV1 {
             end_offset,
@@ -1100,6 +1142,7 @@ impl ActiveJournal {
     ///
     /// On failure the in-memory durable cutoff is not advanced. A handle whose
     /// mutation may have changed bytes refuses all later mutation until reopen.
+    #[allow(clippy::too_many_lines)]
     pub fn sync_pending(&mut self) -> Result<DurableCutoff, ActiveJournalError> {
         self.ensure_usable()?;
         let last_sequence = self.last_append_sequence();
@@ -1112,8 +1155,21 @@ impl ActiveJournal {
         // before the journal synchronization starts this durability transaction.
         let next = self.pending_checkpoint_state(last_sequence)?;
         let checkpoint = prepare_checkpoint_slot(self.identity, next)?;
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let journal_sync = begin_worker_boundary(BoundaryId::JournalSync, last_sequence, 1);
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        if let Some(kind) = journal_sync
+            .as_ref()
+            .and_then(BoundaryToken::pre_operation_error)
+        {
+            finish_worker_boundary(journal_sync, BoundaryOutcome::Error);
+            let error = classify_io(StoreIoOperation::SyncJournal, kind.error_kind(), None);
+            return Err(self.record_mutation_error(error));
+        }
         #[cfg(test)]
         if let Some(injected) = self.faults.journal_sync.take() {
+            #[cfg(feature = "m03-pr03e-native-harness")]
+            finish_worker_boundary(journal_sync, BoundaryOutcome::Error);
             let error = classify_io(
                 StoreIoOperation::SyncJournal,
                 injected.kind,
@@ -1122,11 +1178,48 @@ impl ActiveJournal {
             return Err(self.record_mutation_error(error));
         }
         if let Err(error) = self.journal.sync_all() {
+            #[cfg(feature = "m03-pr03e-native-harness")]
+            finish_worker_boundary(journal_sync, BoundaryOutcome::Error);
             let error = io_error(StoreIoOperation::SyncJournal, error);
+            return Err(self.record_mutation_error(error));
+        }
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        finish_worker_boundary(journal_sync, BoundaryOutcome::Success);
+
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let checkpoint_write =
+            begin_worker_boundary(BoundaryId::CheckpointWrite, next.slot_generation, 1);
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        if let Some(kind) = checkpoint_write
+            .as_ref()
+            .and_then(BoundaryToken::pre_operation_error)
+        {
+            finish_worker_boundary(checkpoint_write, BoundaryOutcome::Error);
+            let error = classify_io(StoreIoOperation::Write, kind.error_kind(), None);
+            return Err(self.record_mutation_error(error));
+        }
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        if let Some((length, kind)) = checkpoint_write
+            .as_ref()
+            .and_then(|token| token.short_partial_write(checkpoint.bytes.len()))
+        {
+            let mut file = &self.checkpoint;
+            if let Err(error) = file
+                .seek(SeekFrom::Start(checkpoint.offset))
+                .and_then(|_| file.write_all(&checkpoint.bytes[..length]))
+            {
+                finish_worker_boundary(checkpoint_write, BoundaryOutcome::Error);
+                let error = io_error(StoreIoOperation::Write, error);
+                return Err(self.record_mutation_error(error));
+            }
+            finish_worker_boundary(checkpoint_write, BoundaryOutcome::PartialWrite);
+            let error = classify_io(StoreIoOperation::Write, kind.error_kind(), None);
             return Err(self.record_mutation_error(error));
         }
         #[cfg(test)]
         if let Some(injected) = self.faults.checkpoint_write.take() {
+            #[cfg(feature = "m03-pr03e-native-harness")]
+            finish_worker_boundary(checkpoint_write, BoundaryOutcome::Error);
             let error = classify_io(
                 StoreIoOperation::Write,
                 injected.kind,
@@ -1135,10 +1228,29 @@ impl ActiveJournal {
             return Err(self.record_mutation_error(error));
         }
         if let Err(error) = write_prepared_checkpoint_slot(&self.checkpoint, &checkpoint) {
+            #[cfg(feature = "m03-pr03e-native-harness")]
+            finish_worker_boundary(checkpoint_write, BoundaryOutcome::Error);
+            return Err(self.record_mutation_error(error));
+        }
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        finish_worker_boundary(checkpoint_write, BoundaryOutcome::Success);
+
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let checkpoint_sync =
+            begin_worker_boundary(BoundaryId::CheckpointSync, next.slot_generation, 1);
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        if let Some(kind) = checkpoint_sync
+            .as_ref()
+            .and_then(BoundaryToken::pre_operation_error)
+        {
+            finish_worker_boundary(checkpoint_sync, BoundaryOutcome::Error);
+            let error = classify_io(StoreIoOperation::SyncCheckpoint, kind.error_kind(), None);
             return Err(self.record_mutation_error(error));
         }
         #[cfg(test)]
         if let Some(injected) = self.faults.checkpoint_sync.take() {
+            #[cfg(feature = "m03-pr03e-native-harness")]
+            finish_worker_boundary(checkpoint_sync, BoundaryOutcome::Error);
             let error = classify_io(
                 StoreIoOperation::SyncCheckpoint,
                 injected.kind,
@@ -1147,11 +1259,21 @@ impl ActiveJournal {
             return Err(self.record_mutation_error(error));
         }
         if let Err(error) = self.checkpoint.sync_all() {
+            #[cfg(feature = "m03-pr03e-native-harness")]
+            finish_worker_boundary(checkpoint_sync, BoundaryOutcome::Error);
             let error = io_error(StoreIoOperation::SyncCheckpoint, error);
             return Err(self.record_mutation_error(error));
         }
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        finish_worker_boundary(checkpoint_sync, BoundaryOutcome::Success);
+
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let checkpoint_adopt =
+            begin_worker_boundary(BoundaryId::CheckpointAdopt, next.slot_generation, 1);
         self.checkpoint_state = next;
         self.sync_count = self.sync_count.saturating_add(1);
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        finish_worker_boundary(checkpoint_adopt, BoundaryOutcome::Success);
         Ok(self.durable_cutoff())
     }
 
@@ -1224,11 +1346,17 @@ impl ActiveJournal {
     }
 
     fn record_mutation_error(&mut self, error: ActiveJournalError) -> ActiveJournalError {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let was_writable = self.write_state == StoreWriteState::Writable;
         self.write_state = if matches!(error, ActiveJournalError::StoragePressure(_)) {
             StoreWriteState::ReopenRequired
         } else {
             StoreWriteState::Faulted
         };
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        if was_writable && self.write_state == StoreWriteState::ReopenRequired {
+            crate::pressure::record_pressure_transition();
+        }
         error
     }
 }
