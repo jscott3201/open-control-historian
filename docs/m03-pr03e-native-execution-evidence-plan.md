@@ -172,29 +172,160 @@ All event records use one process-local monotonic clock based on
 `std::time::Instant`. `start_ns` and `stop_ns` are unsigned nanoseconds relative
 to one process-local monotonic origin; `elapsed_ns` must exactly equal their
 checked difference. Wall-clock time, filesystem timestamps, and timestamps from
-different processes are never subtracted. Each sample records `event_id`,
-`phase_id`, `case_id`, `sample_id`, `process_mode`, `store_mode`, `start_ns`,
-`stop_ns`, `elapsed_ns`, `outcome`, and optional bounded `pair_ordinal`.
+different processes are never subtracted. Each event row records `event_id`,
+`parent_event_id`, `phase_id`, `case_id`, `sample_id`, `process_mode`,
+`store_mode`, `rotation_trigger_path`, `start_ns`, `stop_ns`, `elapsed_ns`,
+`outcome`, `trace_status`, `distribution_eligible`, and optional bounded
+`pair_ordinal`.
+
+`rotation_trigger_path` is a closed field with exactly these values:
+
+- `PRE_APPEND`: age or fit demand is discovered before the preserved incoming
+  append;
+- `POST_PUBLICATION`: rotation demand is discovered after append publication; or
+- `NOT_APPLICABLE`: the sample is not an automatic writer-rotation sample.
+
+Each automatic-rotation case declares exactly one closed
+`expected_rotation_trigger_path`, either `PRE_APPEND` or `POST_PUBLICATION`.
+Every sample/event row for that case must carry the same `rotation_trigger_path`;
+an automatic-rotation case may never declare or report `NOT_APPLICABLE`. Required
+sample and event counts are enforced independently for each declared case/path,
+not pooled across paths or demand classes.
+
+The complete matrix has this minimum closed automatic-rotation case set, matching
+the demand classes reachable at each writer-owned source path:
+
+| Required case ID | Demand class | `expected_rotation_trigger_path` |
+| --- | --- | --- |
+| `ROTATE-PRE-APPEND-FIT` | incoming append does not fit the current active generation | `PRE_APPEND` |
+| `ROTATE-PRE-APPEND-AGE` | age demand discovered before the preserved incoming append | `PRE_APPEND` |
+| `ROTATE-POST-PUBLICATION-SIZE` | size boundary reached after publication | `POST_PUBLICATION` |
+| `ROTATE-POST-PUBLICATION-COUNT` | record-count boundary reached after publication | `POST_PUBLICATION` |
+| `ROTATE-POST-PUBLICATION-AGE` | age boundary reached after publication | `POST_PUBLICATION` |
+
+The schema/source validator must prove this case list covers every reachable
+automatic-rotation demand class at the path where it actually occurs. It must not
+manufacture a post-publication counterpart for a fit-only pre-append case.
+`NOT_APPLICABLE` remains valid only for nonrotation ordinary-durability and
+eager-open cases and cannot hide a rotation case. The complete matrix must still
+contain both writer paths; missing either path fails the existing missing-path
+fixtures.
+
+### Writer-owned trigger paths
+
+| Trigger path | Required pre-rotation barrier | Rotation-delay start | Rotation-delay stop |
+| --- | --- | --- | --- |
+| `PRE_APPEND` | Age or fit demand is discovered while the incoming append remains preserved. Any prior pending ordinary flush, inspection publication, and all covered durable receipt resolution complete first. If there is no pending ordinary work, `V2TIME-ORD-NOOP-BARRIER` records that explicit no-op; no receipt is invented. | Immediately after the flush/receipt sequence or explicit no-op barrier, and immediately before `V2TX-P0-PREFLIGHT`. | Immediately before the preserved incoming append resumes, or when its exact terminal/reopen-required result is fixed. |
+| `POST_PUBLICATION` | Demand is discovered after publication. The forced ordinary flush, inspection publication, and every covered durable receipt resolution complete first, leaving pending empty. | Immediately after the last covered receipt resolves and immediately before `V2TX-P0-PREFLIGHT`. | Immediately before the writer accepts or receives the next ordered command, or when the exact terminal/reopen-required result is fixed. |
+
+Queue/admission time before either start is excluded. A rotation event that starts
+before its applicable ordinary receipt sequence or no-op barrier is invalid.
 
 The top-level event IDs and exact boundaries are:
 
 | Event ID | Start | Stop |
 | --- | --- | --- |
 | `V2TIME-RECEIPT-HANDLED-DURABLE` | The handled stage becomes visible for an append. | Its durable stage becomes visible under the ordinary manifest. A terminal resolution is an incomplete latency sample recorded in fault results, not a durable stop. This is ordinary durability and is never a rotation duration. |
-| `V2TIME-WRITER-ROTATION-DELAY` | After ordinary flush, inspection update, and covered durable receipt completion, when the sole writer commits to rotate, immediately before `V2TX-P0-PREFLIGHT`. | The writer can accept the next ordered append, or returns the exact terminal/reopen-required result. Queue and admission delay before the start are excluded. |
+| `V2TIME-WRITER-ROTATION-DELAY` | The trigger-specific barrier above has completed and the sole writer commits to rotate, immediately before `V2TX-P0-PREFLIGHT`. | The exact trigger-specific resume/receive boundary above, or the exact terminal/reopen-required result. |
 | `V2TIME-ROTATION-MUTATION-CRITICAL` | Immediately before the first `V2TX-P1-INTENT` mutation. | The final directory sync after intent-last cleanup, or immediately before an injected operation error returns with its precommit/postcommit classification. |
 | `V2TIME-EAGER-OPEN` | Future V2 open entry, before format and inventory preflight. | A fully validated writable handle is returned, or the sanitized refusal is fixed before return. |
 
-Required subevents are `V2TIME-ORD-JOURNAL-SYNC`,
-`V2TIME-ORD-CHECKPOINT-SYNC`, `V2TIME-ORD-RETRY-PUBLISH`,
-`V2TIME-ORD-MANIFEST-COMMIT`, `V2TIME-ORD-INSPECTION-UPDATE`,
-`V2TIME-ORD-RECEIPT-RESOLVE`, `V2TIME-P0-PREFLIGHT`,
-`V2TIME-P1-INTENT`, `V2TIME-P2-RAW`, `V2TIME-P3-SEGMENT`,
-`V2TIME-P4-SUCCESSOR`, `V2TIME-P5-CATALOG`,
-`V2TIME-P6-MANIFEST-COMMIT`, `V2TIME-P7-ADOPTION`,
-`V2TIME-P7-CLEANUP`, and `V2TIME-OPEN-PAIR-VALIDATION`. The last event has one
-row per pair with `pair_ordinal=1..=64`; aggregate eager-open duration does not
-replace those rows.
+### Literal ordinary-durability subevents
+
+| Event ID | Literal start | Literal stop |
+| --- | --- | --- |
+| `V2TIME-ORD-JOURNAL-SYNC` | Immediately before the ordinary active Journal V1 `sync_all`. | Immediately after success, or immediately before its exact error classification returns. |
+| `V2TIME-ORD-CHECKPOINT-WRITE` | Immediately before writing the prepared alternate checkpoint slot. | Immediately after the complete write, or immediately before its exact error classification returns. |
+| `V2TIME-ORD-CHECKPOINT-SYNC` | Immediately before checkpoint `sync_all`. | Immediately after success, or immediately before its exact error classification returns. |
+| `V2TIME-ORD-CHECKPOINT-ADOPT` | Immediately before the synchronized checkpoint becomes the in-memory mechanical durable cutoff. | Immediately after the exact new cutoff is installed and inspectable. |
+| `V2TIME-ORD-RETRY-PUBLISH` | Immediately before the first Retry State V1 staging mutation. | After its required artifact sync, bounded readback/validation, final publication, following directory sync, and final relation validation, or at the exact classified fault return. |
+| `V2TIME-ORD-MANIFEST-PUBLICATION-PREPARE` | Immediately before the first ordinary manifest staging mutation. | After staging write/sync and bounded readback/decode, immediately before final rename; or at the exact precommit fault return. |
+| `V2TIME-ORD-MANIFEST-RENAME-COMMIT` | Immediately before the ordinary manifest final rename. | Immediately after rename success or its error. Successful rename is the ordinary manifest authority-changing commit boundary. |
+| `V2TIME-ORD-MANIFEST-POSTCOMMIT-VALIDATE` | Immediately after successful ordinary manifest rename. | After the following directory sync, final readback, and complete ordinary manifest/retry/checkpoint relation validation, or at the exact postcommit fault return. |
+| `V2TIME-ORD-MANIFEST-ADOPT` | Immediately before installing the validated committed ordinary manifest in memory. | Immediately after manifest slots, current root, and retry projection name that exact commit. |
+| `V2TIME-ORD-INSPECTION-UPDATE` | Immediately before publishing runtime inspection for the ordinary commit. | Immediately after the committed manifest is visible through inspection. |
+| `V2TIME-ORD-RECEIPT-RESOLVE` | Immediately before entering the atomic covered durable-batch transition. | Immediately after every covered durable stage is visible and waiters may wake, or after the exact terminal resolution is fixed. |
+| `V2TIME-ORD-NOOP-BARRIER` | On a `PRE_APPEND` demand with no pending ordinary work, immediately before checking that no flush/receipt work is required. | Immediately after pending-empty and the existing ordinary committed root are proven unchanged, before V2 preflight. |
+
+An ordinary flush uses the exact peer order shown above from journal sync through
+receipt resolution. The no-op barrier replaces that complete sequence only for a
+no-pending `PRE_APPEND` path and cannot produce a synthetic handled or durable
+receipt.
+
+### Literal V2 transaction and eager-open subevents
+
+The transaction phase IDs remain exactly `V2TX-P0-PREFLIGHT` through
+`V2TX-P7-ADOPT-CLEAN`; event IDs refine measurement only.
+
+| Event ID | Phase | Literal start | Literal stop |
+| --- | --- | --- | --- |
+| `V2TIME-P0-PREFLIGHT` | `V2TX-P0-PREFLIGHT` | Immediately before the first read-only V2 format/inventory/root preflight operation. | After all preflight relationships and exact transaction candidates are prepared, immediately before the first P1 intent mutation, or at the sanitized refusal. |
+| `V2TIME-P1-INTENT` | `V2TX-P1-INTENT` | Immediately before exclusive create-new of `journal-rotation-v2.intent`. | After intent file sync, complete bounded readback/decode, and following directory sync, or at the exact classified fault return. |
+| `V2TIME-P2-RAW` | `V2TX-P2-RAW` | Immediately before opening the durable active Journal V1 source. | After raw-final directory sync and complete final readback/validation, or at the exact classified fault return. |
+| `V2TIME-P3-SEGMENT` | `V2TX-P3-SEGMENT` | Immediately before the first raw-source read or segment-staging create used by exact `OCHSEG01` streaming publication, whichever occurs first. | After segment-final directory sync and complete hostile final/source-link validation, or at the exact classified fault return. |
+| `V2TIME-P4-SUCCESSOR` | `V2TX-P4-SUCCESSOR` | Immediately before the first successor active Journal V1 or checkpoint create. | After both successor artifacts are synchronized, completely read back, and relation-validated, or at the exact classified fault return. |
+| `V2TIME-P5-CATALOG` | `V2TX-P5-CATALOG` | Immediately before Catalog V2 staging create. | After final rename, following directory sync, complete final readback/decode, and raw/segment/successor relation validation, or at the exact classified fault return. |
+| `V2TIME-P6-MANIFEST` | `V2TX-P6-MANIFEST` | Immediately before Manifest V2 staging create. | After `V2TIME-P6-MANIFEST-POSTCOMMIT-VALIDATE` completes, or at the exact classified precommit/postcommit fault return. This aggregate contains only the next three declared child spans. |
+| `V2TIME-P6-MANIFEST-PUBLICATION-PREPARE` | `V2TX-P6-MANIFEST` | Immediately before Manifest V2 staging create. | After staging write/sync and complete bounded readback/decode, immediately before final rename; or at the exact precommit fault return. |
+| `V2TIME-P6-MANIFEST-RENAME-COMMIT` | `V2TX-P6-MANIFEST` | Immediately before the Manifest V2 final rename. | Immediately after rename success or its error. Successful rename is the sole V2 authority-changing commit boundary and switches root classification to `COMMITTED_ROOT` immediately. |
+| `V2TIME-P6-MANIFEST-POSTCOMMIT-VALIDATE` | `V2TX-P6-MANIFEST` | Immediately after successful Manifest V2 final rename. | After the following directory sync, complete final readback, and complete Manifest/Catalog/raw/segment/successor relation validation, or at the exact postcommit fault return. |
+| `V2TIME-P7-ADOPTION` | `V2TX-P7-ADOPT-CLEAN` | Immediately before in-memory adoption of the fully postcommit-validated successor and committed root. | Immediately after current root, catalog, active successor, and inspection state name the exact committed relation. |
+| `V2TIME-P7-CLEANUP` | `V2TX-P7-ADOPT-CLEAN` | Immediately before the first committed predecessor-active cleanup boundary. | Immediately after intent-last removal and its final directory sync, with the exact clean committed inventory proven; or at the exact postcommit fault return. |
+| `V2TIME-OPEN-PAIR-VALIDATION` | eager open | Immediately before opening the raw final for `pair_ordinal`. | After complete raw and segment validation and source-link comparison, pair-state release, and the pair resource-ledger check, before the next pair opens or the refusal is fixed. |
+
+`V2TIME-OPEN-PAIR-VALIDATION` has one row per pair with
+`pair_ordinal=1..=64`; aggregate `V2TIME-EAGER-OPEN` never replaces those rows.
+
+### Closed event-order and containment validator
+
+The later plan/schema validator must enforce a closed trace grammar:
+
+1. A declared aggregate may contain only its declared child spans:
+   `V2TIME-RECEIPT-HANDLED-DURABLE` may contain the ordinary peer sequence,
+   `V2TIME-WRITER-ROTATION-DELAY` contains P0 through P7,
+   `V2TIME-ROTATION-MUTATION-CRITICAL` contains P1 through P7 cleanup,
+   `V2TIME-P6-MANIFEST` contains its three P6 children, and
+   `V2TIME-EAGER-OPEN` contains ordered pair-validation spans.
+2. Peer subevents may not overlap, merge, reorder, or silently disappear.
+   Complete traces follow the exact ordinary order above and then the exact
+   P0→P1→P2→P3→P4→P5→P6 preparation→P6 rename→P6 postcommit→P7 adoption→P7
+   cleanup order. Parent/child containment is the only permitted overlap.
+3. Successful Manifest V2 final rename changes root classification immediately.
+   Every later event or fault result is `COMMITTED_ROOT` or an unchanged refusal
+   of that committed relation; `PRIOR_ROOT` after rename success is invalid even
+   though directory sync and postcommit validation remain.
+4. Rotation timing cannot begin before the applicable complete ordinary receipt
+   sequence or explicit no-op barrier. The trigger-specific stop must precede the
+   preserved append resume (`PRE_APPEND`) or next command receive/accept
+   (`POST_PUBLICATION`).
+5. Every complete `sample_id` has exactly the required event set, declared case
+   path, parentage, order, and pair coverage. Required sample/event counts are
+   enforced per `case_id` and `expected_rotation_trigger_path`. An injected
+   failure/crash may instead produce `trace_status=INCOMPLETE_FAULT_WITNESS` with
+   the exact completed prefix, last boundary, and omitted suffix; it always has
+   `distribution_eligible=false` and is excluded from timing distributions.
+6. Each automatic-rotation case declares exactly one expected path and every row
+   must match it. Matrix validation requires all five closed demand/path cases and
+   therefore both writer paths overall. It refuses `NOT_APPLICABLE` on rotation,
+   an unrecognized value, a case/path mismatch, pooled counts, or implicit trigger
+   coverage. Nonrotation ordinary/eager-open cases may use `NOT_APPLICABLE`.
+
+The future plan/schema validator must include these literal fixtures:
+
+| Fixture ID | Required result |
+| --- | --- |
+| `TRACE-ACCEPT-PRE-APPEND` | Accept one exact complete required `PRE_APPEND` case trace, including either the ordinary peer sequence or explicit no-op barrier before P0. |
+| `TRACE-ACCEPT-POST-PUBLICATION` | Accept one exact complete required `POST_PUBLICATION` case trace with forced ordinary durability and receipts before P0. |
+| `TRACE-REJECT-MERGED-SUBEVENT` | Reject two required peer spans represented as one event. |
+| `TRACE-REJECT-OVERLAPPING-PEERS` | Reject peer overlap not explained by declared parent containment. |
+| `TRACE-REJECT-REORDERED-SUBEVENT` | Reject any ordinary or P0→P7 reorder. |
+| `TRACE-REJECT-MISSING-SUBEVENT` | Reject a complete sample missing any required literal span. |
+| `TRACE-REJECT-PRE-RECEIPT-ROTATION` | Reject `POST_PUBLICATION` P0/rotation start before all covered durable receipt resolution. |
+| `TRACE-REJECT-PRE-BARRIER-ROTATION` | Reject no-pending `PRE_APPEND` P0/rotation start before the explicit no-op barrier. |
+| `TRACE-REJECT-MISSING-PRE-APPEND` | Reject an applicable matrix with no complete `PRE_APPEND` sample. |
+| `TRACE-REJECT-MISSING-POST-PUBLICATION` | Reject an applicable matrix with no complete `POST_PUBLICATION` sample. |
+| `TRACE-REJECT-CASE-TRIGGER-MISMATCH` | Reject a sample whose trigger differs from its case's one declared `expected_rotation_trigger_path`, including `NOT_APPLICABLE` on rotation. |
+| `TRACE-REJECT-POST-RENAME-PRIOR-ROOT` | Reject `PRIOR_ROOT` classification after successful `V2TIME-P6-MANIFEST-RENAME-COMMIT`. |
 
 A killed child cannot emit an in-process stop event. Crash-after-success cases
 therefore record the child's last successful boundary event and the parent's
@@ -366,9 +497,12 @@ The later structural and execution matrices must prove these exact boundaries:
 - Eager open validates all 64 committed raw/segment pairs completely, one pair
   state at a time. Pair `n` state is released and ledger-checked before pair
   `n+1` opens.
-- The zero-external-sort/workspace design remains mandatory. If the later harness
-  needs nonzero external workspace, it must return `REPLAN` for owner review
-  rather than measuring or normalizing it.
+- Every case measures and ledgers requested and actual logical and allocated
+  external workspace, whether the observation is zero or nonzero.
+- Incomplete, unbounded, arithmetic-overflowing, or unledgered workspace behavior
+  fails the harness evidence. Every candidate implementation must expose finite,
+  checked workspace bounds and complete evidence, but this plan does not choose
+  their accepted numeric value or require zero.
 
 Every operation reports a complete resource ledger with actual and requested
 capacities for frame metadata, observation/index state, input frame, canonical
@@ -387,11 +521,13 @@ eager-validation sweep reads about `109,551,035,136` bytes under the reviewed
 formula. Those massive cases belong on the dedicated AgentBox/release evidence
 path, never hosted PR CI.
 
-The PR03c 160 MiB prototype target and every PR03d standalone value are comparison
-data only. Native peak RSS, writer rotation delay, eager-open latency, total
-runtime, headroom, and all SLOs/budgets remain `UNKNOWN` until native measurements
-return and the owner accepts them. This plan sets no pass threshold for those
-observations.
+The PR03c 160 MiB prototype target, its zero-external-workspace design, and every
+PR03d standalone value are tooling comparison data only. A nonzero native
+workspace observation is not by itself a plan failure or `REPLAN`. Native peak
+RSS, writer rotation delay, eager-open latency, total runtime, headroom, workspace
+limit/acceptance threshold, and all SLOs/budgets remain `UNKNOWN` until measured
+Linux evidence returns and the fresh owner checkpoint accepts them. This plan sets
+no pass threshold for those observations.
 
 ## Bounded report bundle and schema
 
@@ -401,12 +537,12 @@ Reports are schema-versioned UTF-8 KV/TSV, never free-form logs. Schema version
 | Relative file | Required contents |
 | --- | --- |
 | `run.kv` | Plan acceptance SHA; clean harness SHA and measured source SHA; tracked and untracked tree status; `Cargo.lock`, harness-source, and instrumentation-source SHA-256; exact commands/profile; Rust/Cargo versions; platform, CPU, memory, filesystem, mount/locality, load, storage/headroom, page/cache/store facts; report classification and exclusions. |
-| `timing-samples.tsv` | Every complete sample and event ID with exact process/store/cache labels, monotonic start/stop/elapsed nanoseconds, result, and pair ordinal. |
-| `timing-summary.tsv` | Required count, actual count, min/median/observed p90/p95/p99/max/IQR/MAD or witness-only min/median/max plus `percentile_claim=NONE`. |
-| `resource-ledger.tsv` | Every actual/requested capacity and all process, stack, RSS, storage, workspace, concurrent-inventory, headroom, page, and cache fields listed above. |
+| `timing-samples.tsv` | Every complete sample and literal event ID with parent ID, phase, closed `rotation_trigger_path`, exact process/store/cache labels, monotonic start/stop/elapsed nanoseconds, result, trace/distribution status, and pair ordinal. |
+| `timing-summary.tsv` | Per-case/path required count, actual count, declared/observed trigger path, min/median/observed p90/p95/p99/max/IQR/MAD or witness-only min/median/max plus `percentile_claim=NONE`; counts are never pooled and incomplete fault witnesses are excluded. |
+| `resource-ledger.tsv` | Every actual/requested capacity and all process, stack, RSS, storage, requested/actual logical/allocated external workspace, concurrent-inventory, headroom, page, and cache fields listed above for every case. |
 | `fault-registry.tsv` | The complete closed registry row for every instrumented boundary. |
-| `fault-results.tsv` | Fault ID, mode, repetition, expected/actual result, pressure kind/raw diagnostic, receipt stages, process result, last boundary, pre/immediate/reopen/final fingerprints, and root classification. |
-| `matrix.tsv` | Every PR03b crosswalk ID and every timing, bound, hostile, fault/mode, pressure, platform, and report obligation with expected rows, observed rows, and `PASS`/`FAIL`; no skipped or implied row. |
+| `fault-results.tsv` | Fault ID, mode, repetition, expected/actual result, pressure kind/raw diagnostic, receipt stages, rotation trigger path, exact completed event prefix, process result, last boundary, pre/immediate/reopen/final fingerprints, and root classification. |
+| `matrix.tsv` | Every PR03b crosswalk ID; every required rotation `case_id`, demand class, and one `expected_rotation_trigger_path`; both writer paths overall; every event-order fixture; and every timing, bound, hostile, fault/mode, pressure, platform, and report obligation with expected rows, observed rows, and `PASS`/`FAIL`; no skipped or implied row. |
 | `SHA256SUMS` | Relative SHA-256 for every other bounded report file and no unlisted report file. |
 
 All KV keys and TSV columns are closed and schema-validated. The bundle must cap
@@ -434,13 +570,13 @@ neither the harness nor results.
 | `PR03E-M02` Published segment bytes | Independently emit and full-compare exact unchanged `OCHSEG01` bytes, complete source reconstruction, indexes, and trailer without using the production emitter as oracle. | Fixture dimensions, raw/segment identities, complete comparison and hostile parse rows, and oracle hashes. | `UNSATISFIED` |
 | `PR03E-M03` Namespace and inventory | Enumerate the exact V2 recognized-name oracle; prove canonical 156, unknown-name refusal, and no orphan, gap, duplicate, alternate segment, non-file, or leftover. | Canonical sorted inventory fingerprints and before/after equality for every refusal. | `UNSATISFIED` |
 | `PR03E-M04` Epoch fence | Exercise V1, V2, markerless, historical, and every mixed-format inventory before lock create/acquire or mutation. | Boundary trace proving pre-lock refusal plus exact pre/immediate/final inventory equality. | `UNSATISFIED` |
-| `PR03E-M05` Transaction convergence | Exercise every registered phase boundary in all applicable modes with three identical repetitions; allow only exact prior-root rollback before commit and committed-root adoption after commit. | Closed fault registry, complete fault rows, receipt stages, four inventory fingerprints, reopen result, and exact root classification. | `UNSATISFIED` |
+| `PR03E-M05` Transaction convergence | Exercise every registered phase boundary in all applicable modes with three identical repetitions; allow only exact prior-root rollback before commit and committed-root adoption after commit; validate that successful Manifest V2 rename switches classification immediately and rejects every post-rename prior-root trace. | Closed fault registry, ordered event/fixture rows, complete fault rows, receipt stages, four inventory fingerprints, reopen result, and exact root classification. | `UNSATISFIED` |
 | `PR03E-M06` Committed cleanup convergence | Fault/crash before, between, and after successor adoption, predecessor active removal/sync, checkpoint removal/sync, each raw/segment/catalog/manifest staging removal/sync, clean-inventory proof, intent-last removal, and final sync. | Exact cleanup-prefix trace proving no committed raw/segment deletion, no postcommit fallback, no extra inventory, and eventual exact committed reopen. | `UNSATISFIED` |
-| `PR03E-M07` Pressure and receipts | Overlay `StorageFull` and `QuotaExceeded` at every store-owned mutation boundary, including partial-write cases; verify first-wins sticky custody, runtime fail-stop, ordinary receipt preservation, and no false new receipt/commit. | Pressure kind, raw diagnostic, custody/health transition, handled/durable stages, process result, reopen-only convergence, and root/inventory fingerprints. | `UNSATISFIED` |
+| `PR03E-M07` Pressure and receipts | Overlay `StorageFull` and `QuotaExceeded` at every store-owned mutation boundary, including partial-write cases; verify first-wins sticky custody, runtime fail-stop, ordinary receipt preservation, no false new receipt/commit, and no rotation start before covered receipts or the explicit no-op barrier. | Pressure kind, raw diagnostic, custody/health transition, handled/durable stages, trigger path, ordered event prefix, process result, reopen-only convergence, and root/inventory fingerprints. | `UNSATISFIED` |
 | `PR03E-M08` Committed fail-closed behavior | Generate missing, corrupt, foreign, malformed, truncated, partial, excessive, forked, unrelated, ambiguous, and catalog-mismatched committed segment/pair cases. | Sanitized refusal, complete eager-validation boundary, and exact before/after fingerprints with `UNCHANGED_REFUSAL`. | `UNSATISFIED` |
 | `PR03E-M09` Raw/segment linkage | Completely checksum and hostile-parse every pair; verify exact StoreId, generation, range, registry, raw length/CRC, frame coverage, unchanged frame bytes, indexes, trailer, and Catalog V2 identity. | One complete validation row and bounded resource ledger per pair, including pair-state release before the next pair. | `UNSATISFIED` |
 | `PR03E-M10` Bounds | Prove entries 1 and 64, pre-mutation entry-65 refusal, canonical inventory 156, and 157/unknown/mixed refusal unchanged. | Exact boundary traces, mutation count zero for refusals, and canonical before/after fingerprints. | `UNSATISFIED` |
-| `PR03E-M11` Streaming resources | Execute minimum, representative, independent maximum, 64-pair, and refusal tiers with zero external workspace; collect complete native writer-delay, eager-open, RSS, storage, and representation ledgers without thresholds. | All timing samples/statistics, witness labels, pair events, complete resource ledger, platform/cache facts, and explicit `UNKNOWN` budgets/SLOs. PR03d values appear only as labeled comparison data. | `UNSATISFIED` |
+| `PR03E-M11` Streaming resources | Execute minimum, representative, independent maximum, 64-pair, and refusal tiers; measure requested/actual logical/allocated external workspace for zero and nonzero observations; collect the complete declared demand/path case matrix covering both writer paths, literal ordered events, validator fixtures, native writer-delay, eager-open, RSS, storage, and representation ledgers without inventing thresholds. | All timing samples/statistics and required/actual counts grouped by declared case/path, event/fixture completeness, witness labels, pair events, complete finite checked workspace/resource ledgers, platform/cache facts, and explicit `UNKNOWN` native workspace limits, budgets, and SLOs. PR03c/PR03d values appear only as labeled tooling comparison data. | `UNSATISFIED` |
 
 No row may become satisfied in a harness implementation PR merely because its
 schema or test case exists. Structural harness checks and measured results are
@@ -468,5 +604,6 @@ This plan authorizes no harness in this PR, `crates/`, `tools/`, `scripts/`, CI,
 Cargo, dependency, product API, V2 opener/decoder/publication, format-byte or name
 change, V1 migration, fallback, rebuild, repair, query, retention, compaction,
 raw deletion, cloud execution, cache mutation, measured report, numeric native
-budget, or SLO. Physical power-loss, excluded platforms/filesystems, and nonzero
-external workspace remain outside authority.
+budget, accepted native workspace threshold, or SLO. Physical power-loss and
+excluded platforms/filesystems remain outside authority. Zero and nonzero native
+workspace observations are evidence inputs, not authority granted by this plan.

@@ -43,9 +43,10 @@ are exploratory. M03-PR03d records the owner-accepted standalone tooling Linux
 x86_64 resource evidence and closes only that standalone measurement condition.
 M03-PR03e adds the executable native transaction/timing/fault/pressure/receipt
 evidence plan and authorizes only a later private harness review. It adds no
-harness or result. Writer/open/RSS/total-runtime budgets and SLOs remain `UNKNOWN`;
-V2 product work still requires that harness, measured Linux native results, and a
-fresh owner checkpoint.
+harness or result, and PR03c's zero external workspace is tooling comparison data,
+not a native threshold. Writer/open/RSS/total-runtime/native-workspace budgets and
+SLOs remain `UNKNOWN`; V2 product work still requires that harness, measured Linux
+native results, and a fresh owner checkpoint.
 
 ## Current status
 

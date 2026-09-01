@@ -23,15 +23,22 @@ defines:
   commit, adoption, exact committed cleanup, and intent-last synchronization;
 - prior-root versus committed-root crash and refusal classification;
 - exact monotonic timing event boundaries for handled-to-durable receipt latency,
-  writer rotation delay, mutation-critical time, eager open, every transaction
-  phase, and every pair validation;
+  a closed required case matrix covering both `PRE_APPEND` and
+  `POST_PUBLICATION` writer paths, exactly one expected path per rotation case,
+  per-case/path counts, mutation-critical time, eager open, every ordinary/V2
+  transaction subevent, the distinct Manifest rename commit, and every pair
+  validation;
+- a closed event-order/containment validator and positive/negative fixtures for
+  merged, overlapping, reordered, missing, pre-barrier, missing-trigger-path, and
+  post-rename prior-root traces;
 - cold/warm process, filesystem-cache, store-reuse, sample-count, witness-only,
   observed-statistic, platform, and no-outlier policy;
 - a closed semantic fault registry, complete I/O-boundary validator,
   deterministic pre-operation/partial-write/crash-after-success modes, and both
   standard-library pressure overlays;
 - exact receipt, pressure, reopen, inventory-fingerprint, hostile, bound,
-  64-pair, resource-ledger, and zero-workspace obligations;
+  64-pair, resource-ledger, and finite checked native-workspace measurement
+  obligations without an accepted threshold;
 - one bounded, schema-versioned, sanitized KV/TSV report bundle with complete
   source hashes, commands, samples, ledgers, fault results, matrix rows, and
   `SHA256SUMS`; and
@@ -58,16 +65,22 @@ cloud execution belongs to this docs slice.
 The exact 64-pair-plus-active logical planning floor is `75,728,169,472` bytes,
 and one maximum 64-pair sweep reads about `109,551,035,136` bytes. These are
 planning arithmetic, not measured native budgets. PR03c's 160 MiB target and
-PR03d's accepted standalone values remain comparison data only. Native RSS,
-writer delay, eager-open latency, total-runtime budgets, and SLOs remain
-`UNKNOWN`.
+zero-external-workspace result and PR03d's accepted standalone values remain
+tooling comparison data only. The future native harness must ledger requested and
+actual logical/allocated external workspace for every case. Nonzero observation
+is not itself a plan failure or `REPLAN`; incomplete, unbounded, overflowing, or
+unledgered behavior fails. Native RSS, writer delay, eager-open latency,
+total-runtime budgets, workspace limit/acceptance threshold, and SLOs remain
+`UNKNOWN` pending measured Linux evidence and the fresh owner checkpoint.
 
 ## Acceptance and successor handoff
 
 Focused documentation checks must prove that all 11 PR03b rows are mapped exactly
 once and remain `UNSATISFIED`, and that phase IDs, timing events, fault modes,
-sample tiers, platform/cache policy, report files/fields, authority progression,
-and exclusions are present.
+the complete demand/path case matrix, one expected trigger per rotation case,
+both paths overall, per-case counts, event ordering/fixtures, sample tiers,
+platform/cache policy, report files/fields, workspace non-authority, authority
+progression, and exclusions are present.
 
 Required PR gates are:
 

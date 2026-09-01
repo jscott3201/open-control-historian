@@ -242,7 +242,8 @@ metadata/parsing dependencies do not masquerade as native product dependencies.
 defaults and the product closure. It depends inward only on `och-store` and
 `och-core`, duplicates exact Segment V1 emission for resource evidence, and uses
 no external sort workspace or product authority name. Its standalone RSS and
-latency observations cannot establish native writer/open behavior.
+latency/workspace observations cannot establish native writer/open behavior or a
+native workspace threshold.
 
 ## Direction and ownership
 

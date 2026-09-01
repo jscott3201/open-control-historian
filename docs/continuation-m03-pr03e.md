@@ -17,10 +17,13 @@ durable receipt remains truthful if the later rotation fails.
 
 ## Frozen future evidence protocol
 
-The plan defines literal V2 transaction phase and timing IDs, Manifest-only
-commit-side classification, exact precommit rollback/postcommit adoption law,
-intent-last committed cleanup, complete pair validation, and the prohibition on
-reusing incompatible current V1 cleanup ordering. It requires:
+The plan defines literal V2 transaction phase and timing IDs, one expected path
+per automatic-rotation case, a closed demand matrix covering pre-append fit/age
+and post-publication size/count/age across both `PRE_APPEND` and
+`POST_PUBLICATION`, per-case/path counts, closed event ordering and trace fixtures,
+Manifest-rename commit-side classification, exact precommit rollback/postcommit
+adoption law, intent-last committed cleanup, complete pair validation, and the
+prohibition on reusing incompatible current V1 cleanup ordering. It requires:
 
 - 30 independent fresh-process and 100 warm same-process samples for tractable
   minimum and representative timing cases, with each warm sample starting from
@@ -42,18 +45,25 @@ reusing incompatible current V1 cleanup ordering. It requires:
 - a bounded sanitized KV/TSV report bundle with complete samples, resource
   ledger, source hashes, matrix coverage, and relative `SHA256SUMS`.
 
+PR03c's 160 MiB and zero-external-workspace results remain standalone tooling
+comparison data only. Every native case must ledger requested and actual logical
+and allocated external workspace, whether zero or nonzero. Nonzero is not by
+itself a plan failure or `REPLAN`; incomplete, unbounded, overflowing, or
+unledgered workspace fails. The accepted native workspace limit, threshold, and
+SLO remain `UNKNOWN` pending measured Linux evidence and fresh owner review.
+
 The dedicated owner-approved GCP Linux x86_64 AgentBox is the later
 acceptance-candidate platform. Hosted PR CI is functional only and Darwin arm64
 is functional/report-sanitization plus exploratory timing. Physical power loss,
-cache-drop mutation, excluded platforms/filesystems, and nonzero external
-workspace are outside the plan.
+cache-drop mutation, and excluded platforms/filesystems are outside the plan.
 
 ## Authority and successor handoff
 
 Every one of the 11 M03-PR03b future evidence rows is mapped to a future harness
 and report obligation and remains `UNSATISFIED`. M03-PR03d remains accepted
 standalone tooling comparison evidence only. Native RSS, writer rotation delay,
-eager-open latency, total-runtime budgets, and SLOs remain `UNKNOWN`.
+eager-open latency, total-runtime budgets, workspace acceptance threshold, and
+SLOs remain `UNKNOWN`.
 
 Acceptance of this docs slice authorizes only a later bounded private harness PR.
 That harness may emit reviewed V2 names/bytes only in newly absent, exclusively
