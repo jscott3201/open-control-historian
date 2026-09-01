@@ -4,6 +4,14 @@ M03-PR03g1 establishes a private 173-descriptor/173-source-site disposable V2
 executor foundation in the existing `och-v2-evidence` tooling package. At this
 reviewed revision, only the private `root::v2_io` subtree receives the opaque,
 non-cloneable `V2StoreChild` capability and can invoke its private V2 I/O API.
+The private canonical `EvidenceRoot.path` is not projected to crate siblings.
+PR03c fixture, segment, and set owners instead receive opaque fixed-identity
+capabilities: their private paths and rename targets stay in `root::pr03c_io`,
+while callers receive only already-open exact-file handles or path-free operation
+results. `root::v1_smoke` separately owns its disposable V1 child and exposes no
+store path to siblings. A finite current-source API-inventory regression rejects
+path-returning signatures and extraction traits; it is not a broad scanner or a
+future-source proof.
 Its compiled registry proves the exact literal ID/metadata/generated-wrapper
 function-pointer bijection. This is bounded capability containment plus finite
 source review, not proof that arbitrary present or future Rust cannot perform

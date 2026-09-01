@@ -95,14 +95,14 @@ fn generate_open_64(root: &EvidenceRoot, seed: u64) -> Result<()> {
         set.push_str(&case);
         set.push('\n');
     }
-    std::fs::write(root.set_path("open-64")?, set).map_err(|_| EvidenceError::Io)
+    root.pr03c_set("open-64")?.write(set.as_bytes())
 }
 
 fn build_command(arguments: &[String]) -> Result<()> {
     let parsed = Parsed::new(arguments, &["--root", "--case"], &["--keep-on-failure"])?;
     let root = EvidenceRoot::open(&PathBuf::from(parsed.required("--root")?))?;
     let case = parsed.required("--case")?;
-    let meta = model::FixtureMeta::read(&root.fixture_meta_path(case)?)?;
+    let meta = model::FixtureMeta::read(root.pr03c_case(case)?.open_fixture_meta()?)?;
     let report = stream::build(&root, case, parsed.flag("--keep-on-failure"));
     match report {
         Ok(report) => {
@@ -117,7 +117,7 @@ fn validate_command(arguments: &[String]) -> Result<()> {
     let parsed = Parsed::new(arguments, &["--root", "--case"], &[])?;
     let root = EvidenceRoot::open(&PathBuf::from(parsed.required("--root")?))?;
     let case = parsed.required("--case")?;
-    let meta = model::FixtureMeta::read(&root.fixture_meta_path(case)?)?;
+    let meta = model::FixtureMeta::read(root.pr03c_case(case)?.open_fixture_meta()?)?;
     let report = stream::validate(&root, case)?;
     report.print("stream-validate", &meta);
     Ok(())
@@ -127,7 +127,11 @@ fn validate_set_command(arguments: &[String]) -> Result<()> {
     let parsed = Parsed::new(arguments, &["--root", "--set"], &[])?;
     let root = EvidenceRoot::open(&PathBuf::from(parsed.required("--root")?))?;
     let set_name = parsed.required("--set")?;
-    let text = model::read_bounded_text(&root.set_path(set_name)?, 8_192, EvidenceError::Bounds)?;
+    let text = model::read_bounded_text(
+        root.pr03c_set(set_name)?.open()?,
+        8_192,
+        EvidenceError::Bounds,
+    )?;
     let mut lines = text.lines();
     if lines.next() != Some("schema=och-v2-evidence-set-v1") {
         return Err(EvidenceError::InvalidFixture);

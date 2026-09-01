@@ -117,6 +117,11 @@ fn run_child<T>(
     }
 }
 
+#[cfg(test)]
+fn child_absent(root: &EvidenceRoot, name: &str) -> bool {
+    !root.path.join("cases").join(name).exists()
+}
+
 fn success(store: &Path, rotate: bool) -> Result<RuntimeWitness> {
     let session = NativeEvidenceSession::new(SESSION_CAPACITY, FaultPlan::none())
         .map_err(|_| EvidenceError::InvalidHarness)?;
@@ -443,7 +448,7 @@ mod tests {
             }),
             Err(EvidenceError::InvalidHarness)
         ));
-        assert!(!root.path.join("cases").join(SUCCESS_CHILD).exists());
+        assert!(child_absent(&root, SUCCESS_CHILD));
         assert_eq!(
             run_child(&root, SUCCESS_CHILD, |_| Ok(9_u8)).expect("same-name V1 retry"),
             9

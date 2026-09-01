@@ -265,7 +265,12 @@ consumption of the hidden non-default seam and the exact tooling-only Tokio
 `rt`/`sync` edge, plus a safe-Rust SHA-256 oracle and capability-contained
 disposable transaction machinery. The private `root::v2_io` subtree alone receives
 the opaque `V2StoreChild`; its transaction descendants receive that capability,
-not a raw V2 child path. The compiled registry proves the current 173 literal
+not a raw V2 child path. The canonical evidence-root path stays private; PR03c
+siblings use opaque fixed-case/set capabilities backed by private
+`root::pr03c_io` paths and receive only exact open files or path-free results.
+The separate `root::v1_smoke` owner does not expose its child path. A focused
+current-source API inventory checks that topology without reviving the removed
+broad scanner. The compiled registry proves the current 173 literal
 ID/metadata/generated-wrapper bijection. This is finite current-revision Rust
 privacy/source-review evidence, not a universal or future-source filesystem-I/O
 claim. It adds no process supervisor, collector, or report bundle.

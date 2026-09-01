@@ -16,10 +16,9 @@ use och_store::{
     encode_decoded_admission_frame_v1,
 };
 use std::cmp::Ordering;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
-use std::path::Path;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,11 +83,11 @@ struct CountedFile {
 }
 
 impl CountedFile {
-    fn open(path: &Path) -> Result<Self> {
-        Ok(Self {
-            file: File::open(path).map_err(|_| EvidenceError::Io)?,
+    fn new(file: File) -> Self {
+        Self {
+            file,
             stats: IoStats::default(),
-        })
+        }
     }
 
     fn length(&self) -> Result<u64> {
@@ -210,7 +209,7 @@ struct Preflight {
 
 impl Preflight {
     #[allow(clippy::too_many_lines)]
-    fn run(meta: FixtureMeta, raw_path: &Path) -> Result<Self> {
+    fn run(meta: FixtureMeta, raw: File) -> Result<Self> {
         meta.validate()?;
         if meta.frame_count > MAX_FRAMES
             || meta.series_count > MAX_SERIES
@@ -219,7 +218,7 @@ impl Preflight {
             return Err(EvidenceError::Bounds);
         }
         let controlled = ControlledGuard::acquire(crate::ledger::CONTROLLED_BASE_BYTES)?;
-        let mut source = CountedFile::open(raw_path)?;
+        let mut source = CountedFile::new(raw);
         if source.length()? != meta.source_length {
             return Err(EvidenceError::InvalidSource);
         }
@@ -469,31 +468,22 @@ pub(crate) fn build(
     keep_on_failure: bool,
 ) -> Result<OperationReport> {
     root.ensure_layout()?;
-    let meta = FixtureMeta::read(&root.fixture_meta_path(case)?)?;
+    let files = root.pr03c_case(case)?;
+    let meta = FixtureMeta::read(files.open_fixture_meta()?)?;
     if meta.case != case {
         return Err(EvidenceError::InvalidFixture);
     }
-    let raw_path = root.raw_path(case)?;
-    let preflight = Preflight::run(meta.clone(), &raw_path)?;
-    let virtual_emission = emit(&preflight, &raw_path, None)?;
-    let final_path = root.segment_path(case)?;
-    let identity_path = root.segment_identity_path(case)?;
-    let temporary_path = root.segment_temp_path(case)?;
-    remove_if_present(&final_path)?;
-    remove_if_present(&identity_path)?;
-    remove_if_present(&temporary_path)?;
+    let preflight = Preflight::run(meta.clone(), files.open_raw()?)?;
+    let virtual_emission = emit(&preflight, files.open_raw()?, None)?;
+    files.reset_segment()?;
     let result: Result<OperationReport> = (|| {
-        let output = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary_path)
-            .map_err(|_| EvidenceError::Io)?;
-        let emitted = emit(&preflight, &raw_path, Some(output))?;
+        let output = files.create_segment_partial()?;
+        let emitted = emit(&preflight, files.open_raw()?, Some(output))?;
         if emitted.identity != virtual_emission.identity {
             return Err(EvidenceError::InvalidSegment);
         }
-        fs::rename(&temporary_path, &final_path).map_err(|_| EvidenceError::Io)?;
-        fs::write(&identity_path, emitted.identity.encode()).map_err(|_| EvidenceError::Io)?;
+        files.publish_segment()?;
+        files.write_segment_identity(emitted.identity.encode().as_bytes())?;
         let mut source_stats = preflight.source_stats;
         source_stats.add(virtual_emission.source_stats)?;
         source_stats.add(emitted.source_stats)?;
@@ -512,7 +502,7 @@ pub(crate) fn build(
         })
     })();
     if result.is_err() && !keep_on_failure {
-        let _ = fs::remove_file(&temporary_path);
+        let _ = files.remove_segment_partial();
     }
     drop(preflight);
     let controlled_bytes_after = active_controlled_bytes();
@@ -581,12 +571,12 @@ impl SegmentSink {
     }
 }
 
-fn emit(preflight: &Preflight, raw_path: &Path, output: Option<File>) -> Result<Emission> {
+fn emit(preflight: &Preflight, raw: File, output: Option<File>) -> Result<Emission> {
     let mut sink = SegmentSink::new(output);
     let header = encode_header(&preflight.meta, preflight.layout)?;
     sink.write_body(&header)?;
     emit_series_entries(preflight, |entry| sink.write_body(&entry))?;
-    let mut source = CountedFile::open(raw_path)?;
+    let mut source = CountedFile::new(raw);
     let mut frame_buffer = Vec::new();
     let mut max_frame_capacity = 0_usize;
     for frame in &preflight.series_order {
@@ -612,21 +602,25 @@ fn emit(preflight: &Preflight, raw_path: &Path, output: Option<File>) -> Result<
 }
 
 pub(crate) fn validate(root: &EvidenceRoot, case: &str) -> Result<OperationReport> {
-    let meta = FixtureMeta::read(&root.fixture_meta_path(case)?)?;
+    let files = root.pr03c_case(case)?;
+    let meta = FixtureMeta::read(files.open_fixture_meta()?)?;
     if meta.case != case {
         return Err(EvidenceError::InvalidFixture);
     }
-    let identity = SegmentIdentity::read(&root.segment_identity_path(case)?)?;
+    let identity = SegmentIdentity::read(files.open_segment_identity()?)?;
     if identity.source_length != meta.source_length
         || identity.source_checksum != meta.source_checksum
     {
         return Err(EvidenceError::InvalidFixture);
     }
-    let raw_path = root.raw_path(case)?;
-    let segment_path = root.segment_path(case)?;
-    let preflight = Preflight::run(meta.clone(), &raw_path)?;
+    let preflight = Preflight::run(meta.clone(), files.open_raw()?)?;
     let result: Result<OperationReport> = (|| {
-        let validation = validate_pair(&preflight, &raw_path, &segment_path, identity)?;
+        let validation = validate_pair(
+            &preflight,
+            files.open_raw()?,
+            files.open_segment()?,
+            identity,
+        )?;
         let mut source_stats = preflight.source_stats;
         source_stats.add(validation.source_stats)?;
         Ok(OperationReport {
@@ -664,11 +658,11 @@ struct Validation {
 #[allow(clippy::too_many_lines)]
 fn validate_pair(
     preflight: &Preflight,
-    raw_path: &Path,
-    segment_path: &Path,
+    raw: File,
+    segment: File,
     identity: SegmentIdentity,
 ) -> Result<Validation> {
-    let mut segment = CountedFile::open(segment_path)?;
+    let mut segment = CountedFile::new(segment);
     if segment.length()? != preflight.layout.artifact_length
         || identity.artifact_length != preflight.layout.artifact_length
     {
@@ -690,7 +684,7 @@ fn validate_pair(
         }
         Ok(())
     })?;
-    let mut raw = CountedFile::open(raw_path)?;
+    let mut raw = CountedFile::new(raw);
     let mut frame_buffer = Vec::new();
     let mut scratch = vec![0_u8; SCRATCH_BYTES];
     ensure_capacity(scratch.capacity(), SCRATCH_BYTES)?;
@@ -972,14 +966,6 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
 
 fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
-}
-
-fn remove_if_present(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(EvidenceError::Io),
-    }
 }
 
 #[cfg(test)]

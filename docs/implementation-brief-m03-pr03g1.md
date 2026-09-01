@@ -23,8 +23,15 @@ path-returning callback, or crate-visible path API. Rust privacy prevents code
 outside that subtree from constructing or receiving the capability or invoking
 its private V2 I/O API. `fault`, `inventory`, `oracle`, `schema`, and `transaction`
 are descendants of that subtree; transaction execution receives the capability,
-not `&Path`. `EvidenceRoot` offers callers only owner-specific path-free summary
-operations. Current-V1 smoke has a separate private `root::v1_smoke` lifecycle.
+not `&Path`. `EvidenceRoot.path` remains private. Its PR03c callers receive only
+opaque `Pr03cCase`/`Pr03cSet` capabilities whose exact fixture/artifact paths,
+constructors, and rename targets remain private to `root::pr03c_io`; their fixed
+semantic operations return already-open exact-file handles or path-free results,
+never a path or parent handle. Current-V1 smoke has a separate private
+`root::v1_smoke` child lifecycle and does not expose its store path to siblings.
+The command boundary necessarily ingests the caller-supplied `--root` locator,
+but no caller can project the validated canonical evidence root or V2 child path
+back out of `EvidenceRoot` or either PR03c capability.
 
 The concrete compiled source-site inventory carries typed IDs and complete phase,
 artifact, operation, mutation, partial-write, pressure, occurrence, commit-side,
@@ -35,7 +42,11 @@ bounded capability containment and finite source-review evidence at the reviewed
 revision. It is not a parser, source-language policy, or proof that arbitrary
 present or future Rust source cannot perform filesystem I/O. Evidence-parent,
 current-V1, and test-fixture I/O remains with its explicit private owner and is
-outside the disposable V2 capability boundary.
+outside the disposable V2 capability boundary. A focused current-source
+regression enumerates the crate-visible `EvidenceRoot`/PR03c operation signatures
+and rejects path-returning signatures or path-extraction traits at this revision;
+it is intentionally not the removed broad Rust-source scanner or a future-source
+language claim.
 
 Compact disposable execution proves every site under success and applicable
 pre-operation, nonzero short-partial-write, `StorageFull`, and `QuotaExceeded`

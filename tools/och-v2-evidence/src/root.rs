@@ -3,13 +3,15 @@ use crate::model::valid_case_name;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod pr03c_io;
 mod v1_smoke;
 mod v2_io;
+
+pub(crate) use pr03c_io::{Pr03cCase, Pr03cSet};
 
 const MAX_PARENT_ENTRIES: usize = 8;
 const PARENT_DIRECTORIES: [&str; 5] = ["artifacts", "cases", "control", "fixtures", "reports"];
 
-#[derive(Clone, Debug)]
 pub(crate) struct EvidenceRoot {
     path: PathBuf,
 }
@@ -46,55 +48,19 @@ impl EvidenceRoot {
         Ok(Self { path: canonical })
     }
 
-    pub(crate) fn fixtures_dir(&self) -> PathBuf {
-        self.path.join("fixtures")
-    }
-
-    pub(crate) fn artifacts_dir(&self) -> PathBuf {
-        self.path.join("artifacts")
-    }
-
-    pub(crate) fn raw_path(&self, case: &str) -> Result<PathBuf> {
+    pub(crate) fn pr03c_case(&self, case: &str) -> Result<Pr03cCase> {
         validate_case(case)?;
-        Ok(self
-            .fixtures_dir()
-            .join(format!("{case}.raw-journal-v1-evidence")))
+        Ok(Pr03cCase::new(&self.path, case))
     }
 
-    pub(crate) fn fixture_meta_path(&self, case: &str) -> Result<PathBuf> {
-        validate_case(case)?;
-        Ok(self.fixtures_dir().join(format!("{case}.fixture-meta")))
-    }
-
-    pub(crate) fn segment_path(&self, case: &str) -> Result<PathBuf> {
-        validate_case(case)?;
-        Ok(self
-            .artifacts_dir()
-            .join(format!("{case}.ochseg01-evidence")))
-    }
-
-    pub(crate) fn segment_temp_path(&self, case: &str) -> Result<PathBuf> {
-        validate_case(case)?;
-        Ok(self
-            .artifacts_dir()
-            .join(format!("{case}.ochseg01-evidence.partial")))
-    }
-
-    pub(crate) fn segment_identity_path(&self, case: &str) -> Result<PathBuf> {
-        validate_case(case)?;
-        Ok(self
-            .artifacts_dir()
-            .join(format!("{case}.segment-identity")))
-    }
-
-    pub(crate) fn set_path(&self, set: &str) -> Result<PathBuf> {
+    pub(crate) fn pr03c_set(&self, set: &str) -> Result<Pr03cSet> {
         validate_case(set)?;
-        Ok(self.fixtures_dir().join(format!("{set}.fixture-set")))
+        Ok(Pr03cSet::new(&self.path, set))
     }
 
     pub(crate) fn ensure_layout(&self) -> Result<()> {
-        fs::create_dir_all(self.fixtures_dir()).map_err(|_| EvidenceError::Io)?;
-        fs::create_dir_all(self.artifacts_dir()).map_err(|_| EvidenceError::Io)?;
+        fs::create_dir_all(self.path.join("fixtures")).map_err(|_| EvidenceError::Io)?;
+        fs::create_dir_all(self.path.join("artifacts")).map_err(|_| EvidenceError::Io)?;
         Ok(())
     }
 
@@ -166,8 +132,18 @@ impl EvidenceRoot {
     }
 
     #[cfg(test)]
-    pub(crate) fn path_for_test(&self) -> String {
-        self.path.to_string_lossy().into_owned()
+    pub(crate) fn artifact_partials_absent(&self) -> Result<bool> {
+        for entry in fs::read_dir(self.path.join("artifacts")).map_err(|_| EvidenceError::Io)? {
+            let entry = entry.map_err(|_| EvidenceError::Io)?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| EvidenceError::UnsafeInventory)?;
+            if name.ends_with(".partial") {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -365,11 +341,12 @@ mod tests {
             ));
             let _ = fs::remove_dir_all(&parent);
             fs::create_dir(&parent).expect("create hostile cases parent");
-            let root = EvidenceRoot::prepare(&parent.join("evidence"))
-                .expect("prepare initially safe evidence root");
-            fs::create_dir(root.path.join("cases")).expect("create cases directory");
+            let evidence = parent.join("evidence");
+            let root =
+                EvidenceRoot::prepare(&evidence).expect("prepare initially safe evidence root");
+            fs::create_dir(evidence.join("cases")).expect("create cases directory");
             for name in names {
-                let entry = root.path.join("cases").join(name);
+                let entry = evidence.join("cases").join(name);
                 if directory_entry {
                     fs::create_dir(entry).expect("create hostile directory entry");
                 } else {
@@ -380,8 +357,110 @@ mod tests {
                 root.foundation_layout(),
                 Err(EvidenceError::UnsafeInventory)
             ));
-            assert!(!root.path.join("control").exists());
+            assert!(!evidence.join("control").exists());
             fs::remove_dir_all(parent).expect("remove hostile cases parent");
         }
+    }
+
+    #[test]
+    fn reviewed_root_api_inventory_has_no_path_projection_or_extraction_trait() {
+        let root_source = include_str!("root.rs");
+        let pr03c_source = include_str!("root/pr03c_io.rs");
+        let mut actual = reviewed_api("EvidenceRoot", root_source);
+        actual.extend(reviewed_api("Pr03cIo", pr03c_source));
+        actual.sort();
+
+        let mut expected = vec![
+            ("EvidenceRoot", "artifact_partials_absent", "Result<bool>"),
+            ("EvidenceRoot", "ensure_layout", "Result<()>"),
+            ("EvidenceRoot", "open", "Result<Self>"),
+            ("EvidenceRoot", "pr03c_case", "Result<Pr03cCase>"),
+            ("EvidenceRoot", "pr03c_set", "Result<Pr03cSet>"),
+            ("EvidenceRoot", "prepare", "Result<Self>"),
+            ("EvidenceRoot", "run_v1_pressure_smoke", "Result<()>"),
+            ("EvidenceRoot", "run_v1_success_smoke", "Result<()>"),
+            (
+                "EvidenceRoot",
+                "run_v2_foundation",
+                "Result<FoundationSummary>",
+            ),
+            ("Pr03cIo", "create_raw_partial", "Result<File>"),
+            ("Pr03cIo", "create_segment_partial", "Result<File>"),
+            ("Pr03cIo", "open", "Result<File>"),
+            ("Pr03cIo", "open_fixture_meta", "Result<File>"),
+            ("Pr03cIo", "open_raw", "Result<File>"),
+            ("Pr03cIo", "open_segment", "Result<File>"),
+            ("Pr03cIo", "open_segment_identity", "Result<File>"),
+            ("Pr03cIo", "publish_raw", "Result<()>"),
+            ("Pr03cIo", "publish_segment", "Result<()>"),
+            ("Pr03cIo", "remove_raw_partial", "Result<()>"),
+            ("Pr03cIo", "remove_segment_partial", "Result<()>"),
+            ("Pr03cIo", "replace_raw_from", "Result<()>"),
+            ("Pr03cIo", "replace_segment", "Result<()>"),
+            ("Pr03cIo", "reset_fixture", "Result<()>"),
+            ("Pr03cIo", "reset_segment", "Result<()>"),
+            ("Pr03cIo", "write", "Result<()>"),
+            ("Pr03cIo", "write_fixture_meta", "Result<()>"),
+            ("Pr03cIo", "write_segment_identity", "Result<()>"),
+        ]
+        .into_iter()
+        .map(|(owner, name, result)| (owner.to_owned(), name.to_owned(), result.to_owned()))
+        .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(actual, expected);
+
+        for forbidden in [
+            ["impl", "AsRef<"].join(" "),
+            ["impl", "std::ops::AsRef<"].join(" "),
+            ["impl", "Deref"].join(" "),
+            ["impl", "std::ops::Deref"].join(" "),
+            ["fn", "as_path("].join(" "),
+            ["fn", "into_path("].join(" "),
+        ] {
+            assert!(!root_source.contains(&forbidden), "{forbidden}");
+            assert!(!pr03c_source.contains(&forbidden), "{forbidden}");
+        }
+        assert!(root_source.contains("pub(crate) struct EvidenceRoot {\n    path: PathBuf,\n}"));
+        assert!(!pr03c_source.contains("Debug"));
+    }
+
+    fn reviewed_api(owner: &str, source: &str) -> Vec<(String, String, String)> {
+        let mut signatures = Vec::new();
+        let mut lines = source.lines();
+        let visibility = ["pub(crate)", "fn"].join(" ");
+        while let Some(line) = lines.next() {
+            if !line.contains(&visibility) {
+                continue;
+            }
+            let mut signature = line.trim().to_owned();
+            while !signature.contains('{') {
+                let continuation = lines.next().expect("complete reviewed API signature");
+                signature.push(' ');
+                signature.push_str(continuation.trim());
+            }
+            let declaration = signature
+                .split_once('{')
+                .map(|(declaration, _)| declaration)
+                .expect("reviewed function body");
+            let name = declaration
+                .split_once("fn ")
+                .and_then(|(_, rest)| rest.split_once('('))
+                .map(|(name, _)| name)
+                .expect("reviewed function name");
+            let return_type = declaration
+                .split_once("->")
+                .map_or("()", |(_, value)| value.trim());
+            assert!(
+                matches!((owner, name), ("EvidenceRoot", "prepare" | "open"))
+                    || (!declaration.contains("Path")
+                        && !declaration.contains("OsStr")
+                        && !declaration.contains("FnOnce")
+                        && !declaration.contains("FnMut")
+                        && !declaration.contains("Fn(")),
+                "path-bearing reviewed API: {declaration}"
+            );
+            signatures.push((owner.to_owned(), name.to_owned(), return_type.to_owned()));
+        }
+        signatures
     }
 }
