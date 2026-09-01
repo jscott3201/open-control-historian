@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 const MAX_SITE_BYTES: usize = 64 * 1_024;
 const SITE_PAYLOAD: &[u8] = b"M03-PR03g1 disposable source-site fixture\n";
+const SHORT_WRITE_BYTES: usize = 7;
+const SHORT_WRITE_BASELINE: &[u8] = b"before-short-write\n";
 
 pub(crate) type SiteInvoke = fn(&mut V2Io<'_>, Option<FaultSelection>) -> Result<SiteResult>;
 
@@ -32,8 +34,23 @@ pub(crate) enum SiteResult {
     Injected {
         mode: FaultMode,
         pressure: PressureKind,
-        mutated: bool,
+        mutation: MutationWitness,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MutationWitness {
+    Unchanged,
+    Immediate {
+        before: LogicalFileState,
+        after: LogicalFileState,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LogicalFileState {
+    logical_length: u64,
+    sha256: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,7 +126,7 @@ impl<'a> V2Io<'a> {
                 return Ok(SiteResult::Injected {
                     mode: selected.mode,
                     pressure: selected.pressure,
-                    mutated: false,
+                    mutation: MutationWitness::Unchanged,
                 });
             }
             if selected.mode == FaultMode::ShortPartialWrite {
@@ -222,20 +239,37 @@ impl<'a> V2Io<'a> {
         }
         let occurrence = self.occurrences[&site.id];
         let path = self.site_path(site, occurrence);
+        let before_bytes = bounded_read(&path)?;
+        if before_bytes == SITE_PAYLOAD
+            || before_bytes == SITE_PAYLOAD[..SHORT_WRITE_BYTES]
+            || before_bytes.starts_with(&SITE_PAYLOAD[..SHORT_WRITE_BYTES])
+        {
+            return Err(EvidenceError::InvalidHarness);
+        }
+        let before = logical_file_state(&path)?;
         let mut file = OpenOptions::new()
             .write(true)
-            .open(path)
+            .open(&path)
             .map_err(|_| EvidenceError::Io)?;
-        let written = file
-            .write(&SITE_PAYLOAD[..7])
+        file.write_all(&SITE_PAYLOAD[..SHORT_WRITE_BYTES])
             .map_err(|_| EvidenceError::Io)?;
-        if written == 0 || written >= SITE_PAYLOAD.len() {
+        file.flush().map_err(|_| EvidenceError::Io)?;
+        drop(file);
+        let after_bytes = bounded_read(&path)?;
+        let after = logical_file_state(&path)?;
+        if SHORT_WRITE_BYTES == 0
+            || SHORT_WRITE_BYTES >= SITE_PAYLOAD.len()
+            || before == after
+            || before_bytes == after_bytes
+            || after_bytes == SITE_PAYLOAD
+            || !after_bytes.starts_with(&SITE_PAYLOAD[..SHORT_WRITE_BYTES])
+        {
             return Err(EvidenceError::InvalidHarness);
         }
         Ok(SiteResult::Injected {
             mode: FaultMode::ShortPartialWrite,
             pressure,
-            mutated: true,
+            mutation: MutationWitness::Immediate { before, after },
         })
     }
 
@@ -499,7 +533,10 @@ pub(crate) fn exercise_all_sites(root: &Path) -> Result<usize> {
         let mut io = V2Io::new(root)?;
         if !matches!(
             io.execute(site, Some(selection))?,
-            SiteResult::Injected { mutated: false, .. }
+            SiteResult::Injected {
+                mutation: MutationWitness::Unchanged,
+                ..
+            }
         ) || fingerprint(root)? != restored
         {
             return Err(EvidenceError::InvalidHarness);
@@ -507,21 +544,7 @@ pub(crate) fn exercise_all_sites(root: &Path) -> Result<usize> {
         executions = executions.checked_add(1).ok_or(EvidenceError::Bounds)?;
 
         if site.descriptor.short_write {
-            let baseline = restore_site(root, site)?;
-            let selection = FaultSelection::new(
-                site.id,
-                NonZeroU32::MIN,
-                FaultMode::ShortPartialWrite,
-                PressureKind::None,
-            )?;
-            let mut io = V2Io::new(root)?;
-            if !matches!(
-                io.execute(site, Some(selection))?,
-                SiteResult::Injected { mutated: true, .. }
-            ) || restore_site(root, site)? != baseline
-            {
-                return Err(EvidenceError::InvalidHarness);
-            }
+            exercise_short_write(root, site, PressureKind::None)?;
             executions = executions.checked_add(1).ok_or(EvidenceError::Bounds)?;
         }
         if site.descriptor.pressure {
@@ -538,7 +561,7 @@ pub(crate) fn exercise_all_sites(root: &Path) -> Result<usize> {
                     io.execute(site, Some(selection))?,
                     SiteResult::Injected {
                         pressure: actual,
-                        mutated: false,
+                        mutation: MutationWitness::Unchanged,
                         ..
                     } if actual == pressure
                 ) || fingerprint(root)? != baseline
@@ -547,25 +570,7 @@ pub(crate) fn exercise_all_sites(root: &Path) -> Result<usize> {
                 }
                 executions = executions.checked_add(1).ok_or(EvidenceError::Bounds)?;
                 if site.descriptor.short_write {
-                    let baseline = restore_site(root, site)?;
-                    let selection = FaultSelection::new(
-                        site.id,
-                        NonZeroU32::MIN,
-                        FaultMode::ShortPartialWrite,
-                        pressure,
-                    )?;
-                    let mut io = V2Io::new(root)?;
-                    if !matches!(
-                        io.execute(site, Some(selection))?,
-                        SiteResult::Injected {
-                            pressure: actual,
-                            mutated: true,
-                            ..
-                        } if actual == pressure
-                    ) || restore_site(root, site)? != baseline
-                    {
-                        return Err(EvidenceError::InvalidHarness);
-                    }
+                    exercise_short_write(root, site, pressure)?;
                     executions = executions.checked_add(1).ok_or(EvidenceError::Bounds)?;
                 }
             }
@@ -573,6 +578,35 @@ pub(crate) fn exercise_all_sites(root: &Path) -> Result<usize> {
     }
     clear_root(root)?;
     Ok(executions)
+}
+
+fn exercise_short_write(root: &Path, site: SourceSite, pressure: PressureKind) -> Result<()> {
+    let baseline = restore_site(root, site)?;
+    let selection = FaultSelection::new(
+        site.id,
+        NonZeroU32::MIN,
+        FaultMode::ShortPartialWrite,
+        pressure,
+    )?;
+    let mut io = V2Io::new(root)?;
+    let result = io.execute(site, Some(selection))?;
+    let immediate = fingerprint(root)?;
+    if !matches!(
+        result,
+        SiteResult::Injected {
+            pressure: actual,
+            mutation: MutationWitness::Immediate { before, after },
+            ..
+        } if actual == pressure && before != after
+    ) || immediate == baseline
+    {
+        return Err(EvidenceError::InvalidHarness);
+    }
+    let restored = restore_site(root, site)?;
+    if restored != baseline {
+        return Err(EvidenceError::InvalidHarness);
+    }
+    Ok(())
 }
 
 pub(crate) fn clear_root(root: &Path) -> Result<()> {
@@ -682,7 +716,12 @@ fn write_baseline(root: &Path, site: SourceSite, include_optional: bool) -> Resu
         )
         && (include_optional || !is_optional_probe(site.id))
     {
-        write_file(&target, SITE_PAYLOAD)?;
+        let bytes = if site.descriptor.short_write {
+            SHORT_WRITE_BASELINE
+        } else {
+            SITE_PAYLOAD
+        };
+        write_file(&target, bytes)?;
     }
     if matches!(
         site.descriptor.operation,
@@ -990,6 +1029,14 @@ fn digest_file(path: &Path, maximum: u64) -> Result<([u8; 32], u64)> {
     Ok((hash.finish()?, total))
 }
 
+fn logical_file_state(path: &Path) -> Result<LogicalFileState> {
+    let (sha256, logical_length) = digest_file(path, MAX_SITE_BYTES as u64)?;
+    Ok(LogicalFileState {
+        logical_length,
+        sha256,
+    })
+}
+
 fn require_exact_fixture(path: &Path) -> Result<()> {
     if bounded_read(path)? == SITE_PAYLOAD {
         Ok(())
@@ -1088,6 +1135,27 @@ mod tests {
     }
 
     #[test]
+    fn every_short_write_site_proves_immediate_change_then_exact_restoration() {
+        let temp = Temp::new("short-writes");
+        let sites = source_sites()
+            .into_iter()
+            .filter(|site| site.descriptor.short_write)
+            .collect::<Vec<_>>();
+        assert_eq!(sites.len(), 7);
+        for site in sites {
+            for pressure in [
+                PressureKind::None,
+                PressureKind::StorageFull,
+                PressureKind::QuotaExceeded,
+            ] {
+                exercise_short_write(&temp.0, site, pressure)
+                    .expect("immediate mutation and restoration");
+            }
+        }
+        clear_root(&temp.0).expect("clear short-write fixture");
+    }
+
+    #[test]
     fn p0_p7_present_absent_rollback_and_64_pair_eager_flows_are_legal() {
         let temp = Temp::new("flows");
         for kind in [
@@ -1102,40 +1170,5 @@ mod tests {
             assert!(!witness.trace.is_empty());
         }
         clear_root(&temp.0).expect("clear flow fixture");
-    }
-
-    #[test]
-    fn executor_modules_have_no_low_level_store_child_io_outside_this_owner() {
-        for (name, source) in [
-            ("fault.rs", include_str!("fault.rs")),
-            ("inventory.rs", include_str!("inventory.rs")),
-            ("transaction.rs", include_str!("transaction.rs")),
-            ("runtime.rs", include_str!("runtime.rs")),
-            ("schema.rs", include_str!("schema.rs")),
-            ("oracle.rs", include_str!("oracle.rs")),
-            ("mod.rs", include_str!("mod.rs")),
-            ("sha256.rs", include_str!("../sha256.rs")),
-        ] {
-            let source = source
-                .split("#[cfg(test)]")
-                .next()
-                .expect("production source");
-            for forbidden in [
-                "std::fs",
-                "File::open",
-                "OpenOptions",
-                "fs::rename",
-                "fs::remove",
-                ".sync_all(",
-                ".write_all(",
-                ".read_to_end(",
-                "create_new(",
-            ] {
-                assert!(
-                    !source.contains(forbidden),
-                    "{name} escaped through {forbidden}"
-                );
-            }
-        }
     }
 }

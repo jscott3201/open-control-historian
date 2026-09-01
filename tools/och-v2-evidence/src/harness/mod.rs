@@ -3,6 +3,8 @@ pub(crate) mod inventory;
 mod oracle;
 mod runtime;
 mod schema;
+#[cfg(test)]
+mod source_policy;
 mod transaction;
 mod v2_io;
 
@@ -22,16 +24,15 @@ pub(crate) fn foundation_check_command(arguments: &[String]) -> Result<()> {
 
     let root = EvidenceRoot::prepare(Path::new(values["--root"]))?;
     root.foundation_layout()?;
-    let child = root.create_store_child("v2-executor-foundation")?;
-    let witness = transaction::run_foundation(&child)?;
-    root.dispose_store_child(&child)?;
+    let witness = root.with_store_child("v2-executor-foundation", transaction::run_foundation)?;
 
-    let success = root.create_store_child("v1-success-smoke")?;
-    let success_witness = runtime::success(&success, false)?;
-    if success_witness.handled != "HANDLED" || success_witness.durable != "DURABLE" {
-        return Err(EvidenceError::InvalidHarness);
-    }
-    root.dispose_store_child(&success)?;
+    root.with_store_child("v1-success-smoke", |success| {
+        let success_witness = runtime::success(success, false)?;
+        if success_witness.handled != "HANDLED" || success_witness.durable != "DURABLE" {
+            return Err(EvidenceError::InvalidHarness);
+        }
+        Ok(())
+    })?;
 
     for (name, kind, partial) in [
         (
@@ -45,9 +46,7 @@ pub(crate) fn foundation_check_command(arguments: &[String]) -> Result<()> {
             true,
         ),
     ] {
-        let pressure = root.create_store_child(name)?;
-        runtime::pressure(&pressure, kind, partial)?;
-        root.dispose_store_child(&pressure)?;
+        root.with_store_child(name, |pressure| runtime::pressure(pressure, kind, partial))?;
     }
 
     println!("schema={}", schema::FOUNDATION_SCHEMA);

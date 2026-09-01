@@ -33,34 +33,36 @@ impl Drop for Temp {
 fn private_foundation_command_executes_closure_and_emits_no_report_or_collection_claim() {
     let temp = Temp::new();
     let root = temp.0.join("evidence");
-    let output = Command::new(env!("CARGO_BIN_EXE_och-v2-evidence"))
-        .args([
-            "native-foundation-check",
-            "--root",
-            root.to_str().expect("UTF-8 temporary root"),
-        ])
-        .output()
-        .expect("run private foundation command");
-    assert!(
-        output.status.success(),
-        "foundation command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("bounded UTF-8 summary");
-    for expected in [
-        "schema=m03-pr03g1-v1",
-        "foundation_status=PASS",
-        "descriptor_count=173",
-        "source_site_count=173",
-        "flow_count=5",
-        "COLLECTION_AUTHORIZED=false",
-        "REPORT_BUNDLE=ABSENT",
-        "PR03E-M01..M11=UNSATISFIED",
-        "V2_PRODUCT_AUTHORITY=false",
-    ] {
-        assert!(stdout.lines().any(|line| line == expected), "{expected}");
+    for iteration in 1..=2 {
+        let output = Command::new(env!("CARGO_BIN_EXE_och-v2-evidence"))
+            .args([
+                "native-foundation-check",
+                "--root",
+                root.to_str().expect("UTF-8 temporary root"),
+            ])
+            .output()
+            .expect("run private foundation command");
+        assert!(
+            output.status.success(),
+            "foundation command iteration {iteration} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("bounded UTF-8 summary");
+        for expected in [
+            "schema=m03-pr03g1-v1",
+            "foundation_status=PASS",
+            "descriptor_count=173",
+            "source_site_count=173",
+            "flow_count=5",
+            "COLLECTION_AUTHORIZED=false",
+            "REPORT_BUNDLE=ABSENT",
+            "PR03E-M01..M11=UNSATISFIED",
+            "V2_PRODUCT_AUTHORITY=false",
+        ] {
+            assert!(stdout.lines().any(|line| line == expected), "{expected}");
+        }
+        assert!(!stdout.contains('/') && !stdout.contains('\\'));
     }
-    assert!(!stdout.contains('/') && !stdout.contains('\\'));
     assert!(!root.join("reports").exists());
     assert_eq!(
         fs::read_dir(root.join("cases"))

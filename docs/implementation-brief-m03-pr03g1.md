@@ -22,7 +22,11 @@ mutation, partial-write, pressure, occurrence, commit-side, root, successor, and
 terminal metadata. Closure validation proves exact count/set uniqueness and exact
 descriptor/source metadata equality. Evidence-parent/control lifecycle and test
 fixture setup remain in their explicit root or test owners; they are not V2
-store-child executor operations.
+store-child executor operations. A closed, dependency-free lexical source policy
+enumerates `fault.rs`, `inventory.rs`, `mod.rs`, `oracle.rs`, `runtime.rs`,
+`schema.rs`, `transaction.rs`, and `v2_io.rs`, rejects unlisted modules, path
+escapes, common filesystem aliases, and unknown helper indirection, and reserves
+low-level V2 store-child I/O to `v2_io.rs` alone.
 
 Compact disposable execution proves every site under success and applicable
 pre-operation, nonzero short-partial-write, `StorageFull`, and `QuotaExceeded`
@@ -30,7 +34,11 @@ injection. `CHILD_CRASH_AFTER_SUCCESS` remains explicitly registered as a g2
 execution obligation and is not claimed by g1. Legal traces execute P0-P7 with
 present and absent optional cleanup branches, intent-last cleanup, real
 precommit rollback, and eager validation of 64 small raw/segment pairs one pair
-at a time.
+at a time. Every short-write case compares immediate post-fault bytes, logical
+length, and fingerprint with its distinct pre-fault state before independently
+restoring the exact baseline. Every named foundation/runtime-smoke child is
+disposed on success or error; the original operation error takes precedence if
+cleanup also fails.
 
 The private primitive oracles retain marker/intent/catalog/manifest relationship
 checks, Catalog bounds 1/64/65, canonical inventory bounds 156/157, safe-Rust

@@ -107,6 +107,25 @@ impl EvidenceRoot {
         Ok(child)
     }
 
+    /// Runs one operation inside a newly created named store child and always
+    /// attempts to reclaim that child before returning.
+    ///
+    /// Operation failures retain precedence because cleanup must not replace
+    /// the evidence that explains why the disposable execution failed.
+    pub(crate) fn with_store_child<T>(
+        &self,
+        name: &str,
+        operation: impl FnOnce(&Path) -> Result<T>,
+    ) -> Result<T> {
+        let child = self.create_store_child(name)?;
+        let operation_result = operation(&child);
+        let cleanup_result = self.dispose_store_child(&child);
+        match operation_result {
+            Err(error) => Err(error),
+            Ok(value) => cleanup_result.map(|()| value),
+        }
+    }
+
     pub(crate) fn dispose_store_child(&self, child: &Path) -> Result<()> {
         let cases = fs::canonicalize(self.path.join("cases")).map_err(|_| EvidenceError::Io)?;
         let canonical = fs::canonicalize(child).map_err(|_| EvidenceError::Io)?;
@@ -271,6 +290,27 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
 
+    struct Temp(PathBuf);
+
+    impl Temp {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "och-v2-evidence-root-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).expect("create root test parent");
+            Self(path)
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn v1_and_future_v2_authority_names_are_recognized_but_evidence_names_are_not() {
         for name in [
@@ -314,5 +354,58 @@ mod tests {
         ));
         assert!(!child.exists());
         fs::remove_dir_all(parent).expect("remove hostile parent");
+    }
+
+    #[test]
+    fn named_store_child_is_reclaimed_after_error_and_same_name_can_rerun() {
+        let temp = Temp::new("child-cleanup");
+        let root_path = temp.0.join("evidence");
+        let root = EvidenceRoot::prepare(&root_path).expect("prepare evidence root");
+        root.foundation_layout().expect("prepare foundation layout");
+        let child = root_path.join("cases/reused-child");
+
+        assert!(matches!(
+            root.with_store_child("reused-child", |_| Err::<(), _>(
+                EvidenceError::InvalidHarness
+            )),
+            Err(EvidenceError::InvalidHarness)
+        ));
+        assert!(!child.exists());
+        assert_eq!(
+            fs::read_dir(root_path.join("cases"))
+                .expect("read reclaimed cases")
+                .count(),
+            0
+        );
+
+        assert_eq!(
+            root.with_store_child("reused-child", |path| {
+                assert!(path.is_dir());
+                Ok(7_u8)
+            })
+            .expect("rerun reclaimed child"),
+            7
+        );
+        assert!(!child.exists());
+    }
+
+    #[test]
+    fn operation_error_precedes_cleanup_error() {
+        let temp = Temp::new("cleanup-precedence");
+        let root_path = temp.0.join("evidence");
+        let root = EvidenceRoot::prepare(&root_path).expect("prepare evidence root");
+        root.foundation_layout().expect("prepare foundation layout");
+
+        let result = root.with_store_child("removed-by-operation", |child| {
+            fs::remove_dir(child).expect("remove empty child before cleanup");
+            Err::<(), _>(EvidenceError::Replan)
+        });
+        assert!(matches!(result, Err(EvidenceError::Replan)));
+
+        let cleanup_only = root.with_store_child("cleanup-error", |child| {
+            fs::remove_dir(child).expect("remove second empty child before cleanup");
+            Ok(())
+        });
+        assert!(matches!(cleanup_only, Err(EvidenceError::Io)));
     }
 }

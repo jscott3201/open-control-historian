@@ -6,7 +6,9 @@ store-child I/O owner executes every retained source site under success and ever
 g1-applicable error/partial/pressure mode, plus legal compact P0-P7 present and
 absent cleanup, rollback, and 64-pair eager-open flows. Safe-Rust SHA-256,
 primitive relationship, fingerprint, entry, inventory, and refusal bounds remain
-private test/tooling proof.
+private test/tooling proof. Cycle 1 hardens that foundation with always-attempted
+named-child disposal, immediate pre-restore short-write state evidence, and a
+closed alias-resistant production-module/source-I/O ownership policy.
 
 The exact tooling-only runtime/Tokio authority is unchanged: runtime activates
 only `m03-pr03e-native-harness`, Tokio remains pinned at `1.53.1` with only `rt`
