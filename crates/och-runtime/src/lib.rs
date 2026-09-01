@@ -5950,6 +5950,7 @@ mod tests {
             BoundaryId::ManifestPrepare,
             BoundaryId::ManifestRenameCommit,
             BoundaryId::ManifestPostcommit,
+            BoundaryId::ManifestAdopt,
             BoundaryId::ManifestPrepare,
             BoundaryId::ManifestRenameCommit,
             BoundaryId::ManifestPostcommit,
@@ -5987,8 +5988,13 @@ mod tests {
                 .iter()
                 .all(|event| event.batch_id() == 1)
         );
+        let append = snapshot
+            .events()
+            .iter()
+            .find(|event| event.boundary() == BoundaryId::JournalAppendWrite)
+            .expect("append event");
         assert_eq!(
-            snapshot.events()[10].subject(),
+            append.subject(),
             snapshot.events().last().expect("durable event").subject()
         );
         snapshot
@@ -6157,6 +6163,9 @@ mod tests {
             .position(|event| event.boundary() == BoundaryId::RotationDelay)
             .expect("rotation delay event");
         assert!(durable < rotation);
+        snapshot
+            .validate_closed_trace()
+            .expect("automatic rotation trace should validate");
         fs::remove_dir_all(directory).expect("remove rotation evidence directory");
     }
 

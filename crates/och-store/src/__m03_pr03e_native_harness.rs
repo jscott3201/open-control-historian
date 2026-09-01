@@ -267,7 +267,7 @@ impl BoundaryDescriptor {
             B::InspectionUpdate => matches!(next, B::DurableBatchReceiptResolution),
             B::DurableBatchReceiptResolution => matches!(
                 next,
-                B::RotationDecision | B::JournalAppendWrite | B::JournalSync
+                B::RotationDecision | B::RotationDelay | B::JournalAppendWrite | B::JournalSync
             ),
             B::RotationDecision => matches!(
                 next,
@@ -438,7 +438,7 @@ const REGISTRY: [BoundaryDescriptor; BOUNDARY_COUNT] = [
         false,
         false,
         false,
-        false,
+        true,
     ),
     descriptor(
         BoundaryId::StorePressureTransition,
@@ -733,6 +733,8 @@ pub enum EvidenceFailure {
     Poisoned,
     /// A worker session was installed over an existing session.
     DuplicateInstallation,
+    /// A boundary token was presented to a different originating session.
+    SessionMismatch,
 }
 
 /// Structural status of one copied evidence snapshot.
@@ -1040,7 +1042,12 @@ impl NativeEvidenceSession {
     /// Explicitly finishes one boundary span and appends at most one record.
     #[allow(clippy::needless_pass_by_value)]
     pub fn finish_boundary(&self, token: BoundaryToken, outcome: BoundaryOutcome) {
-        if token.session.is_none() {
+        let Some(originating_session) = token.session.as_ref() else {
+            return;
+        };
+        if !Arc::ptr_eq(&self.inner, &originating_session.inner) {
+            self.mark_failure(EvidenceFailure::SessionMismatch);
+            originating_session.mark_failure(EvidenceFailure::SessionMismatch);
             return;
         }
         let mut state = match self.inner.state.try_lock() {
@@ -1209,6 +1216,7 @@ const fn encode_failure(failure: EvidenceFailure) -> u8 {
         EvidenceFailure::ArithmeticOverflow => 4,
         EvidenceFailure::Poisoned => 5,
         EvidenceFailure::DuplicateInstallation => 6,
+        EvidenceFailure::SessionMismatch => 7,
     }
 }
 
@@ -1220,6 +1228,7 @@ const fn decode_failure(value: u8) -> Option<EvidenceFailure> {
         4 => Some(EvidenceFailure::ArithmeticOverflow),
         5 => Some(EvidenceFailure::Poisoned),
         6 => Some(EvidenceFailure::DuplicateInstallation),
+        7 => Some(EvidenceFailure::SessionMismatch),
         _ => None,
     }
 }
@@ -1420,5 +1429,56 @@ mod tests {
             snapshot.status(),
             EvidenceStatus::Failed(EvidenceFailure::EventOverflow)
         );
+    }
+
+    #[test]
+    fn native_evidence_token_session_mismatch_fails_both_without_completion() {
+        let first = NativeEvidenceSession::new(2, FaultPlan::none()).expect("first session");
+        let second = NativeEvidenceSession::new(2, FaultPlan::none()).expect("second session");
+        let first_token = first.begin_boundary(BoundaryId::RotationDecision, 0, 1, 1);
+        let second_token = second.begin_boundary(BoundaryId::RotationDecision, 0, 2, 1);
+
+        first.finish_boundary(second_token, BoundaryOutcome::Success);
+
+        assert_eq!(
+            first.snapshot().status(),
+            EvidenceStatus::Failed(EvidenceFailure::SessionMismatch)
+        );
+        assert_eq!(
+            second.snapshot().status(),
+            EvidenceStatus::Failed(EvidenceFailure::SessionMismatch)
+        );
+        assert!(first.snapshot().events().is_empty());
+        assert!(second.snapshot().events().is_empty());
+        assert_eq!(
+            first.snapshot().validate_closed_trace(),
+            Err(TraceValidationError::Incomplete)
+        );
+        assert_eq!(
+            second.snapshot().validate_closed_trace(),
+            Err(TraceValidationError::Incomplete)
+        );
+
+        // The reciprocal misuse also cannot complete the still-open numeric
+        // token in either failed session.
+        second.finish_boundary(first_token, BoundaryOutcome::Success);
+        assert!(first.snapshot().events().is_empty());
+        assert!(second.snapshot().events().is_empty());
+    }
+
+    #[test]
+    fn native_evidence_cloned_session_tokens_and_inactive_tokens_remain_valid() {
+        let session = NativeEvidenceSession::new(2, FaultPlan::none()).expect("session");
+        let cloned = session.clone();
+        let token = session.begin_boundary(BoundaryId::RotationDecision, 0, 1, 1);
+        cloned.finish_boundary(token, BoundaryOutcome::Success);
+        session.finish_boundary(BoundaryToken::inactive(), BoundaryOutcome::Error);
+
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.status(), EvidenceStatus::Complete);
+        assert_eq!(snapshot.events().len(), 1);
+        snapshot
+            .validate_closed_trace()
+            .expect("same-session clone token should close normally");
     }
 }
