@@ -49,7 +49,12 @@ harness or result and grants no V2 authority. Measured Linux native evidence and
 fresh owner review still block V2 work. M03-PR03f adds one disabled-by-default,
 rustdoc-hidden native instrumentation/fault/crash prerequisite bound only to
 actual current-V1 source seams. It adds no harness, V2 source site, report,
-measurement, or product authority.
+measurement, or product authority. M03-PR03g1 extends the existing private
+`och-v2-evidence` package only with a source-closed disposable V2 executor
+foundation, primitive/SHA-256 oracles, and narrow current-V1 success/pressure seam
+smoke. M03-PR03g2 still owns complete matrix/report/collector/supervisor work. g1
+does not authorize collection; every PR03e row remains unsatisfied and V2 remains
+unimplemented.
 Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
@@ -68,7 +73,7 @@ default workspace selection
   tokio rt + sync only
 
   och-policy (tooling): cargo_metadata + parsing support
-  och-v2-evidence (tooling): std + inward och-store/och-core evidence only
+  och-v2-evidence (tooling): inward core/store/runtime + exact rt/sync Tokio
 ```
 
 [`och-core`](../crates/och-core/) owns exact platform-independent contracts for
@@ -242,10 +247,11 @@ The separately reviewed but unimplemented future authority is defined by
 [Manifest V2](manifest-v2-contract.md),
 [Generation Catalog V2](generation-catalog-v2-contract.md), and
 [Published Native Segment V1](published-native-segment-v1-contract.md).
-Its still-unimplemented private harness and evidence protocol is defined by the
+Its evidence protocol is defined by the
 [M03-PR03e Native V2 execution-evidence plan](m03-pr03e-native-execution-evidence-plan.md).
-The current-V1-only, non-default instrumentation prerequisite for that later
-harness is recorded by [M03-PR03f](implementation-brief-m03-pr03f.md).
+The current-V1-only, non-default instrumentation prerequisite is recorded by
+[M03-PR03f](implementation-brief-m03-pr03f.md), and the private executor foundation
+is recorded by [M03-PR03g1](implementation-brief-m03-pr03g1.md).
 
 [`och-policy`](../tools/och-policy/) is private repository tooling. It appears in
 the full workspace so clippy and tests cover it, while root `default-members`
@@ -253,11 +259,14 @@ selects all three native roots and no tooling. Consequently the tool's Cargo
 metadata/parsing dependencies do not masquerade as native product dependencies.
 
 [`och-v2-evidence`](../tools/och-v2-evidence/) is likewise private tooling outside
-defaults and the product closure. It depends inward only on `och-store` and
-`och-core`, duplicates exact Segment V1 emission for resource evidence, and uses
-no external sort workspace or product authority name. Its standalone RSS and
-latency/workspace observations cannot establish native writer/open behavior or a
-native workspace threshold.
+defaults and the product closure. Its PR03c commands still duplicate exact Segment
+V1 emission with no external-sort workspace. M03-PR03g1 adds direct inward runtime
+consumption of the hidden non-default seam and the exact tooling-only Tokio
+`rt`/`sync` edge, plus a safe-Rust SHA-256 oracle and source-closed disposable
+transaction machinery. It adds no process supervisor, collector, or report bundle.
+Fixture V2 bytes exist only under disposable children and are not accepted product
+bytes. Foundation passes and standalone observations establish no native
+writer/open threshold, budget, SLO, or PR03e crosswalk satisfaction.
 
 ## Direction and ownership
 
@@ -448,4 +457,5 @@ remaining native evidence/owner stop are recorded by
 The executable native evidence plan and its still-unsatisfied matrix are recorded
 by [M03-PR03e](continuation-m03-pr03e.md); the separate current-V1-only native
 instrumentation prerequisite is recorded by
-[M03-PR03f](continuation-m03-pr03f.md).
+[M03-PR03f](continuation-m03-pr03f.md). The source-closed executor foundation and
+g2 handoff are recorded by [M03-PR03g1](continuation-m03-pr03g1.md).

@@ -3,6 +3,9 @@ use crate::model::valid_case_name;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const MAX_PARENT_ENTRIES: usize = 8;
+const PARENT_DIRECTORIES: [&str; 5] = ["artifacts", "cases", "control", "fixtures", "reports"];
+
 #[derive(Clone, Debug)]
 pub(crate) struct EvidenceRoot {
     path: PathBuf,
@@ -82,6 +85,58 @@ impl EvidenceRoot {
         Ok(())
     }
 
+    pub(crate) fn foundation_layout(&self) -> Result<()> {
+        self.validate_parent_inventory()?;
+        for name in ["cases", "control"] {
+            fs::create_dir_all(self.path.join(name)).map_err(|_| EvidenceError::Io)?;
+        }
+        self.validate_parent_inventory()
+    }
+
+    pub(crate) fn create_store_child(&self, name: &str) -> Result<PathBuf> {
+        validate_case(name)?;
+        self.validate_parent_inventory()?;
+        let cases = self.path.join("cases");
+        fs::create_dir_all(&cases).map_err(|_| EvidenceError::Io)?;
+        let child = cases.join(name);
+        if child.exists() {
+            return Err(EvidenceError::UnsafeInventory);
+        }
+        reject_store_ancestors(&cases)?;
+        fs::create_dir(&child).map_err(|_| EvidenceError::Io)?;
+        Ok(child)
+    }
+
+    pub(crate) fn dispose_store_child(&self, child: &Path) -> Result<()> {
+        let cases = fs::canonicalize(self.path.join("cases")).map_err(|_| EvidenceError::Io)?;
+        let canonical = fs::canonicalize(child).map_err(|_| EvidenceError::Io)?;
+        if canonical.parent() != Some(cases.as_path()) {
+            return Err(EvidenceError::UnsafeInventory);
+        }
+        fs::remove_dir_all(canonical).map_err(|_| EvidenceError::Io)
+    }
+
+    pub(crate) fn validate_parent_inventory(&self) -> Result<()> {
+        let mut count = 0_usize;
+        for entry in fs::read_dir(&self.path).map_err(|_| EvidenceError::Io)? {
+            let entry = entry.map_err(|_| EvidenceError::Io)?;
+            count = count.checked_add(1).ok_or(EvidenceError::Bounds)?;
+            if count > MAX_PARENT_ENTRIES
+                || !entry.file_type().map_err(|_| EvidenceError::Io)?.is_dir()
+            {
+                return Err(EvidenceError::UnsafeInventory);
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| EvidenceError::UnsafeInventory)?;
+            if !PARENT_DIRECTORIES.contains(&name.as_str()) {
+                return Err(EvidenceError::UnsafeInventory);
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn path_for_test(&self) -> String {
         self.path.to_string_lossy().into_owned()
@@ -121,13 +176,31 @@ fn contains_recognized_store_name(directory: &Path) -> Result<bool> {
         let entry = entry.map_err(|_| EvidenceError::Io)?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
-            continue;
+            return Ok(true);
         };
-        if is_recognized_store_name(name) {
+        if is_recognized_store_name(name) || is_authority_like_name(name) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn is_authority_like_name(name: &str) -> bool {
+    [
+        "store-format-",
+        "manifest-",
+        "generation-catalog-",
+        "journal-rotation-",
+        "active-journal-",
+        "sealed-journal-",
+        "native-segment-",
+        "series-registry-",
+        "retry-state-",
+        "recovery-state-",
+        "store-v1.lock",
+    ]
+    .into_iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 fn is_recognized_store_name(name: &str) -> bool {
@@ -194,6 +267,9 @@ fn recognized_slot_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn v1_and_future_v2_authority_names_are_recognized_but_evidence_names_are_not() {
@@ -219,5 +295,24 @@ mod tests {
         }
         assert!(!is_recognized_store_name("min.ochseg01-evidence"));
         assert!(!is_recognized_store_name("min.raw-journal-v1-evidence"));
+    }
+
+    #[test]
+    fn authority_like_unknown_ancestor_refuses_before_child_creation() {
+        let parent = std::env::temp_dir().join(format!(
+            "och-v2-evidence-root-hostile-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).expect("create hostile parent");
+        fs::write(parent.join("manifest-v9-unknown.och"), []).expect("write unknown authority");
+        let child = parent.join("evidence");
+        assert!(matches!(
+            EvidenceRoot::prepare(&child),
+            Err(EvidenceError::UnsafeEvidenceRoot)
+        ));
+        assert!(!child.exists());
+        fs::remove_dir_all(parent).expect("remove hostile parent");
     }
 }

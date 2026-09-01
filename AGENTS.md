@@ -57,9 +57,15 @@ harness or result. M03-PR03f adds only the owner-authorized, disabled-by-default
 rustdoc-hidden current-V1 native instrumentation/fault/crash prerequisite for
 that later harness. It adds no harness, V2 source binding, report, measurement,
 or V2 behavior; explicit all-feature builds compile the seam while defaults stay
-off. Writer-delay,
+off. M03-PR03g1 adds only the private source-closed disposable V2 executor
+foundation: a 173-descriptor/source-site bijection, real compact P0-P7/rollback/
+eager-open wrapper execution, safe-Rust SHA-256 and primitive oracles, and narrow
+current-V1 success/pressure seam smoke. It adds no complete matrix, timing/fault
+report, collector, child-crash campaign, measurement, accepted V2 byte, or
+collection authorization. M03-PR03g2 must separately complete those harness
+obligations; every `PR03E-M01..M11` row remains `UNSATISFIED`. Writer-delay,
 eager-open, RSS, total-runtime, and native external-workspace limits/budgets/SLOs
-remain `UNKNOWN`; the later harness, measured Linux native results, and a fresh
+remain `UNKNOWN`; g2, measured Linux native results, and a fresh
 owner checkpoint still block implementation.
 `och-runtime` depends
 inward on `och-store`, opens one explicitly
@@ -114,8 +120,8 @@ time-based retry, multi-segment or runtime query, adapters, manifest-backed late
 projection, pressure retry/clear or
 continued degraded ingress, stale-restore custody, and broad repair remain absent.
 The reviewed future V2 publication contract does not make any of those behaviors
-present and remains blocked on the PR03e plan's separate private harness, measured
-native results, and fresh owner checkpoint described above.
+present and remains blocked on measured native results and the fresh owner
+checkpoint described above.
 Published observations never imply current or held values.
 
 The ignored `_roadmap/` directory is local and unpublished.
@@ -141,7 +147,10 @@ exact direct `och-runtime -> tokio` edge
 with default features disabled and only `rt` and `sync`; never route it through a
 helper or admit it to `och-core`, `och-store`, or another native root. Policy must verify both
 that exact normal, non-optional manifest declaration and Tokio's resolved unified
-feature set. Do not introduce Arrow, Parquet, DataFusion, Flight, tonic/prost,
+feature set. The private `och-v2-evidence` tooling package may independently
+declare the same pinned Tokio version with default features disabled and only
+`rt` and `sync`, solely to drive the hidden runtime facade; this does not enter
+defaults or the native closure. Do not introduce Arrow, Parquet, DataFusion, Flight, tonic/prost,
 SQLx, PostgreSQL, object/cloud providers, embedded databases, memory mapping,
 Studio, Engine, or donor code into the native model. A dependency needed only by
 a policy or build check belongs under `tools/`, not in a native crate.

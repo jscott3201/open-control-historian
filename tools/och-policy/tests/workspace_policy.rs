@@ -62,6 +62,12 @@ fn native_evidence_feature_is_exact_nondefault_and_does_not_change_the_native_gr
             .join("crates/och-runtime/Cargo.toml"),
     )
     .expect("read runtime manifest");
+    let evidence = std::fs::read_to_string(
+        root.parent()
+            .expect("workspace root")
+            .join("tools/och-v2-evidence/Cargo.toml"),
+    )
+    .expect("read evidence-tool manifest");
     let lock = std::fs::read_to_string(root.parent().expect("workspace root").join("Cargo.lock"))
         .expect("read workspace lockfile");
 
@@ -77,12 +83,23 @@ fn native_evidence_feature_is_exact_nondefault_and_does_not_change_the_native_gr
     assert!(runtime.contains(
         "och-core = { version = \"=0.0.0\", path = \"../och-core\" }\noch-store = { version = \"=0.0.0\", path = \"../och-store\" }\ntokio = { version = \"1.53.1\", default-features = false, features = [\"rt\", \"sync\"] }"
     ));
+    assert!(evidence.contains(
+        "och-runtime = { version = \"=0.0.0\", path = \"../../crates/och-runtime\", default-features = false, features = [\"m03-pr03e-native-harness\"] }"
+    ));
+    assert!(evidence.contains(
+        "tokio = { version = \"1.53.1\", default-features = false, features = [\"rt\", \"sync\"] }"
+    ));
+    assert_eq!(evidence.matches("tokio = {").count(), 1);
+    assert_eq!(evidence.matches("och-runtime = {").count(), 1);
     assert!(workspace.contains(
         "default-members = [\"crates/och-core\", \"crates/och-runtime\", \"crates/och-store\"]"
     ));
     assert!(!workspace.contains("och-v2-native-harness"));
     assert!(!lock.contains("och-v2-native-harness"));
     assert!(!lock.contains("name = \"sha2\""));
+    assert!(lock.contains(
+        "name = \"och-v2-evidence\"\nversion = \"0.0.0\"\ndependencies = [\n \"och-core\",\n \"och-runtime\",\n \"och-store\",\n \"tokio\",\n]"
+    ));
 
     let summary = och_policy::check_workspace(&root)
         .expect("feature metadata must preserve the checked native graph");

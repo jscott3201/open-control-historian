@@ -543,6 +543,14 @@ fn store_id(seed: u64) -> Result<StoreId> {
         .map_err(|_| EvidenceError::InvalidFixture)
 }
 
+pub(crate) fn harness_store_id(seed: u64) -> Result<StoreId> {
+    store_id(seed)
+}
+
+pub(crate) fn harness_admission(store: StoreId, seed: u64) -> Result<CanonicalAdmission> {
+    admission(store, seed, 0, 1, 0, None)
+}
+
 fn series_id(number: u64) -> Result<SeriesId> {
     SeriesId::from_bytes(uuid_bytes(number)).map_err(|_| EvidenceError::InvalidFixture)
 }

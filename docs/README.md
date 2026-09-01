@@ -72,9 +72,12 @@ retention, or reclamation state.
 - [M03-PR03e native execution-evidence plan](m03-pr03e-native-execution-evidence-plan.md)
   remains the review plan for a later private harness and report.
 - [M03-PR03f native evidence instrumentation](implementation-brief-m03-pr03f.md)
-  is the disabled-by-default current-V1 native prerequisite for that later
-  harness. It adds no harness, result, V2 source binding, accepted V2 byte,
-  budget, SLO, or product authority.
+  is the disabled-by-default current-V1 native prerequisite.
+- [M03-PR03g1 private executor foundation](implementation-brief-m03-pr03g1.md)
+  consumes that seam from existing private tooling only for source-closed
+  disposable V2 execution and current-V1 success/pressure smoke. It emits no
+  report and does not authorize collection; all M01-M11 rows remain
+  `UNSATISFIED` and all native limits remain `UNKNOWN`.
 
 ## Historical delivery records
 
@@ -143,6 +146,8 @@ a historical record says otherwise.
   [continuation](continuation-m03-pr03e.md)
 - **M03-PR03f:** [native evidence-instrumentation brief](implementation-brief-m03-pr03f.md)
   and [continuation](continuation-m03-pr03f.md)
+- **M03-PR03g1:** [private executor-foundation brief](implementation-brief-m03-pr03g1.md)
+  and [continuation](continuation-m03-pr03g1.md)
 
 ## Future Store Format V2 review material
 
@@ -158,8 +163,10 @@ a historical record says otherwise.
 - [M03-PR03b implementation barrier](implementation-brief-m03-pr03b.md)
 - [M03-PR03e private-harness/evidence plan](m03-pr03e-native-execution-evidence-plan.md)
 - [M03-PR03f native evidence-instrumentation prerequisite](implementation-brief-m03-pr03f.md)
+- [M03-PR03g1 private executor-foundation boundary](implementation-brief-m03-pr03g1.md)
 
 The PR03c tooling target and PR03d standalone Linux x86_64 measurements do not set
-a native workspace threshold. PR03f supplies only current-V1 instrumentation; the
-later private harness, measured native results, and a fresh owner checkpoint
-remain prerequisites for any separately reviewed V2 product proposal.
+a native workspace threshold. PR03f supplies current-V1 instrumentation and
+PR03g1 supplies only its private executor foundation. M03-PR03g2, later measured
+native results, and a fresh owner checkpoint remain prerequisites for any separately
+reviewed V2 product proposal.
