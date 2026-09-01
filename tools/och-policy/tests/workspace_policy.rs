@@ -45,3 +45,47 @@ fn command_rejects_unknown_arguments() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("usage:"));
 }
+
+#[test]
+fn native_evidence_feature_is_exact_nondefault_and_does_not_change_the_native_graph() {
+    let root = workspace_manifest();
+    let workspace = std::fs::read_to_string(&root).expect("read workspace manifest");
+    let store = std::fs::read_to_string(
+        root.parent()
+            .expect("workspace root")
+            .join("crates/och-store/Cargo.toml"),
+    )
+    .expect("read store manifest");
+    let runtime = std::fs::read_to_string(
+        root.parent()
+            .expect("workspace root")
+            .join("crates/och-runtime/Cargo.toml"),
+    )
+    .expect("read runtime manifest");
+    let lock = std::fs::read_to_string(root.parent().expect("workspace root").join("Cargo.lock"))
+        .expect("read workspace lockfile");
+
+    assert!(store.contains("[features]\ndefault = []\nm03-pr03e-native-harness = []"));
+    assert!(runtime.contains(
+        "[features]\ndefault = []\nm03-pr03e-native-harness = [\"och-store/m03-pr03e-native-harness\"]"
+    ));
+    assert!(
+        store.contains(
+            "[dependencies]\noch-core = { version = \"=0.0.0\", path = \"../och-core\" }"
+        )
+    );
+    assert!(runtime.contains(
+        "och-core = { version = \"=0.0.0\", path = \"../och-core\" }\noch-store = { version = \"=0.0.0\", path = \"../och-store\" }\ntokio = { version = \"1.53.1\", default-features = false, features = [\"rt\", \"sync\"] }"
+    ));
+    assert!(workspace.contains(
+        "default-members = [\"crates/och-core\", \"crates/och-runtime\", \"crates/och-store\"]"
+    ));
+    assert!(!workspace.contains("och-v2-native-harness"));
+    assert!(!lock.contains("och-v2-native-harness"));
+    assert!(!lock.contains("name = \"sha2\""));
+
+    let summary = och_policy::check_workspace(&root)
+        .expect("feature metadata must preserve the checked native graph");
+    assert_eq!(summary.native_root_count(), 3);
+    assert_eq!(summary.native_closure_package_count(), 5);
+}

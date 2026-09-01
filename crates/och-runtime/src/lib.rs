@@ -11,6 +11,10 @@ mod ingress;
 mod latest;
 mod store_worker;
 
+#[cfg(feature = "m03-pr03e-native-harness")]
+#[doc(hidden)]
+pub mod __m03_pr03e_native_harness;
+
 pub use ingress::{
     AdmissionPriority, AppendIdentity, BarrierDemand, ByteReservationLimits, DurableCommit,
     DurableOutcome, HandledOutcome, HistorianIngress, IngressCommand, MAX_OUTSTANDING_COMMANDS,
@@ -88,6 +92,8 @@ impl HistorianRuntime {
     ) -> Result<Self, StartError> {
         let executor = Handle::try_current().map_err(|_| StartError::NoActiveRuntime)?;
         let store_id = store_options.store_id();
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let evidence_session = store_options.evidence_session();
         let ingress = HistorianIngress::new_with_limits(
             store_id,
             store_options.byte_limits(),
@@ -123,6 +129,8 @@ impl HistorianRuntime {
             inspection.clone(),
             Arc::clone(&stop),
             Arc::clone(&control_gate),
+            #[cfg(feature = "m03-pr03e-native-harness")]
+            evidence_session,
         ));
         let mut startup = StartupGuard::new(writer);
 
@@ -695,6 +703,9 @@ async fn run_writer(
     inspection: InspectionShared,
     stop: Arc<AtomicBool>,
     control_gate: Arc<AsyncMutex<()>>,
+    #[cfg(feature = "m03-pr03e-native-harness")] evidence_session: Option<
+        och_store::__m03_pr03e_native_harness::NativeEvidenceSession,
+    >,
 ) -> WriterExit {
     #[cfg(test)]
     let mut options = options;
@@ -769,6 +780,8 @@ async fn run_writer(
         store_sender,
         control_gate,
         &mut failure_guard,
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        evidence_session,
     )
     .await
 }
@@ -780,6 +793,9 @@ async fn writer_loop(
     store_sender: SyncSender<WorkerMessage>,
     control_gate: Arc<AsyncMutex<()>>,
     failure_guard: &mut WriterFailureGuard,
+    #[cfg(feature = "m03-pr03e-native-harness")] evidence_session: Option<
+        och_store::__m03_pr03e_native_harness::NativeEvidenceSession,
+    >,
 ) -> WriterExit {
     #[cfg(test)]
     let mut options = options;
@@ -874,7 +890,14 @@ async fn writer_loop(
                 };
                 #[cfg(not(test))]
                 let fault_injection = CompletionFaultInjection::None;
-                if !(*work).finish_handled(admission, append, preparation, fault_injection) {
+                if !(*work).finish_handled(
+                    admission,
+                    append,
+                    preparation,
+                    fault_injection,
+                    #[cfg(feature = "m03-pr03e-native-harness")]
+                    evidence_session.as_ref(),
+                ) {
                     return WriterExit::PublicationFault;
                 }
                 if try_send(
@@ -1090,7 +1113,11 @@ mod tests {
     };
     use std::fs;
     use std::future::{Future, poll_fn};
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    use std::io::BufRead;
     use std::io::{ErrorKind, Write};
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    use std::num::{NonZeroU32, NonZeroUsize};
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::process::{Command, Stdio};
@@ -1180,6 +1207,59 @@ mod tests {
             .await
             .expect("default durable-test registry declaration should commit");
         Ok(runtime)
+    }
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    fn native_evidence_options(
+        directory: PathBuf,
+        mode: och_store::ActiveJournalOpenMode,
+        session: Option<super::__m03_pr03e_native_harness::NativeEvidenceSession>,
+    ) -> StoreOptions {
+        let options = durable_options(
+            directory,
+            store_id(1),
+            mode,
+            ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0)
+                .expect("native-evidence byte limits"),
+            group_policy(
+                std::time::Duration::from_secs(60),
+                MAX_OUTSTANDING_COMMANDS,
+                64 * 1_024 * 1_024,
+            ),
+        );
+        match session {
+            Some(session) => options.with_native_evidence_session(session),
+            None => options,
+        }
+    }
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    fn native_evidence_rotation_options(
+        directory: PathBuf,
+        session: super::__m03_pr03e_native_harness::NativeEvidenceSession,
+    ) -> StoreOptions {
+        StoreOptions::new(
+            directory,
+            store_id(1),
+            och_store::ActiveJournalOpenMode::CreateNew,
+            och_store::ActiveJournalLimits::new(
+                och_store::MAX_ADMISSION_PAYLOAD_V1,
+                64 * 1_024 * 1_024,
+                1,
+            )
+            .expect("one-record rotation limits"),
+            ByteReservationLimits::new(64 * 1_024 * 1_024, 0, 0).expect("rotation byte limits"),
+            group_policy(
+                std::time::Duration::from_secs(60),
+                MAX_OUTSTANDING_COMMANDS,
+                64 * 1_024 * 1_024,
+            ),
+            och_store::RegistryPersistenceOptions::new(SeriesRegistryLimits::new(16, 64))
+                .expect("rotation registry options"),
+            och_store::RetryPersistenceOptions::new(2, 2).expect("rotation retry options"),
+        )
+        .expect("rotation store options")
+        .with_native_evidence_session(session)
     }
 
     fn reopen_manifest_store(directory: &Path, store: StoreId) -> och_store::ManifestStore {
@@ -5788,5 +5868,447 @@ mod tests {
             fs::remove_file(marker).expect("remove child readiness marker");
             fs::remove_dir_all(directory).expect("remove child-kill directory");
         }
+    }
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_evidence_observation_is_exact_and_sessionless_bytes_are_unchanged() {
+        use super::__m03_pr03e_native_harness::{
+            BoundaryId, BoundaryOutcome, EvidenceStatus, FaultPlan, NativeEvidenceSession,
+        };
+
+        let baseline_directory = test_directory();
+        let observed_directory = test_directory();
+        let session = NativeEvidenceSession::new(64, FaultPlan::none()).expect("evidence session");
+
+        let baseline_outcomes = harness().block_on(async {
+            let runtime = complete_bounded(open_durable_test(native_evidence_options(
+                baseline_directory.clone(),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                None,
+            )))
+            .await
+            .expect("feature-on sessionless runtime");
+            let receipt = runtime
+                .ingress()
+                .try_submit(IngressCommand::with_policy(
+                    command("native-evidence-equivalence", 90, 90).into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Immediate,
+                ))
+                .expect("sessionless append")
+                .into_receipt();
+            let handled = complete_bounded(receipt.clone().wait_handled()).await;
+            let durable = complete_bounded(receipt.wait_durable()).await;
+            let inspection = runtime.inspection();
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("sessionless shutdown");
+            (handled, durable, inspection)
+        });
+        let baseline_bytes = directory_bytes(&baseline_directory);
+
+        let observed_outcomes = harness().block_on(async {
+            let runtime = complete_bounded(open_durable_test(native_evidence_options(
+                observed_directory.clone(),
+                och_store::ActiveJournalOpenMode::CreateNew,
+                Some(session.clone()),
+            )))
+            .await
+            .expect("observed runtime");
+            let receipt = runtime
+                .ingress()
+                .try_submit(IngressCommand::with_policy(
+                    command("native-evidence-equivalence", 90, 90).into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Immediate,
+                ))
+                .expect("observed append")
+                .into_receipt();
+            let handled = complete_bounded(receipt.clone().wait_handled()).await;
+            let durable = complete_bounded(receipt.wait_durable()).await;
+            let inspection = runtime.inspection();
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("observed shutdown");
+            (handled, durable, inspection)
+        });
+        let observed_bytes = directory_bytes(&observed_directory);
+        assert_eq!(observed_outcomes, baseline_outcomes);
+        assert_eq!(observed_bytes, baseline_bytes);
+
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.status(), EvidenceStatus::Complete);
+        let actual = snapshot
+            .events()
+            .iter()
+            .map(|event| event.boundary())
+            .collect::<Vec<_>>();
+        let expected = vec![
+            BoundaryId::RetryStatePublish,
+            BoundaryId::ManifestPrepare,
+            BoundaryId::ManifestRenameCommit,
+            BoundaryId::ManifestPostcommit,
+            BoundaryId::ManifestPrepare,
+            BoundaryId::ManifestRenameCommit,
+            BoundaryId::ManifestPostcommit,
+            BoundaryId::ManifestAdopt,
+            BoundaryId::RotationDecision,
+            BoundaryId::JournalAppendWrite,
+            BoundaryId::HandledVisibility,
+            BoundaryId::RotationDecision,
+            BoundaryId::JournalSync,
+            BoundaryId::CheckpointWrite,
+            BoundaryId::CheckpointSync,
+            BoundaryId::CheckpointAdopt,
+            BoundaryId::RetryStatePublish,
+            BoundaryId::ManifestPrepare,
+            BoundaryId::ManifestRenameCommit,
+            BoundaryId::ManifestPostcommit,
+            BoundaryId::ManifestAdopt,
+            BoundaryId::InspectionUpdate,
+            BoundaryId::DurableBatchReceiptResolution,
+        ];
+        assert_eq!(actual, expected);
+        assert!(
+            snapshot
+                .events()
+                .iter()
+                .all(|event| event.outcome() == BoundaryOutcome::Success)
+        );
+        let durability = snapshot
+            .events()
+            .iter()
+            .position(|event| event.boundary() == BoundaryId::JournalSync)
+            .expect("journal sync event");
+        assert!(
+            snapshot.events()[durability..]
+                .iter()
+                .all(|event| event.batch_id() == 1)
+        );
+        assert_eq!(
+            snapshot.events()[10].subject(),
+            snapshot.events().last().expect("durable event").subject()
+        );
+        snapshot
+            .validate_closed_trace()
+            .expect("exact current-V1 trace should validate");
+
+        fs::remove_dir_all(baseline_directory).expect("remove baseline evidence directory");
+        fs::remove_dir_all(observed_directory).expect("remove observed evidence directory");
+    }
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_evidence_real_pressure_faults_preserve_custody_and_no_false_durability() {
+        use super::__m03_pr03e_native_harness::{
+            BoundaryId, BoundaryOutcome, EvidenceStatus, FaultAction, FaultPlan, InjectedErrorKind,
+            NativeEvidenceSession,
+        };
+
+        let cases = [
+            (
+                "pre-storage-full",
+                FaultAction::PreOperationError(InjectedErrorKind::StorageFull),
+                ErrorKind::StorageFull,
+                BoundaryOutcome::Error,
+            ),
+            (
+                "partial-quota",
+                FaultAction::ShortPartialWrite {
+                    bytes: NonZeroUsize::new(7).expect("nonzero partial write"),
+                    error: InjectedErrorKind::QuotaExceeded,
+                },
+                ErrorKind::QuotaExceeded,
+                BoundaryOutcome::PartialWrite,
+            ),
+        ];
+        for (label, action, expected_kind, expected_outcome) in cases {
+            let directory = test_directory();
+            let plan = FaultPlan::single(
+                BoundaryId::JournalAppendWrite,
+                NonZeroU32::new(1).expect("first append occurrence"),
+                action,
+            )
+            .expect("legal append fault plan");
+            let session = NativeEvidenceSession::new(64, plan).expect("pressure evidence session");
+            harness().block_on(async {
+                let runtime = complete_bounded(open_durable_test(native_evidence_options(
+                    directory.clone(),
+                    och_store::ActiveJournalOpenMode::CreateNew,
+                    Some(session.clone()),
+                )))
+                .await
+                .unwrap_or_else(|error| panic!("{label} runtime open failed: {error}"));
+                let receipt = runtime
+                    .ingress()
+                    .try_submit(IngressCommand::with_policy(
+                        command(label, 91, 91).into_admission(),
+                        AdmissionPriority::Normal,
+                        BarrierDemand::Immediate,
+                    ))
+                    .unwrap_or_else(|_| panic!("{label} admission"))
+                    .into_receipt();
+                assert_eq!(
+                    complete_bounded(receipt.clone().wait_handled()).await,
+                    HandledOutcome::WriterStopped
+                );
+                assert_eq!(
+                    complete_bounded(receipt.wait_durable()).await,
+                    DurableOutcome::WriterStopped
+                );
+                let inspection = runtime.inspection();
+                assert_eq!(inspection.health(), RuntimeHealth::StoragePressure);
+                assert_eq!(
+                    inspection.write_state(),
+                    och_store::StoreWriteState::ReopenRequired
+                );
+                assert_eq!(
+                    inspection
+                        .pressure_evidence()
+                        .expect("typed pressure evidence")
+                        .kind(),
+                    expected_kind
+                );
+                assert_eq!(
+                    inspection.committed().durable_cutoff().append_sequence(),
+                    0,
+                    "{label} must not create false durability"
+                );
+                let shutdown = complete_bounded(runtime.shutdown()).await;
+                assert!(matches!(
+                    shutdown,
+                    Err(ShutdownError::StoragePressure(evidence)) if evidence.kind() == expected_kind
+                ));
+            });
+            let snapshot = session.snapshot();
+            assert_eq!(snapshot.status(), EvidenceStatus::Complete);
+            let append = snapshot
+                .events()
+                .iter()
+                .find(|event| event.boundary() == BoundaryId::JournalAppendWrite)
+                .expect("actual append boundary event");
+            assert_eq!(append.outcome(), expected_outcome);
+            assert_eq!(
+                snapshot.events().last().map(|event| event.boundary()),
+                Some(BoundaryId::StorePressureTransition)
+            );
+            let reopened = reopen_manifest_store(&directory, store_id(1));
+            assert_eq!(
+                reopened.inspection().write_state(),
+                och_store::StoreWriteState::Writable
+            );
+            assert_eq!(
+                reopened
+                    .inspection()
+                    .committed()
+                    .durable_cutoff()
+                    .append_sequence(),
+                0
+            );
+            drop(reopened);
+            fs::remove_dir_all(directory).expect("remove pressure evidence directory");
+        }
+    }
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    #[test]
+    fn native_evidence_rotation_delay_starts_after_ordinary_durable_resolution() {
+        use super::__m03_pr03e_native_harness::{
+            BoundaryId, EvidenceStatus, FaultPlan, NativeEvidenceSession,
+        };
+
+        let directory = test_directory();
+        let session = NativeEvidenceSession::new(64, FaultPlan::none()).expect("rotation session");
+        let options = native_evidence_rotation_options(directory.clone(), session.clone());
+        harness().block_on(async {
+            let runtime = complete_bounded(open_durable_test(options))
+                .await
+                .expect("rotation runtime");
+            let receipt = runtime
+                .ingress()
+                .try_submit(IngressCommand::with_policy(
+                    command("native-rotation", 93, 93).into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Immediate,
+                ))
+                .expect("rotation append")
+                .into_receipt();
+            assert!(matches!(
+                complete_bounded(receipt.wait_durable()).await,
+                DurableOutcome::Durable(_)
+            ));
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("rotation shutdown");
+        });
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.status(), EvidenceStatus::Complete);
+        let durable = snapshot
+            .events()
+            .iter()
+            .position(|event| event.boundary() == BoundaryId::DurableBatchReceiptResolution)
+            .expect("durable resolution event");
+        let rotation = snapshot
+            .events()
+            .iter()
+            .position(|event| event.boundary() == BoundaryId::RotationDelay)
+            .expect("rotation delay event");
+        assert!(durable < rotation);
+        fs::remove_dir_all(directory).expect("remove rotation evidence directory");
+    }
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    #[test]
+    fn native_evidence_crash_child() {
+        use super::__m03_pr03e_native_harness::{
+            BoundaryId, BoundaryOutcome, FaultAction, FaultPlan, NativeEvidenceSession,
+        };
+
+        let Ok(directory) = std::env::var("OCH_NATIVE_EVIDENCE_CRASH_DIRECTORY") else {
+            return;
+        };
+        let plan = FaultPlan::single(
+            BoundaryId::RotationDelay,
+            NonZeroU32::new(1).expect("first rotation delay"),
+            FaultAction::CrashAfterSuccess,
+        )
+        .expect("legal crash plan");
+        let session = NativeEvidenceSession::new(64, plan).expect("child evidence session");
+        let supervisor = session.clone();
+        std::thread::spawn(move || {
+            let ready = supervisor
+                .wait_for_crash_ready(TEST_WAIT_TIMEOUT)
+                .expect("native crash gate must become ready");
+            assert_eq!(ready.boundary(), BoundaryId::RotationDelay);
+            assert_eq!(ready.occurrence().get(), 1);
+            let snapshot = supervisor.snapshot();
+            assert_eq!(snapshot.crash_ready(), Some(ready));
+            let targeted = snapshot.events().last().expect("targeted crash event");
+            assert_eq!(targeted.boundary(), BoundaryId::RotationDelay);
+            assert_eq!(targeted.occurrence().get(), 1);
+            assert_eq!(targeted.outcome(), BoundaryOutcome::Success);
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(b"M03-PR03F-NATIVE-READY\n")
+                .expect("write fixed readiness frame");
+            stdout.flush().expect("flush fixed readiness frame");
+        });
+        harness().block_on(async {
+            let runtime = complete_bounded(open_durable_test(native_evidence_rotation_options(
+                PathBuf::from(directory),
+                session,
+            )))
+            .await
+            .expect("child evidence runtime open");
+            let receipt = runtime
+                .ingress()
+                .try_submit(IngressCommand::with_policy(
+                    command("native-crash", 92, 92).into_admission(),
+                    AdmissionPriority::Normal,
+                    BarrierDemand::Immediate,
+                ))
+                .expect("child crash append")
+                .into_receipt();
+            let _never_returns_before_parent_kill = receipt.wait_durable().await;
+            complete_bounded(runtime.shutdown())
+                .await
+                .expect("crash gate must not let shutdown return");
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(b"M03-PR03F-NATIVE-RETURNED\n")
+                .expect("write forbidden return frame");
+            stdout.flush().expect("flush forbidden return frame");
+        });
+    }
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    #[test]
+    fn native_evidence_parent_kills_reaps_and_reopens_after_ready_boundary() {
+        let directory = test_directory();
+        let mut child = Command::new(std::env::current_exe().expect("runtime test executable"))
+            .args([
+                "--exact",
+                "tests::native_evidence_crash_child",
+                "--nocapture",
+            ])
+            .env("OCH_NATIVE_EVIDENCE_CRASH_DIRECTORY", &directory)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn native evidence child");
+        let stdout = child.stdout.take().expect("piped child stdout");
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (returned_tx, returned_rx) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            let mut stdout = std::io::BufReader::new(stdout);
+            let result = (|| {
+                for _ in 0..16 {
+                    line.clear();
+                    if stdout.read_line(&mut line)? == 0 {
+                        break;
+                    }
+                    if line == "M03-PR03F-NATIVE-READY\n" {
+                        return Ok(line.clone());
+                    }
+                }
+                Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "bounded child output omitted readiness frame",
+                ))
+            })();
+            if ready_tx.send(result).is_err() {
+                return;
+            }
+            loop {
+                line.clear();
+                match stdout.read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) if line == "M03-PR03F-NATIVE-RETURNED\n" => {
+                        let _ = returned_tx.send(());
+                        return;
+                    }
+                    Ok(_) => {}
+                }
+            }
+        });
+        let ready = ready_rx
+            .recv_timeout(TEST_WAIT_TIMEOUT)
+            .expect("child readiness timeout")
+            .expect("read child readiness");
+        assert_eq!(ready, "M03-PR03F-NATIVE-READY\n");
+        assert!(
+            matches!(
+                returned_rx.recv_timeout(std::time::Duration::from_secs(1)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "targeted boundary returned or child output closed before parent kill"
+        );
+        assert!(
+            child.try_wait().expect("inspect ready child").is_none(),
+            "native path must remain blocked inside the targeted boundary finish"
+        );
+        child.kill().expect("parent kills ready child");
+        let status = child.wait().expect("parent reaps killed child");
+        assert!(!status.success());
+        reader.join().expect("readiness reader joins");
+
+        let reopened = reopen_manifest_store(&directory, store_id(1));
+        assert!(reopened.recovered_records().is_empty());
+        assert_eq!(reopened.inspection().generations().active_generation(), 2);
+        assert_eq!(reopened.inspection().generations().sealed_count(), 1);
+        assert_eq!(
+            reopened
+                .inspection()
+                .committed()
+                .durable_cutoff()
+                .append_sequence(),
+            1
+        );
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("remove crash evidence directory");
     }
 }

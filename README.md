@@ -39,9 +39,11 @@ unimplemented review contract.
   durable query authority, or runtime query service.
 
 > **Durable-format boundary:** current product authority is **Store Format V1
-> only**. Store Format V2 and the M03-PR03e native evidence plan are design and
-> evidence review barriers for possible future work. Current code neither accepts
-> nor emits V2 product bytes and does not implement Native Segment publication.
+> only**. Store Format V2 and the M03-PR03e native evidence plan are review
+> barriers for possible future work. M03-PR03f adds only a disabled-by-default,
+> rustdoc-hidden current-V1 instrumentation prerequisite for a later private
+> harness. Current code neither accepts nor emits V2 product bytes and does not
+> implement Native Segment publication or that harness.
 
 Durability claims are limited to the documented Store Format V1 process,
 filesystem-operation, synchronization, and recovery contract. They are not a

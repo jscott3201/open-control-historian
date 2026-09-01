@@ -8,8 +8,12 @@ M03-PR03e adds no harness, product-reachable code, accepted V2 artifact, measure
 result, numeric SLO or budget, opener, decoder, publication path, or Store Format
 V2 authority. Store Format V1 remains the only implemented and accepted format.
 
-Plan acceptance authorizes only a separate, bounded review of a private/test-only
-harness. Every row in the [M03-PR03b future evidence matrix](#pr03b-evidence-crosswalk)
+Plan acceptance first authorized a separate bounded prerequisite review, now
+delivered by M03-PR03f as disabled-by-default, rustdoc-hidden current-V1 native
+instrumentation. It is not the private harness and binds no V2 source site.
+Acceptance next authorizes only a separate, bounded review of the complete
+private/test-only harness consuming that seam. Every row in the
+[M03-PR03b future evidence matrix](#pr03b-evidence-crosswalk)
 remains `UNSATISFIED` until the required harness exists, the measurements and
 fault results exist, and the evidence returns through the authority progression
 defined below. M03-PR03d is comparison evidence for a standalone tooling
@@ -69,6 +73,13 @@ journal sync
 that transaction, publishes Retry State V1 after the mechanical cutoff, and then
 publishes the ordinary manifest. `flush_pending` updates inspection before
 `IngressShared::complete_durable_batch` resolves the covered durable stages.
+
+M03-PR03f now exposes only closed current-V1 observations/faults at those actual
+seams under `m03-pr03e-native-harness`. Its registry deliberately contains no
+`V2TX-*`, `V2TIME-P*`, or `V2IO-*` source-bound identity because no native V2
+transaction exists. The later harness and any still-future product implementation
+must add their separately reviewed complete V2 registry rather than relabeling
+current-V1 events.
 
 A receipt truthfully durable under that prior ordinary manifest remains durable
 if the later rotation fails, requires reopen, or crashes. Rotation may neither
@@ -572,9 +583,10 @@ Every applicable registered boundary must exercise these literal modes:
 - `PRE_OPERATION_ERROR`: deterministic error before the operation changes state;
 - `SHORT_PARTIAL_WRITE`: deterministic nonzero short write followed by error,
   only where a write can partially succeed; and
-- `CHILD_CRASH_AFTER_SUCCESS`: after the boundary returns success, a parent-owned
-  controller uses OS kill/abort or an equivalent abrupt immediate termination
-  before the next registered boundary. The child performs no unwinding,
+- `CHILD_CRASH_AFTER_SUCCESS`: after the operation succeeds, instrumentation
+  records that boundary, publishes readiness, and blocks inside boundary finish
+  before it can return. A parent-owned controller uses OS kill/abort or an
+  equivalent abrupt immediate termination. The child performs no unwinding,
   destructors, `Drop` cleanup, exit handler, report flush, or other cleanup.
 
 Crash control, observations, and reports are parent-owned and remain in the
@@ -713,17 +725,22 @@ distinct records. No row may cite PR03d as native proof.
 
 ## Acceptance and authority progression
 
-1. **M03-PR03e docs acceptance:** authorizes only review of one later bounded
-   private harness PR. It accepts no code, result, V2 artifact, or product budget.
-2. **Later private harness review:** must pass plan-schema, closed-registry,
+1. **M03-PR03e docs acceptance:** authorized review of a bounded prerequisite
+   before the complete private harness. It accepted no result, V2 artifact, or
+   product budget.
+2. **M03-PR03f instrumentation prerequisite:** supplies only disabled-by-default,
+   rustdoc-hidden current-V1 source observation/fault/crash plumbing. It accepts
+   no harness, report, measurement, V2 source binding, or product authority.
+3. **Later complete private harness review:** must consume the reviewed seam and
+   pass plan-schema, closed-registry,
    matrix-completeness, disposable-root, sanitization, and functional structural
    checks. Acceptance authorizes evidence collection only.
-3. **Measured native evidence:** the complete Linux x86_64 acceptance-candidate
+4. **Measured native evidence:** the complete Linux x86_64 acceptance-candidate
    bundle is collected from a clean reviewed harness/measured SHA on the approved
    AgentBox. Darwin evidence remains exploratory. No SLO or budget is inferred.
-4. **Fresh owner checkpoint:** the owner reviews the complete native results and
+5. **Fresh owner checkpoint:** the owner reviews the complete native results and
    decides whether any measured budgets and an implementation plan are accepted.
-5. **Separate product implementation:** only after that explicit checkpoint may
+6. **Separate product implementation:** only after that explicit checkpoint may
    a Store Format V2 product PR be planned. Its actual code must rerun the entire
    matrix; harness-only evidence cannot substitute.
 

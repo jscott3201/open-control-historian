@@ -29,6 +29,10 @@ mod recovery;
 mod retry;
 mod segment;
 
+#[cfg(feature = "m03-pr03e-native-harness")]
+#[doc(hidden)]
+pub mod __m03_pr03e_native_harness;
+
 #[cfg(test)]
 mod typed_value_block;
 

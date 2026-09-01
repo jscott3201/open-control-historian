@@ -76,8 +76,11 @@ standalone tooling comparison evidence only. Native RSS, writer rotation delay,
 eager-open latency, total-runtime budgets, workspace acceptance threshold, and
 SLOs remain `UNKNOWN`.
 
-Acceptance of this docs slice authorizes only a later bounded private harness PR.
-That harness may emit reviewed V2 names/bytes only in newly absent, exclusively
+Acceptance of this docs slice authorized a separately reviewed native
+instrumentation prerequisite before the complete harness. M03-PR03f now supplies
+only that disabled-by-default, rustdoc-hidden current-V1 seam; it adds no harness,
+report, measurement, or V2 source binding. The next separately reviewed complete
+private harness may emit reviewed V2 names/bytes only in newly absent, exclusively
 created store-under-test children beneath an out-of-band private evidence parent.
 Descriptors, disposable markers, reports, and process controls stay outside each
 exact V2 inventory. The harness grants no product authority. Harness acceptance

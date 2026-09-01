@@ -1026,6 +1026,43 @@ impl IngressShared {
         append: AppendIdentity,
         preparation: PreparedPublication,
         fault: CompletionFaultInjection,
+        #[cfg(feature = "m03-pr03e-native-harness")] evidence_session: Option<
+            &och_store::__m03_pr03e_native_harness::NativeEvidenceSession,
+        >,
+    ) -> bool {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let evidence = evidence_session.map(|session| {
+            session.begin_boundary(
+                och_store::__m03_pr03e_native_harness::BoundaryId::HandledVisibility,
+                0,
+                append.append_sequence(),
+                1,
+            )
+        });
+        let result = self.complete_handled_inner(slot_index, admission, append, preparation, fault);
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        if let Some(token) = evidence
+            && let Some(session) = evidence_session
+        {
+            session.finish_boundary(
+                token,
+                if result {
+                    och_store::__m03_pr03e_native_harness::BoundaryOutcome::Success
+                } else {
+                    och_store::__m03_pr03e_native_harness::BoundaryOutcome::Error
+                },
+            );
+        }
+        result
+    }
+
+    fn complete_handled_inner(
+        &self,
+        slot_index: usize,
+        admission: CanonicalAdmission,
+        append: AppendIdentity,
+        preparation: PreparedPublication,
+        fault: CompletionFaultInjection,
     ) -> bool {
         let mut state = match self.state.lock() {
             Ok(state) => state,
@@ -1080,6 +1117,31 @@ impl IngressShared {
     }
 
     pub(crate) fn complete_durable_batch(
+        &self,
+        entries: &[DurableBatchEntry],
+        committed: ManifestCommit,
+        retry: RetryStateSnapshot,
+    ) -> bool {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let evidence = och_store::__m03_pr03e_native_harness::begin_worker_boundary(
+            och_store::__m03_pr03e_native_harness::BoundaryId::DurableBatchReceiptResolution,
+            committed.durable_cutoff().append_sequence(),
+            u32::try_from(entries.len()).unwrap_or(u32::MAX),
+        );
+        let result = self.complete_durable_batch_inner(entries, committed, retry);
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        och_store::__m03_pr03e_native_harness::finish_worker_boundary(
+            evidence,
+            if result {
+                och_store::__m03_pr03e_native_harness::BoundaryOutcome::Success
+            } else {
+                och_store::__m03_pr03e_native_harness::BoundaryOutcome::Error
+            },
+        );
+        result
+    }
+
+    fn complete_durable_batch_inner(
         &self,
         entries: &[DurableBatchEntry],
         committed: ManifestCommit,
@@ -1276,9 +1338,20 @@ impl InFlightCommand {
         append: AppendIdentity,
         preparation: PreparedPublication,
         fault: CompletionFaultInjection,
+        #[cfg(feature = "m03-pr03e-native-harness")] evidence_session: Option<
+            &och_store::__m03_pr03e_native_harness::NativeEvidenceSession,
+        >,
     ) -> bool {
         self.shared.take().is_some_and(|shared| {
-            shared.complete_handled(self.slot_index, admission, append, preparation, fault)
+            shared.complete_handled(
+                self.slot_index,
+                admission,
+                append,
+                preparation,
+                fault,
+                #[cfg(feature = "m03-pr03e-native-harness")]
+                evidence_session,
+            )
         })
     }
 

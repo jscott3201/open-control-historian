@@ -46,6 +46,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "m03-pr03e-native-harness")]
+use crate::__m03_pr03e_native_harness::{
+    BoundaryId, BoundaryOutcome, BoundaryToken, begin_worker_boundary, finish_worker_boundary,
+};
+
 /// Exact never-renamed store-level writer lock artifact.
 pub const STORE_LOCK_FILE_NAME: &str = "store-v1.lock";
 /// Exact Store Format V1 reset marker artifact.
@@ -1856,9 +1861,13 @@ impl ManifestStore {
         ) {
             return Err(self.record_terminal_error(error));
         }
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let adoption = begin_worker_boundary(BoundaryId::ManifestAdopt, record.generation, 1);
         self.manifest_slots = manifest_slots;
         self.current_slot = slot;
         self.current = record;
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        finish_worker_boundary(adoption, BoundaryOutcome::Success);
         Ok(self.commit())
     }
 
@@ -2136,6 +2145,8 @@ impl ManifestStore {
     }
 
     fn record_terminal_error(&mut self, error: ManifestStoreError) -> ManifestStoreError {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        let was_writable = self.write_state == StoreWriteState::Writable;
         self.write_state = if matches!(
             error,
             ManifestStoreError::StoragePressure(_)
@@ -2148,6 +2159,10 @@ impl ManifestStore {
         } else {
             StoreWriteState::Faulted
         };
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        if was_writable && self.write_state == StoreWriteState::ReopenRequired {
+            crate::pressure::record_pressure_transition();
+        }
         error
     }
 }
@@ -4181,6 +4196,7 @@ fn remove_unreferenced_catalog_slots(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn publish_reusable_slot(
     directory_path: &Path,
     directory: &File,
@@ -4195,36 +4211,150 @@ fn publish_reusable_slot(
     }
     let staging_path = directory_path.join(staging_name);
     let target_path = directory_path.join(target_name);
-    let mut staging = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&staging_path)
-        .map_err(|error| {
-            if error.kind() == ErrorKind::AlreadyExists {
-                ManifestStoreError::InterruptedPublication
-            } else {
-                manifest_io(ManifestIoOperation::CreateArtifact, &error)
-            }
-        })?;
-    injected_publication_fault(staging_name, PublicationPoint::Write)?;
-    staging
-        .write_all(bytes)
-        .map_err(|error| manifest_io(ManifestIoOperation::Write, &error))?;
-    injected_publication_fault(staging_name, PublicationPoint::SyncArtifact)?;
-    staging
-        .sync_all()
-        .map_err(|error| manifest_io(ManifestIoOperation::SyncArtifact, &error))?;
-    injected_publication_fault(staging_name, PublicationPoint::Readback)?;
-    let candidate = read_required_bounded(&staging_path, maximum)?;
-    verify(&candidate)?;
-    injected_publication_fault(staging_name, PublicationPoint::Publish)?;
-    std::fs::rename(&staging_path, &target_path)
-        .map_err(|error| manifest_io(ManifestIoOperation::Publish, &error))?;
-    injected_publication_fault(staging_name, PublicationPoint::SyncDirectory)?;
-    directory
-        .sync_all()
-        .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let subject = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let records_ordinary = crate::__m03_pr03e_native_harness::records_worker_ordinary_publication();
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let mut retry_publication = (records_ordinary && staging_name == RETRY_STAGING_FILE_NAME)
+        .then(|| begin_worker_boundary(BoundaryId::RetryStatePublish, subject, 1))
+        .flatten();
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let mut manifest_prepare = (records_ordinary && staging_name == MANIFEST_STAGING_FILE_NAME)
+        .then(|| begin_worker_boundary(BoundaryId::ManifestPrepare, subject, 1))
+        .flatten();
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    if let Some(kind) =
+        publication_pre_operation_error(retry_publication.as_ref(), manifest_prepare.as_ref())
+    {
+        finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Error);
+        finish_publication_boundary(&mut manifest_prepare, BoundaryOutcome::Error);
+        return Err(classify_manifest_io(
+            ManifestIoOperation::CreateArtifact,
+            kind.error_kind(),
+            None,
+        ));
+    }
+
+    let preparation = (|| {
+        let mut staging = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)
+            .map_err(|error| {
+                if error.kind() == ErrorKind::AlreadyExists {
+                    ManifestStoreError::InterruptedPublication
+                } else {
+                    manifest_io(ManifestIoOperation::CreateArtifact, &error)
+                }
+            })?;
+        injected_publication_fault(staging_name, PublicationPoint::Write)?;
+        staging
+            .write_all(bytes)
+            .map_err(|error| manifest_io(ManifestIoOperation::Write, &error))?;
+        injected_publication_fault(staging_name, PublicationPoint::SyncArtifact)?;
+        staging
+            .sync_all()
+            .map_err(|error| manifest_io(ManifestIoOperation::SyncArtifact, &error))?;
+        injected_publication_fault(staging_name, PublicationPoint::Readback)?;
+        let candidate = read_required_bounded(&staging_path, maximum)?;
+        verify(&candidate)
+    })();
+    if let Err(error) = preparation {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        {
+            finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Error);
+            finish_publication_boundary(&mut manifest_prepare, BoundaryOutcome::Error);
+        }
+        return Err(error);
+    }
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    finish_publication_boundary(&mut manifest_prepare, BoundaryOutcome::Success);
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let mut manifest_commit = (records_ordinary && staging_name == MANIFEST_STAGING_FILE_NAME)
+        .then(|| begin_worker_boundary(BoundaryId::ManifestRenameCommit, subject, 1))
+        .flatten();
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    if let Some(kind) =
+        publication_pre_operation_error(retry_publication.as_ref(), manifest_commit.as_ref())
+    {
+        finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Error);
+        finish_publication_boundary(&mut manifest_commit, BoundaryOutcome::Error);
+        return Err(classify_manifest_io(
+            ManifestIoOperation::Publish,
+            kind.error_kind(),
+            None,
+        ));
+    }
+    if let Err(error) = injected_publication_fault(staging_name, PublicationPoint::Publish)
+        .and_then(|()| {
+            std::fs::rename(&staging_path, &target_path)
+                .map_err(|error| manifest_io(ManifestIoOperation::Publish, &error))
+        })
+    {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        {
+            finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Error);
+            finish_publication_boundary(&mut manifest_commit, BoundaryOutcome::Error);
+        }
+        return Err(error);
+    }
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    finish_publication_boundary(&mut manifest_commit, BoundaryOutcome::Success);
+
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    let mut manifest_postcommit = (records_ordinary && staging_name == MANIFEST_STAGING_FILE_NAME)
+        .then(|| begin_worker_boundary(BoundaryId::ManifestPostcommit, subject, 1))
+        .flatten();
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    if let Some(kind) =
+        publication_pre_operation_error(retry_publication.as_ref(), manifest_postcommit.as_ref())
+    {
+        finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Error);
+        finish_publication_boundary(&mut manifest_postcommit, BoundaryOutcome::Error);
+        return Err(classify_manifest_io(
+            ManifestIoOperation::SyncDirectory,
+            kind.error_kind(),
+            None,
+        ));
+    }
+    if let Err(error) = injected_publication_fault(staging_name, PublicationPoint::SyncDirectory)
+        .and_then(|()| {
+            directory
+                .sync_all()
+                .map_err(|error| manifest_io(ManifestIoOperation::SyncDirectory, &error))
+        })
+    {
+        #[cfg(feature = "m03-pr03e-native-harness")]
+        {
+            finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Error);
+            finish_publication_boundary(&mut manifest_postcommit, BoundaryOutcome::Error);
+        }
+        return Err(error);
+    }
+    #[cfg(feature = "m03-pr03e-native-harness")]
+    {
+        finish_publication_boundary(&mut manifest_postcommit, BoundaryOutcome::Success);
+        finish_publication_boundary(&mut retry_publication, BoundaryOutcome::Success);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "m03-pr03e-native-harness")]
+fn publication_pre_operation_error(
+    aggregate: Option<&BoundaryToken>,
+    phase: Option<&BoundaryToken>,
+) -> Option<crate::__m03_pr03e_native_harness::InjectedErrorKind> {
+    aggregate
+        .and_then(BoundaryToken::pre_operation_error)
+        .or_else(|| phase.and_then(BoundaryToken::pre_operation_error))
+}
+
+#[cfg(feature = "m03-pr03e-native-harness")]
+fn finish_publication_boundary(token: &mut Option<BoundaryToken>, outcome: BoundaryOutcome) {
+    finish_worker_boundary(token.take(), outcome);
 }
 
 #[derive(Clone, Copy)]

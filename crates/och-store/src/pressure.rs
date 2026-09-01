@@ -20,3 +20,13 @@ pub enum StoreWriteState {
 pub(crate) const fn is_storage_pressure(kind: ErrorKind) -> bool {
     matches!(kind, ErrorKind::StorageFull | ErrorKind::QuotaExceeded)
 }
+
+#[cfg(feature = "m03-pr03e-native-harness")]
+pub(crate) fn record_pressure_transition() {
+    use crate::__m03_pr03e_native_harness::{
+        BoundaryId, BoundaryOutcome, begin_worker_boundary, finish_worker_boundary,
+    };
+
+    let evidence = begin_worker_boundary(BoundaryId::StorePressureTransition, 0, 1);
+    finish_worker_boundary(evidence, BoundaryOutcome::Success);
+}

@@ -53,7 +53,11 @@ Linux x86_64 resource evidence for that unchanged prototype and satisfies only
 the PR03c standalone measurement condition. M03-PR03e adds only the executable
 native timing/transaction/fault/cleanup/pressure/receipt plan and maps every
 PR03b evidence row to a later private harness/report obligation. It adds no
-harness or result and authorizes only later private-harness review. Writer-delay,
+harness or result. M03-PR03f adds only the owner-authorized, disabled-by-default,
+rustdoc-hidden current-V1 native instrumentation/fault/crash prerequisite for
+that later harness. It adds no harness, V2 source binding, report, measurement,
+or V2 behavior; explicit all-feature builds compile the seam while defaults stay
+off. Writer-delay,
 eager-open, RSS, total-runtime, and native external-workspace limits/budgets/SLOs
 remain `UNKNOWN`; the later harness, measured Linux native results, and a fresh
 owner checkpoint still block implementation.
