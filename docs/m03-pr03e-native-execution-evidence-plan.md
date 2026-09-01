@@ -174,9 +174,76 @@ to one process-local monotonic origin; `elapsed_ns` must exactly equal their
 checked difference. Wall-clock time, filesystem timestamps, and timestamps from
 different processes are never subtracted. Each event row records `event_id`,
 `parent_event_id`, `phase_id`, `case_id`, `sample_id`, `process_mode`,
-`store_mode`, `rotation_trigger_path`, `start_ns`, `stop_ns`, `elapsed_ns`,
-`outcome`, `trace_status`, `distribution_eligible`, and optional bounded
-`pair_ordinal`.
+`store_mode`, `rotation_trigger_path`, `durability_batch_id`, `sample_class`,
+`sample_outcome`, joined `fault_id`, joined `fault_mode`, joined `pressure_kind`,
+`start_ns`, `stop_ns`, `elapsed_ns`, event `outcome`, `trace_status`,
+`distribution_eligible`, and optional bounded `pair_ordinal`.
+
+### Closed sample classification and eligibility
+
+`sample_class` is exactly one of `SUCCESS`, `FAULT`, `PRESSURE`, or
+`NON_SUCCESS`. `sample_outcome` is exactly one of `SUCCESS`, `REFUSED`,
+`TERMINAL`, `REOPEN_REQUIRED`, `ERROR`, `CRASHED`, or `OTHER_NON_SUCCESS`.
+Every emitted event `outcome` uses that same closed value set; empty, unknown,
+free-text, or any other event outcome is invalid. An event not reached is omitted
+under the exact incomplete trace rather than emitted with an invented outcome.
+`pressure_kind` is `NONE`, `StorageFull`, or `QuotaExceeded`; `fault_id` and
+`fault_mode` are either `NONE` or exact closed fault-registry values. A present
+fault ID/mode pair must join the same `sample_id` to its exact fault-result row;
+pressure evidence may also name its injected boundary, but pressure precedence
+still applies. Missing, partial, conflicting, or unmatched joined evidence fails
+schema validation.
+
+Classification uses this exact first-match precedence so a sample cannot fit two
+classes:
+
+1. `PRESSURE` when `pressure_kind != NONE`;
+2. otherwise `FAULT` when `fault_id != NONE` or `fault_mode != NONE`;
+3. otherwise `NON_SUCCESS` when `sample_outcome != SUCCESS`, when
+   any emitted event `outcome != SUCCESS`, when the intended operation or process
+   result is non-success, when `trace_status != COMPLETE_SUCCESS`, or when the
+   exact required successful event tree/count is incomplete; and
+4. only the remaining complete successful sample is `SUCCESS`.
+
+`sample_outcome=SUCCESS` is valid only when the intended operation and process
+completed successfully and every required emitted event in the complete tree has
+`outcome=SUCCESS`. Otherwise `sample_outcome` is deterministic by this first-match
+result precedence: `CRASHED` for process crash, `REOPEN_REQUIRED` for the sticky
+typed reopen result, `TERMINAL` for another terminal result, `REFUSED` for a typed
+refusal, `ERROR` for an emitted event/process error, and `OTHER_NON_SUCCESS` for
+the remaining closed operation non-success. Existing `PRESSURE` then `FAULT` then
+`NON_SUCCESS` class precedence still applies independently.
+
+`trace_status` is exactly `COMPLETE_SUCCESS`, `COMPLETE_NON_SUCCESS`,
+`INCOMPLETE_FAULT_WITNESS`, or `INCOMPLETE_NON_SUCCESS_WITNESS`.
+`COMPLETE_SUCCESS` is valid only for `sample_class=SUCCESS`; a complete-shaped
+fault, pressure, refusal, terminal/reopen result, or other non-success uses
+`COMPLETE_NON_SUCCESS` and remains ineligible.
+
+The eligibility equivalence is closed:
+
+```text
+distribution_eligible=true
+iff sample_class=SUCCESS
+and sample_outcome=SUCCESS
+and fault_id=NONE
+and fault_mode=NONE
+and pressure_kind=NONE
+and trace_status=COMPLETE_SUCCESS
+and intended operation/process result=SUCCESS
+and every required emitted event outcome=SUCCESS
+and the exact required event tree and event counts are complete.
+```
+
+Every event row for one `sample_id` repeats these sample fields exactly or joins
+deterministically to one bounded sample record carrying them; disagreement among
+rows or joined reports fails. Every fault injection, abrupt crash witness,
+pressure overlay, typed refusal, terminal/reopen result, incomplete trace, and
+other non-success has `distribution_eligible=false`, even when the final
+registered boundary succeeded and the event tree appears complete. The validator
+rejects `sample_outcome=SUCCESS`, `sample_class=SUCCESS`, or
+`distribution_eligible=true` whenever any emitted event, process result, or
+intended operation result is non-success.
 
 `rotation_trigger_path` is a closed field with exactly these values:
 
@@ -278,44 +345,85 @@ The transaction phase IDs remain exactly `V2TX-P0-PREFLIGHT` through
 
 ### Closed event-order and containment validator
 
-The later plan/schema validator must enforce a closed trace grammar:
+`parent_event_id=NONE` is the one canonical root sentinel. Empty, null, omitted,
+or unknown parent values are invalid. The event-node key is
+`(sample_id, event_id, pair_ordinal)`; non-pair events use `pair_ordinal=NONE`.
+Every non-root node has exactly one direct parent node in the same sample.
 
-1. A declared aggregate may contain only its declared child spans:
-   `V2TIME-RECEIPT-HANDLED-DURABLE` may contain the ordinary peer sequence,
-   `V2TIME-WRITER-ROTATION-DELAY` contains P0 through P7,
-   `V2TIME-ROTATION-MUTATION-CRITICAL` contains P1 through P7 cleanup,
-   `V2TIME-P6-MANIFEST` contains its three P6 children, and
-   `V2TIME-EAGER-OPEN` contains ordered pair-validation spans.
+The only legal direct-parent edges are:
+
+| Direct parent | Exact direct children |
+| --- | --- |
+| `NONE` | root aggregates `V2TIME-WRITER-ROTATION-DELAY`, `V2TIME-RECEIPT-HANDLED-DURABLE`, and `V2TIME-EAGER-OPEN`; separate root event `V2TIME-ORD-NOOP-BARRIER` |
+| `V2TIME-WRITER-ROTATION-DELAY` | `V2TIME-P0-PREFLIGHT`, `V2TIME-ROTATION-MUTATION-CRITICAL` |
+| `V2TIME-ROTATION-MUTATION-CRITICAL` | `V2TIME-P1-INTENT`, `V2TIME-P2-RAW`, `V2TIME-P3-SEGMENT`, `V2TIME-P4-SUCCESSOR`, `V2TIME-P5-CATALOG`, aggregate `V2TIME-P6-MANIFEST`, `V2TIME-P7-ADOPTION`, `V2TIME-P7-CLEANUP` |
+| `V2TIME-P6-MANIFEST` | `V2TIME-P6-MANIFEST-PUBLICATION-PREPARE`, `V2TIME-P6-MANIFEST-RENAME-COMMIT`, `V2TIME-P6-MANIFEST-POSTCOMMIT-VALIDATE` |
+| `V2TIME-RECEIPT-HANDLED-DURABLE` | `V2TIME-ORD-JOURNAL-SYNC`, `V2TIME-ORD-CHECKPOINT-WRITE`, `V2TIME-ORD-CHECKPOINT-SYNC`, `V2TIME-ORD-CHECKPOINT-ADOPT`, `V2TIME-ORD-RETRY-PUBLISH`, `V2TIME-ORD-MANIFEST-PUBLICATION-PREPARE`, `V2TIME-ORD-MANIFEST-RENAME-COMMIT`, `V2TIME-ORD-MANIFEST-POSTCOMMIT-VALIDATE`, `V2TIME-ORD-MANIFEST-ADOPT`, `V2TIME-ORD-INSPECTION-UPDATE`, and `V2TIME-ORD-RECEIPT-RESOLVE`; never `V2TIME-ORD-NOOP-BARRIER` |
+| `V2TIME-EAGER-OPEN` | every `V2TIME-OPEN-PAIR-VALIDATION` identified by its exact `pair_ordinal` |
+
+Root sets are also closed. A receipt projection has only the receipt root; an
+eager-open sample has only the eager-open root; a rotation sample with a pending
+ordinary barrier has only the writer root and joins receipt projections by batch
+ID; and a pending-empty `PRE_APPEND` rotation sample has the no-op root followed
+by the writer root. Those two roots may touch at the boundary but may not overlap
+or cross. No other multi-root sample is valid.
+
+No other parent type or edge is legal. A descendant is transitively contained by
+each ancestor but names only its one direct parent. Every child interval lies
+fully within its direct parent interval, and therefore every descendant lies
+within every ancestor. Sibling intervals may touch when one `stop_ns` exactly
+equals the next `start_ns`; siblings may not overlap, cross, or contain one
+another. Parent/child intervals may nest but may not cross.
+
+The later plan/schema validator must enforce this closed forest of direct-parent
+trees plus the existing trace grammar:
+
+1. Reject cycles, duplicate parentage, duplicate event-node keys, unknown parents,
+   wrong parent types, roots whose parent is not `NONE`, children whose parent is
+   `NONE`, missing direct parents, and crossing intervals.
 2. Peer subevents may not overlap, merge, reorder, or silently disappear.
-   Complete traces follow the exact ordinary order above and then the exact
+   Complete traces follow the exact ordinary order and the exact
    P0→P1→P2→P3→P4→P5→P6 preparation→P6 rename→P6 postcommit→P7 adoption→P7
-   cleanup order. Parent/child containment is the only permitted overlap.
+   cleanup order. The declared direct/transitive hierarchy is the only permitted
+   containment.
 3. Successful Manifest V2 final rename changes root classification immediately.
    Every later event or fault result is `COMMITTED_ROOT` or an unchanged refusal
    of that committed relation; `PRIOR_ROOT` after rename success is invalid even
    though directory sync and postcommit validation remain.
 4. Rotation timing cannot begin before the applicable complete ordinary receipt
-   sequence or explicit no-op barrier. The trigger-specific stop must precede the
+   sequence or separate no-op root. The trigger-specific stop must precede the
    preserved append resume (`PRE_APPEND`) or next command receive/accept
    (`POST_PUBLICATION`).
 5. Every complete `sample_id` has exactly the required event set, declared case
-   path, parentage, order, and pair coverage. Required sample/event counts are
-   enforced per `case_id` and `expected_rotation_trigger_path`. An injected
-   failure/crash may instead produce `trace_status=INCOMPLETE_FAULT_WITNESS` with
-   the exact completed prefix, last boundary, and omitted suffix; it always has
-   `distribution_eligible=false` and is excluded from timing distributions.
+   path, direct parents, transitive containment, order, and pair coverage.
+   Required eligible-success sample/event counts are enforced per `case_id` and
+   `expected_rotation_trigger_path`. A fault/non-success may retain an exact
+   completed tree or an exact prefix under its closed `trace_status`, but is always
+   `distribution_eligible=false`.
 6. Each automatic-rotation case declares exactly one expected path and every row
    must match it. Matrix validation requires all five closed demand/path cases and
    therefore both writer paths overall. It refuses `NOT_APPLICABLE` on rotation,
    an unrecognized value, a case/path mismatch, pooled counts, or implicit trigger
    coverage. Nonrotation ordinary/eager-open cases may use `NOT_APPLICABLE`.
 
+`durability_batch_id` is either `NONE` or one nonzero bounded unsigned 64-bit
+identifier. A receipt-latency sample carries the physical ordinary batch ID; a
+rotation sample with a pending ordinary barrier joins that same ID, while a
+pending-empty no-op path uses `NONE`. If one physical ordinary batch covers
+multiple receipts, each covered receipt has its own `sample_id` projection and
+its own receipt root/direct-child tree. The same observed ordinary timestamps may
+repeat across those projections and their shared `durability_batch_id`, but no
+event node is shared across samples or given multiple parents. The rotation tree
+joins the receipt projections by batch ID; it never parents their ordinary event
+nodes. Its preflight/rotation start must be at or after every joined covered
+receipt root has stopped.
+
 The future plan/schema validator must include these literal fixtures:
 
 | Fixture ID | Required result |
 | --- | --- |
-| `TRACE-ACCEPT-PRE-APPEND` | Accept one exact complete required `PRE_APPEND` case trace, including either the ordinary peer sequence or explicit no-op barrier before P0. |
-| `TRACE-ACCEPT-POST-PUBLICATION` | Accept one exact complete required `POST_PUBLICATION` case trace with forced ordinary durability and receipts before P0. |
+| `TRACE-ACCEPT-PRE-APPEND` | Accept one exact complete required `PRE_APPEND` rotation tree with either joined covered receipt projection(s) by batch ID or the explicit no-op root before P0. |
+| `TRACE-ACCEPT-POST-PUBLICATION` | Accept one exact complete required `POST_PUBLICATION` rotation tree joined to its forced ordinary-durability receipt projection(s), all stopped before P0. |
 | `TRACE-REJECT-MERGED-SUBEVENT` | Reject two required peer spans represented as one event. |
 | `TRACE-REJECT-OVERLAPPING-PEERS` | Reject peer overlap not explained by declared parent containment. |
 | `TRACE-REJECT-REORDERED-SUBEVENT` | Reject any ordinary or P0→P7 reorder. |
@@ -326,12 +434,29 @@ The future plan/schema validator must include these literal fixtures:
 | `TRACE-REJECT-MISSING-POST-PUBLICATION` | Reject an applicable matrix with no complete `POST_PUBLICATION` sample. |
 | `TRACE-REJECT-CASE-TRIGGER-MISMATCH` | Reject a sample whose trigger differs from its case's one declared `expected_rotation_trigger_path`, including `NOT_APPLICABLE` on rotation. |
 | `TRACE-REJECT-POST-RENAME-PRIOR-ROOT` | Reject `PRIOR_ROOT` classification after successful `V2TIME-P6-MANIFEST-RENAME-COMMIT`. |
+| `ELIGIBILITY-ACCEPT-COMPLETE-SUCCESS` | Accept exact complete tree/count, success outcome, absent fault/pressure evidence, `sample_class=SUCCESS`, `trace_status=COMPLETE_SUCCESS`, and `distribution_eligible=true`. |
+| `ELIGIBILITY-REJECT-FINAL-FAULT-ELIGIBLE` | Reject a complete-shaped sample marked eligible when a final-boundary injected fault ID/mode exists, even if that boundary event reports success. |
+| `ELIGIBILITY-REJECT-PRESSURE-ELIGIBLE` | Reject any `StorageFull` or `QuotaExceeded` sample marked eligible. |
+| `ELIGIBILITY-REJECT-NON-SUCCESS-ELIGIBLE` | Reject a refusal, terminal/reopen result, crash, error, incomplete trace, or other non-success marked eligible. |
+| `ELIGIBILITY-REJECT-NON-SUCCESS-EVENT-SUCCESS-SAMPLE` | Reject a complete event tree containing one non-success event when the sample is falsely labeled `sample_outcome=SUCCESS`, `sample_class=SUCCESS`, and `distribution_eligible=true`. |
+| `ELIGIBILITY-REJECT-SUMMARY-INELIGIBLE` | Reject any timing summary that includes an ineligible sample or counts it toward a required success count. |
+| `TREE-ACCEPT-DIRECT-NESTED` | Accept the exact direct-parent tree, including P6 grandchildren transitively contained by mutation-critical and writer ancestors. |
+| `TREE-ACCEPT-SIBLING-BOUNDARY-TOUCH` | Accept ordered siblings where one stop equals the next start without overlap. |
+| `TREE-REJECT-WRONG-PARENT` | Reject any event attached to a parent not listed in the direct-parent table. |
+| `TREE-REJECT-CROSSING-PARENT-CHILD` | Reject a child interval extending outside or crossing its direct parent. |
+| `TREE-REJECT-CROSSING-SIBLINGS` | Reject overlapping, crossing, or sibling-containing intervals. |
+| `TREE-REJECT-CYCLE` | Reject every direct or transitive parent cycle. |
+| `TREE-REJECT-UNKNOWN-PARENT` | Reject a non-`NONE` parent node absent from the same sample. |
+| `TREE-REJECT-DUPLICATE-PARENTAGE` | Reject duplicate event-node keys or one node assigned more than one direct parent. |
+| `TREE-REJECT-ROOT-SENTINEL` | Reject a root event whose `parent_event_id` is not `NONE`, including empty or unknown values. |
+| `TREE-REJECT-CHILD-SENTINEL` | Reject a child event whose `parent_event_id=NONE`. |
 
 A killed child cannot emit an in-process stop event. Crash-after-success cases
 therefore record the child's last successful boundary event and the parent's
-separate process-exit/reopen observations; they are fault witnesses and are not
-included in timing distributions unless a complete same-process start/stop pair
-exists. Parent and child monotonic values are never combined.
+separate process-exit/reopen observations. They remain raw fault witnesses with
+`sample_class=FAULT` and `distribution_eligible=false`, even when a complete
+same-process start/stop pair or complete-shaped event tree exists. Parent and
+child monotonic values are never combined.
 
 Instrumentation overhead must be measured in a paired harness-only calibration
 and reported, but samples are not adjusted or discarded. No duration in this plan
@@ -353,7 +478,9 @@ same observed p50 rule, IQR is observed p75 minus observed p25, and MAD is the
 observed p50 of all absolute deviations from that median. No warm-up, slow,
 fast, scheduler-affected, or other outlier may be removed. Failed samples remain
 in the fault/result report and cannot silently reduce the required successful
-sample count.
+sample count. Every required timing count is the count of distinct
+`distribution_eligible=true` successful `sample_id` values only; fault/pressure
+repetitions and complete-shaped non-success witnesses never satisfy it.
 
 Each sample independently labels:
 
@@ -537,21 +664,23 @@ Reports are schema-versioned UTF-8 KV/TSV, never free-form logs. Schema version
 | Relative file | Required contents |
 | --- | --- |
 | `run.kv` | Plan acceptance SHA; clean harness SHA and measured source SHA; tracked and untracked tree status; `Cargo.lock`, harness-source, and instrumentation-source SHA-256; exact commands/profile; Rust/Cargo versions; platform, CPU, memory, filesystem, mount/locality, load, storage/headroom, page/cache/store facts; report classification and exclusions. |
-| `timing-samples.tsv` | Every complete sample and literal event ID with parent ID, phase, closed `rotation_trigger_path`, exact process/store/cache labels, monotonic start/stop/elapsed nanoseconds, result, trace/distribution status, and pair ordinal. |
-| `timing-summary.tsv` | Per-case/path required count, actual count, declared/observed trigger path, min/median/observed p90/p95/p99/max/IQR/MAD or witness-only min/median/max plus `percentile_claim=NONE`; counts are never pooled and incomplete fault witnesses are excluded. |
+| `timing-samples.tsv` | Every raw complete or incomplete event row with direct parent or root `NONE`, phase, case/sample and optional durability-batch IDs, closed trigger path, sample class/outcome, joined fault ID/mode and pressure kind, exact process/store/cache labels, monotonic start/stop/elapsed nanoseconds, event outcome, trace status, distribution eligibility, and pair ordinal. |
+| `timing-summary.tsv` | Per-case/path required eligible-success count, actual distinct eligible-success count, declared/observed trigger path, min/median/observed p90/p95/p99/max/IQR/MAD or witness-only min/median/max plus `percentile_claim=NONE`; only `distribution_eligible=true` samples are aggregated, counts are never pooled, and every ineligible sample is excluded. |
 | `resource-ledger.tsv` | Every actual/requested capacity and all process, stack, RSS, storage, requested/actual logical/allocated external workspace, concurrent-inventory, headroom, page, and cache fields listed above for every case. |
 | `fault-registry.tsv` | The complete closed registry row for every instrumented boundary. |
-| `fault-results.tsv` | Fault ID, mode, repetition, expected/actual result, pressure kind/raw diagnostic, receipt stages, rotation trigger path, exact completed event prefix, process result, last boundary, pre/immediate/reopen/final fingerprints, and root classification. |
-| `matrix.tsv` | Every PR03b crosswalk ID; every required rotation `case_id`, demand class, and one `expected_rotation_trigger_path`; both writer paths overall; every event-order fixture; and every timing, bound, hostile, fault/mode, pressure, platform, and report obligation with expected rows, observed rows, and `PASS`/`FAIL`; no skipped or implied row. |
+| `fault-results.tsv` | Sample ID/class/outcome/eligibility, fault ID/mode, repetition, expected/actual result, pressure kind/raw diagnostic, receipt stages, durability-batch and rotation-trigger IDs, exact completed event prefix/tree, process result, last boundary, pre/immediate/reopen/final fingerprints, and root classification. |
+| `matrix.tsv` | Every PR03b crosswalk ID; every required rotation `case_id`, demand class, and one `expected_rotation_trigger_path`; both writer paths overall; every eligibility, direct-parent/containment, and existing event-order fixture; and every timing, bound, hostile, fault/mode, pressure, platform, and report obligation with expected rows, observed rows, and `PASS`/`FAIL`; no skipped or implied row. |
 | `SHA256SUMS` | Relative SHA-256 for every other bounded report file and no unlisted report file. |
 
 All KV keys and TSV columns are closed and schema-validated. The bundle must cap
 itself at 64 MiB, each data file at 16 MiB, each physical line at 4,096 bytes,
 each scalar at 1,024 bytes, and row counts at the exact precomputed matrix count.
 If the complete required matrix cannot fit, the harness returns `REPLAN`; it does
-not truncate. Reports include complete samples but no canonical payload.
+not truncate. Raw reports retain every complete and incomplete observation but no
+canonical payload; summaries retain only eligible successful statistics.
 
 Validation rejects a missing/unknown/duplicate ID, missing required field,
+class/outcome/evidence/eligibility mismatch, illegal direct parent or interval,
 incomplete matrix row, unsafe value, unknown schema version, dirty or mismatched
 measured source, mismatched plan/harness/instrumentation hash, checksum mismatch,
 unlisted file, absolute path, username, hostname, cloud project/instance ID,
@@ -570,13 +699,13 @@ neither the harness nor results.
 | `PR03E-M02` Published segment bytes | Independently emit and full-compare exact unchanged `OCHSEG01` bytes, complete source reconstruction, indexes, and trailer without using the production emitter as oracle. | Fixture dimensions, raw/segment identities, complete comparison and hostile parse rows, and oracle hashes. | `UNSATISFIED` |
 | `PR03E-M03` Namespace and inventory | Enumerate the exact V2 recognized-name oracle; prove canonical 156, unknown-name refusal, and no orphan, gap, duplicate, alternate segment, non-file, or leftover. | Canonical sorted inventory fingerprints and before/after equality for every refusal. | `UNSATISFIED` |
 | `PR03E-M04` Epoch fence | Exercise V1, V2, markerless, historical, and every mixed-format inventory before lock create/acquire or mutation. | Boundary trace proving pre-lock refusal plus exact pre/immediate/final inventory equality. | `UNSATISFIED` |
-| `PR03E-M05` Transaction convergence | Exercise every registered phase boundary in all applicable modes with three identical repetitions; allow only exact prior-root rollback before commit and committed-root adoption after commit; validate that successful Manifest V2 rename switches classification immediately and rejects every post-rename prior-root trace. | Closed fault registry, ordered event/fixture rows, complete fault rows, receipt stages, four inventory fingerprints, reopen result, and exact root classification. | `UNSATISFIED` |
+| `PR03E-M05` Transaction convergence | Exercise every registered phase boundary in all applicable modes with three identical repetitions; allow only exact prior-root rollback before commit and committed-root adoption after commit; validate that successful Manifest V2 rename switches classification immediately; require the closed direct-parent/transitive tree and ineligible classification for every fault witness. | Closed fault registry, direct-parent/containment and eligibility fixture rows, complete raw fault/event rows, receipt stages, four inventory fingerprints, reopen result, and exact root classification. | `UNSATISFIED` |
 | `PR03E-M06` Committed cleanup convergence | Fault/crash before, between, and after successor adoption, predecessor active removal/sync, checkpoint removal/sync, each raw/segment/catalog/manifest staging removal/sync, clean-inventory proof, intent-last removal, and final sync. | Exact cleanup-prefix trace proving no committed raw/segment deletion, no postcommit fallback, no extra inventory, and eventual exact committed reopen. | `UNSATISFIED` |
-| `PR03E-M07` Pressure and receipts | Overlay `StorageFull` and `QuotaExceeded` at every store-owned mutation boundary, including partial-write cases; verify first-wins sticky custody, runtime fail-stop, ordinary receipt preservation, no false new receipt/commit, and no rotation start before covered receipts or the explicit no-op barrier. | Pressure kind, raw diagnostic, custody/health transition, handled/durable stages, trigger path, ordered event prefix, process result, reopen-only convergence, and root/inventory fingerprints. | `UNSATISFIED` |
+| `PR03E-M07` Pressure and receipts | Overlay `StorageFull` and `QuotaExceeded` at every store-owned mutation boundary, including partial-write cases; verify first-wins sticky custody, runtime fail-stop, ordinary receipt preservation, no false new receipt/commit, no rotation start before covered receipts or the explicit no-op barrier, and ineligibility of every pressure/refusal/terminal result. | Pressure kind, raw diagnostic, sample class/outcome and false eligibility, custody/health transition, handled/durable stages, durability-batch/trigger join, ordered event prefix, process result, reopen-only convergence, and root/inventory fingerprints. | `UNSATISFIED` |
 | `PR03E-M08` Committed fail-closed behavior | Generate missing, corrupt, foreign, malformed, truncated, partial, excessive, forked, unrelated, ambiguous, and catalog-mismatched committed segment/pair cases. | Sanitized refusal, complete eager-validation boundary, and exact before/after fingerprints with `UNCHANGED_REFUSAL`. | `UNSATISFIED` |
 | `PR03E-M09` Raw/segment linkage | Completely checksum and hostile-parse every pair; verify exact StoreId, generation, range, registry, raw length/CRC, frame coverage, unchanged frame bytes, indexes, trailer, and Catalog V2 identity. | One complete validation row and bounded resource ledger per pair, including pair-state release before the next pair. | `UNSATISFIED` |
 | `PR03E-M10` Bounds | Prove entries 1 and 64, pre-mutation entry-65 refusal, canonical inventory 156, and 157/unknown/mixed refusal unchanged. | Exact boundary traces, mutation count zero for refusals, and canonical before/after fingerprints. | `UNSATISFIED` |
-| `PR03E-M11` Streaming resources | Execute minimum, representative, independent maximum, 64-pair, and refusal tiers; measure requested/actual logical/allocated external workspace for zero and nonzero observations; collect the complete declared demand/path case matrix covering both writer paths, literal ordered events, validator fixtures, native writer-delay, eager-open, RSS, storage, and representation ledgers without inventing thresholds. | All timing samples/statistics and required/actual counts grouped by declared case/path, event/fixture completeness, witness labels, pair events, complete finite checked workspace/resource ledgers, platform/cache facts, and explicit `UNKNOWN` native workspace limits, budgets, and SLOs. PR03c/PR03d values appear only as labeled tooling comparison data. | `UNSATISFIED` |
+| `PR03E-M11` Streaming resources | Execute minimum, representative, independent maximum, 64-pair, and refusal tiers; measure requested/actual logical/allocated external workspace for zero and nonzero observations; collect the complete demand/path matrix, closed direct-parent tree, literal ordered events, eligibility fixtures, native writer-delay, eager-open, RSS, storage, and representation ledgers without inventing thresholds. | Raw observations plus timing statistics/counts computed only from distinct eligible successes grouped by declared case/path; direct/transitive tree and fixture completeness; batch joins, witness labels, pair events, finite checked workspace/resource ledgers, platform/cache facts, and explicit `UNKNOWN` native limits/budgets/SLOs. PR03c/PR03d values remain tooling comparison data. | `UNSATISFIED` |
 
 No row may become satisfied in a harness implementation PR merely because its
 schema or test case exists. Structural harness checks and measured results are

@@ -29,8 +29,15 @@ defines:
   transaction subevent, the distinct Manifest rename commit, and every pair
   validation;
 - a closed event-order/containment validator and positive/negative fixtures for
-  merged, overlapping, reordered, missing, pre-barrier, missing-trigger-path, and
-  post-rename prior-root traces;
+  one direct parent, root sentinel, transitive containment, batch projections,
+  sibling boundary-touch, and rejection of merged, overlapping, crossing,
+  reordered, missing, cyclic, unknown-parent, invalid-sentinel, pre-barrier,
+  missing-trigger-path, and post-rename prior-root traces;
+- a closed `SUCCESS`/`FAULT`/`PRESSURE`/`NON_SUCCESS` classification with exact
+  precedence and `distribution_eligible=true` iff the sample is an exact complete
+  fault-free, pressure-free success whose intended operation, process, and every
+  required emitted event all report success; summaries and required counts use
+  only distinct eligible successes while raw reports retain every observation;
 - cold/warm process, filesystem-cache, store-reuse, sample-count, witness-only,
   observed-statistic, platform, and no-outlier policy;
 - a closed semantic fault registry, complete I/O-boundary validator,
@@ -78,9 +85,10 @@ total-runtime budgets, workspace limit/acceptance threshold, and SLOs remain
 Focused documentation checks must prove that all 11 PR03b rows are mapped exactly
 once and remain `UNSATISFIED`, and that phase IDs, timing events, fault modes,
 the complete demand/path case matrix, one expected trigger per rotation case,
-both paths overall, per-case counts, event ordering/fixtures, sample tiers,
-platform/cache policy, report files/fields, workspace non-authority, authority
-progression, and exclusions are present.
+both paths overall, per-case counts, closed eligibility equivalence and fixtures,
+one-parent/root-sentinel/transitive containment and fixtures, batch projection,
+event ordering, sample tiers, platform/cache policy, report files/fields,
+workspace non-authority, authority progression, and exclusions are present.
 
 Required PR gates are:
 

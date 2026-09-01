@@ -21,9 +21,12 @@ The plan defines literal V2 transaction phase and timing IDs, one expected path
 per automatic-rotation case, a closed demand matrix covering pre-append fit/age
 and post-publication size/count/age across both `PRE_APPEND` and
 `POST_PUBLICATION`, per-case/path counts, closed event ordering and trace fixtures,
-Manifest-rename commit-side classification, exact precommit rollback/postcommit
-adoption law, intent-last committed cleanup, complete pair validation, and the
-prohibition on reusing incompatible current V1 cleanup ordering. It requires:
+one direct parent with root sentinel and transitive containment, bounded
+durability-batch receipt projections, closed success/fault/pressure/non-success
+classification, successful-timing eligibility equivalence, Manifest-rename
+commit-side classification, exact precommit rollback/postcommit adoption law,
+intent-last committed cleanup, complete pair validation, and the prohibition on
+reusing incompatible current V1 cleanup ordering. It requires:
 
 - 30 independent fresh-process and 100 warm same-process samples for tractable
   minimum and representative timing cases, with each warm sample starting from
@@ -44,6 +47,14 @@ prohibition on reusing incompatible current V1 cleanup ordering. It requires:
   one-pair-at-a-time validation of all 64 committed pairs; and
 - a bounded sanitized KV/TSV report bundle with complete samples, resource
   ledger, source hashes, matrix coverage, and relative `SHA256SUMS`.
+
+Only distinct exact complete `SUCCESS` samples with no fault or pressure evidence
+and successful intended-operation, process, and required-event outcomes are
+timing-distribution eligible. Any event/process/operation non-success
+deterministically makes the sample non-success. Fault/crash, pressure, refusal,
+terminal/reopen, incomplete, and every other non-success observation remains in
+raw reports but never contributes statistics or required-success counts, even
+with a complete-shaped event tree.
 
 PR03c's 160 MiB and zero-external-workspace results remain standalone tooling
 comparison data only. Every native case must ledger requested and actual logical
