@@ -1,5 +1,14 @@
 # Canonical model and bounded-runtime architecture
 
+![Architecture diagram showing the solid current native dependency path from och-runtime through och-store to och-core, the direct runtime-to-core canonical-type relation, and dashed tooling and future boundaries](assets/architecture.svg)
+
+**Text alternative:** The solid current product boundary contains
+`och-runtime -> och-store -> och-core`; runtime also uses canonical core types
+directly. Tokio is runtime's only allowed external product dependency and exposes
+only `rt` and `sync`. Dashed boxes distinguish repository tooling outside native
+default members, absent future inward-only adapters, and the unimplemented Store
+Format V2 review contract outside current Store Format V1 authority.
+
 ## Present topology
 
 M00 established the reviewed dependency-free canonical model. M01-PR01 added a
