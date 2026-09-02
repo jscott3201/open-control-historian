@@ -65,11 +65,15 @@ current-V1 success/pressure seam smoke. It adds no complete matrix, timing/fault
 report, collector, child-crash campaign, measurement, accepted V2 byte, or
 collection authorization. Its containment claim is finite current-revision Rust
 privacy and source-review evidence, not a universal or future-source I/O proof.
-M03-PR03g2 must separately complete those harness
-obligations; every `PR03E-M01..M11` row remains `UNSATISFIED`. Writer-delay,
-eager-open, RSS, total-runtime, and native external-workspace limits/budgets/SLOs
-remain `UNKNOWN`; g2, measured Linux native results, and a fresh
-owner checkpoint still block implementation.
+M03-PR03g2 completes only the private structural harness infrastructure: one
+closed 639-row structural matrix, bounded schema-validated synthetic report
+bundle, and parent-killed/reaped/reopened campaign for all 173 registered crash
+targets. Its reserved collection command fails closed before root creation; no
+measured collector or acceptance-context builder exists, and hosted checks remain
+structural. Every `PR03E-M01..M11` row remains
+`UNSATISFIED`. Writer-delay, eager-open, RSS, total-runtime, and native
+external-workspace limits/budgets/SLOs remain `UNKNOWN`; measured Linux native
+results and a fresh owner checkpoint still block implementation.
 `och-runtime` depends
 inward on `och-store`, opens one explicitly
 bounded filesystem-backed store, admits only complete M00-PR05

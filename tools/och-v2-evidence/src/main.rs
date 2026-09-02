@@ -41,6 +41,9 @@ fn run(arguments: &[String]) -> Result<()> {
             Ok(())
         }
         "native-foundation-check" => harness::foundation_check_command(arguments),
+        "native-harness-check" => harness::harness_check_command(arguments),
+        "native-collect" => harness::collect_command(arguments),
+        "__native-child" => root::hidden_child_command(arguments),
         _ => Err(EvidenceError::Usage),
     }
 }

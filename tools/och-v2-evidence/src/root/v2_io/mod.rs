@@ -1,7 +1,7 @@
 //! Private capability and executor subtree for disposable V2 store children.
 
 use crate::error::{EvidenceError, Result};
-use crate::root::{EvidenceRoot, FoundationSummary};
+use crate::root::{EvidenceRoot, FoundationSummary, HarnessSummary};
 use crate::sha256::{Sha256, hex};
 use fault::{Artifact, FaultDescriptor, FaultId, FaultSelection, Operation};
 use inventory::{ArtifactFingerprint, InventoryFingerprint};
@@ -14,8 +14,11 @@ use std::path::{Path, PathBuf};
 
 mod fault;
 mod inventory;
+mod matrix;
 mod oracle;
+mod report;
 mod schema;
+mod supervisor;
 mod transaction;
 
 const MAX_SITE_BYTES: usize = 64 * 1_024;
@@ -81,6 +84,55 @@ pub(super) fn run_foundation(root: &EvidenceRoot) -> Result<FoundationSummary> {
     run_child(root, transaction::run_foundation)
 }
 
+pub(super) fn hidden_child_command(arguments: &[String]) -> Result<()> {
+    supervisor::hidden_child_command(arguments)
+}
+
+pub(super) fn run_harness(root: &EvidenceRoot) -> Result<HarnessSummary> {
+    run_complete(root, &report::ReportContext::structural())
+}
+
+fn run_complete(root: &EvidenceRoot, context: &report::ReportContext) -> Result<HarnessSummary> {
+    schema::validate_closed_schema()?;
+    fault::validate_registry()?;
+    validate_compiled_registry_bijection()?;
+    let matrix = matrix::structural_matrix()?;
+    if matrix.len() != matrix::MATRIX_ROW_COUNT {
+        return Err(EvidenceError::InvalidHarness);
+    }
+    report::preflight(context)?;
+    let foundation = run_foundation(root)?;
+    let witnesses = supervisor::run_campaign(root)?;
+    let summary = report::write_and_validate(root, context, &witnesses)?;
+    if witnesses.len() != FaultId::ALL.len()
+        || summary.bundle_files != report::ALL_FILES.len()
+        || summary.timing_rows != matrix::TIMING_SAMPLE_ROW_COUNT
+        || summary.timing_summary_rows != matrix::TIMING_SUMMARY_ROW_COUNT
+        || summary.resource_rows != matrix::RESOURCE_ROW_COUNT
+        || summary.registry_rows != FaultId::ALL.len()
+        || summary.fault_result_rows != fault::applicability_rows()?.len()
+        || summary.matrix_rows != matrix::MATRIX_ROW_COUNT
+    {
+        return Err(EvidenceError::InvalidHarness);
+    }
+    Ok(HarnessSummary {
+        schema: schema::REPORT_SCHEMA,
+        classification: context.classification.as_str(),
+        descriptor_count: foundation.descriptor_count,
+        crash_target_count: witnesses.len(),
+        matrix_rows: summary.matrix_rows,
+        timing_rows: summary.timing_rows,
+        timing_summary_rows: summary.timing_summary_rows,
+        resource_rows: summary.resource_rows,
+        registry_rows: summary.registry_rows,
+        fault_result_rows: summary.fault_result_rows,
+        bundle_files: summary.bundle_files,
+        bundle_bytes: summary.bundle_bytes,
+        collection_authorized: context.collection_authorized,
+        measured_native_evidence: context.measured_native_evidence,
+    })
+}
+
 fn run_child<T>(
     root: &EvidenceRoot,
     operation: impl FnOnce(&V2StoreChild) -> Result<T>,
@@ -101,7 +153,7 @@ struct SourceSite {
     id: FaultId,
     name: &'static str,
     descriptor: FaultDescriptor,
-    crash_deferred_to_g2: bool,
+    crash_registered_for_g2: bool,
     invoke: SiteInvoke,
 }
 
@@ -147,7 +199,8 @@ struct FlowWitness {
 }
 
 struct V2Io<'a> {
-    child: &'a V2StoreChild,
+    path: &'a Path,
+    crash_ready: Option<&'a supervisor::WorkerReady>,
     occurrences: BTreeMap<FaultId, u32>,
     adopted: bool,
     inspection_published: bool,
@@ -160,7 +213,25 @@ impl<'a> V2Io<'a> {
             return Err(EvidenceError::UnsafeInventory);
         }
         Ok(Self {
-            child,
+            path: child.path(),
+            crash_ready: None,
+            occurrences: BTreeMap::new(),
+            adopted: false,
+            inspection_published: false,
+            opened_lock: None,
+        })
+    }
+
+    fn new_worker(
+        target: &'a supervisor::ChildWorkerTarget,
+        ready: &'a supervisor::WorkerReady,
+    ) -> Result<Self> {
+        if !target.path().is_dir() {
+            return Err(EvidenceError::UnsafeInventory);
+        }
+        Ok(Self {
+            path: target.path(),
+            crash_ready: Some(ready),
             occurrences: BTreeMap::new(),
             adopted: false,
             inspection_published: false,
@@ -197,7 +268,9 @@ impl<'a> V2Io<'a> {
             .filter(|selected| selected.id == site.id && selected.occurrence.get() == *occurrence);
         if let Some(selected) = selected {
             if selected.mode == FaultMode::ChildCrashAfterSuccess {
-                return Err(EvidenceError::Replan);
+                let ready = self.crash_ready.ok_or(EvidenceError::Replan)?;
+                self.execute_success(site)?;
+                return ready.publish_and_block(site.id);
             }
             if selected.mode == FaultMode::PreOperationError {
                 return Ok(SiteResult::Injected {
@@ -219,11 +292,11 @@ impl<'a> V2Io<'a> {
         let path = self.site_path(site, occurrence);
         match site.descriptor.operation {
             Operation::DirectoryOpen => {
-                File::open(self.child.path()).map_err(|_| EvidenceError::Io)?;
+                File::open(self.path).map_err(|_| EvidenceError::Io)?;
             }
             Operation::DirectoryRead => {
                 let mut count = 0_usize;
-                for entry in fs::read_dir(self.child.path()).map_err(|_| EvidenceError::Io)? {
+                for entry in fs::read_dir(self.path).map_err(|_| EvidenceError::Io)? {
                     entry.map_err(|_| EvidenceError::Io)?;
                     count = count.checked_add(1).ok_or(EvidenceError::Bounds)?;
                     if count > inventory::MAX_V2_INVENTORY_ENTRIES {
@@ -264,7 +337,7 @@ impl<'a> V2Io<'a> {
             }
             Operation::Synchronize => {
                 let sync_path = if site.descriptor.artifact == Artifact::RootInventory {
-                    self.child.path().to_path_buf()
+                    self.path.to_path_buf()
                 } else {
                     path
                 };
@@ -284,7 +357,7 @@ impl<'a> V2Io<'a> {
             }
             Operation::InspectionPublish => {
                 if !self.adopted {
-                    require_exact_fixture(&self.child.path().join("manifest-v2-slot-1.och"))?;
+                    require_exact_fixture(&self.path.join("manifest-v2-slot-1.och"))?;
                     self.adopted = true;
                 }
                 self.inspection_published = true;
@@ -352,7 +425,7 @@ impl<'a> V2Io<'a> {
 
     fn complete_validation(&self, site: SourceSite, path: &Path) -> Result<()> {
         if site.descriptor.artifact == Artifact::RootInventory {
-            let _ = fingerprint(self.child)?;
+            let _ = fingerprint_path(self.path)?;
             return Ok(());
         }
         if is_optional_probe(site.id) && !path.exists() {
@@ -376,18 +449,18 @@ impl<'a> V2Io<'a> {
     }
 
     fn relation_validation(&self, site: SourceSite) -> Result<()> {
-        if !self.child.path().join("store-format-v2.och").is_file() {
+        if !self.path.join("store-format-v2.och").is_file() {
             return Err(EvidenceError::InvalidHarness);
         }
         match site.descriptor.artifact {
             Artifact::CatalogFinal => {
-                require_exact_fixture(&self.child.path().join("generation-catalog-v2-slot-1.och"))
+                require_exact_fixture(&self.path.join("generation-catalog-v2-slot-1.och"))
             }
             Artifact::ManifestFinal => {
-                require_exact_fixture(&self.child.path().join("manifest-v2-slot-1.och"))
+                require_exact_fixture(&self.path.join("manifest-v2-slot-1.och"))
             }
             Artifact::StoreAuthority if self.inspection_published || self.adopted => {
-                require_exact_fixture(&self.child.path().join("manifest-v2-slot-1.och"))
+                require_exact_fixture(&self.path.join("manifest-v2-slot-1.och"))
             }
             Artifact::StoreAuthority => Ok(()),
             _ => require_exact_fixture(&self.site_path(site, 1)),
@@ -396,21 +469,16 @@ impl<'a> V2Io<'a> {
 
     fn rename_source(&self, site: SourceSite) -> Result<PathBuf> {
         match site.descriptor.artifact {
-            Artifact::RawFinal => Ok(self.child.path().join("sealed-journal-v1.staging")),
-            Artifact::SegmentFinal => Ok(self.child.path().join("native-segment-v1.staging")),
-            Artifact::CatalogFinal => Ok(self.child.path().join("generation-catalog-v2.staging")),
-            Artifact::ManifestFinal => Ok(self.child.path().join("manifest-v2.staging")),
+            Artifact::RawFinal => Ok(self.path.join("sealed-journal-v1.staging")),
+            Artifact::SegmentFinal => Ok(self.path.join("native-segment-v1.staging")),
+            Artifact::CatalogFinal => Ok(self.path.join("generation-catalog-v2.staging")),
+            Artifact::ManifestFinal => Ok(self.path.join("manifest-v2.staging")),
             _ => Err(EvidenceError::InvalidHarness),
         }
     }
 
     fn site_path(&self, site: SourceSite, occurrence: u32) -> PathBuf {
-        artifact_path(
-            self.child.path(),
-            site.id,
-            site.descriptor.artifact,
-            occurrence,
-        )
+        artifact_path(self.path, site.id, site.descriptor.artifact, occurrence)
     }
 }
 
@@ -422,7 +490,7 @@ fn source_sites() -> Vec<SourceSite> {
             id,
             name: id.source_symbol(),
             descriptor: id.descriptor(),
-            crash_deferred_to_g2: true,
+            crash_registered_for_g2: true,
             invoke: id.source_invoke(),
         })
         .collect()
@@ -452,7 +520,10 @@ fn classify(child: &V2StoreChild) -> Result<inventory::InventoryClass> {
 }
 
 fn fingerprint(child: &V2StoreChild) -> Result<InventoryFingerprint> {
-    let directory = child.path();
+    fingerprint_path(child.path())
+}
+
+fn fingerprint_path(directory: &Path) -> Result<InventoryFingerprint> {
     let mut artifacts = Vec::new();
     artifacts
         .try_reserve_exact(inventory::MAX_V2_INVENTORY_ENTRIES)
@@ -512,7 +583,7 @@ fn validate_site(site: SourceSite) -> Result<()> {
     let descriptor = site.id.descriptor();
     if site.name != site.id.source_symbol()
         || site.descriptor != descriptor
-        || !site.crash_deferred_to_g2
+        || !site.crash_registered_for_g2
         || !std::ptr::fn_addr_eq(site.invoke, site.id.source_invoke())
         || descriptor.id != site.id
         || descriptor.maximum_occurrence == 0
@@ -721,7 +792,7 @@ fn source_site_unchecked(id: FaultId) -> SourceSite {
         id,
         name: id.source_symbol(),
         descriptor: id.descriptor(),
-        crash_deferred_to_g2: true,
+        crash_registered_for_g2: true,
         invoke: id.source_invoke(),
     }
 }
@@ -742,21 +813,26 @@ fn prepare_prior(root: &Path, rollback_derivatives: bool) -> Result<()> {
         write_file(&root.join(name), SITE_PAYLOAD)?;
     }
     if rollback_derivatives {
-        for name in [
-            "journal-rotation-v2.intent",
-            "sealed-journal-v1.staging",
-            "sealed-journal-v1-g00000000000000000002.och",
-            "native-segment-v1.staging",
-            "native-segment-v1-g00000000000000000002.och",
-            "active-journal-v1-g00000000000000000002.och",
-            "active-journal-v1-g00000000000000000002.checkpoint",
-            "generation-catalog-v2.staging",
-            "generation-catalog-v2-slot-1.och",
-            "manifest-v2.staging",
-            "manifest-v2-slot-1.och",
-        ] {
-            write_file(&root.join(name), SITE_PAYLOAD)?;
-        }
+        prepare_rollback_derivatives(root)?;
+    }
+    Ok(())
+}
+
+fn prepare_rollback_derivatives(root: &Path) -> Result<()> {
+    for name in [
+        "journal-rotation-v2.intent",
+        "sealed-journal-v1.staging",
+        "sealed-journal-v1-g00000000000000000002.och",
+        "native-segment-v1.staging",
+        "native-segment-v1-g00000000000000000002.och",
+        "active-journal-v1-g00000000000000000002.och",
+        "active-journal-v1-g00000000000000000002.checkpoint",
+        "generation-catalog-v2.staging",
+        "generation-catalog-v2-slot-1.och",
+        "manifest-v2.staging",
+        "manifest-v2-slot-1.och",
+    ] {
+        write_file(&root.join(name), SITE_PAYLOAD)?;
     }
     Ok(())
 }
@@ -1204,7 +1280,7 @@ mod tests {
         assert_eq!(sites.len(), FaultId::ALL.len());
         for site in sites {
             assert_eq!(site.descriptor, site.id.descriptor());
-            assert!(site.crash_deferred_to_g2);
+            assert!(site.crash_registered_for_g2);
         }
     }
 

@@ -30,7 +30,7 @@ pub(super) fn run_foundation(child: &V2StoreChild) -> Result<FoundationSummary> 
         source_site_count,
         site_executions,
         flow_count,
-        deferred_crash_obligations: source_site_count,
+        registered_g2_crash_targets: source_site_count,
     })
 }
 
@@ -74,7 +74,7 @@ mod tests {
         assert_eq!(witness.source_site_count, 173);
         assert_eq!(witness.site_executions, 487);
         assert_eq!(witness.flow_count, 5);
-        assert_eq!(witness.deferred_crash_obligations, 173);
+        assert_eq!(witness.registered_g2_crash_targets, 173);
         assert_eq!(
             fs::read_dir(temp.0.join("evidence/cases"))
                 .expect("read reclaimed cases")

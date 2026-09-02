@@ -74,7 +74,7 @@ fn private_foundation_command_executes_closure_and_emits_no_report_or_collection
 }
 
 #[test]
-fn deferred_g2_commands_and_hidden_child_are_absent() {
+fn unsupported_or_malformed_private_commands_refuse() {
     for command in [
         "native-run",
         "native-validate",

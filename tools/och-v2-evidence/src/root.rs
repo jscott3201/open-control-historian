@@ -23,7 +23,25 @@ pub(crate) struct FoundationSummary {
     pub(crate) source_site_count: usize,
     pub(crate) site_executions: usize,
     pub(crate) flow_count: usize,
-    pub(crate) deferred_crash_obligations: usize,
+    pub(crate) registered_g2_crash_targets: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HarnessSummary {
+    pub(crate) schema: &'static str,
+    pub(crate) classification: &'static str,
+    pub(crate) descriptor_count: usize,
+    pub(crate) crash_target_count: usize,
+    pub(crate) matrix_rows: usize,
+    pub(crate) timing_rows: usize,
+    pub(crate) timing_summary_rows: usize,
+    pub(crate) resource_rows: usize,
+    pub(crate) registry_rows: usize,
+    pub(crate) fault_result_rows: usize,
+    pub(crate) bundle_files: usize,
+    pub(crate) bundle_bytes: usize,
+    pub(crate) collection_authorized: bool,
+    pub(crate) measured_native_evidence: bool,
 }
 
 impl EvidenceRoot {
@@ -67,6 +85,11 @@ impl EvidenceRoot {
     pub(crate) fn run_v2_foundation(&self) -> Result<FoundationSummary> {
         self.foundation_layout()?;
         v2_io::run_foundation(self)
+    }
+
+    pub(crate) fn run_v2_harness(&self) -> Result<HarnessSummary> {
+        self.foundation_layout()?;
+        v2_io::run_harness(self)
     }
 
     pub(crate) fn run_v1_success_smoke(&self) -> Result<()> {
@@ -145,6 +168,10 @@ impl EvidenceRoot {
         }
         Ok(true)
     }
+}
+
+pub(crate) fn hidden_child_command(arguments: &[String]) -> Result<()> {
+    v2_io::hidden_child_command(arguments)
 }
 
 fn validate_case(case: &str) -> Result<()> {
@@ -373,6 +400,7 @@ mod tests {
         let mut expected = vec![
             ("EvidenceRoot", "artifact_partials_absent", "Result<bool>"),
             ("EvidenceRoot", "ensure_layout", "Result<()>"),
+            ("EvidenceRoot", "hidden_child_command", "Result<()>"),
             ("EvidenceRoot", "open", "Result<Self>"),
             ("EvidenceRoot", "pr03c_case", "Result<Pr03cCase>"),
             ("EvidenceRoot", "pr03c_set", "Result<Pr03cSet>"),
@@ -384,6 +412,7 @@ mod tests {
                 "run_v2_foundation",
                 "Result<FoundationSummary>",
             ),
+            ("EvidenceRoot", "run_v2_harness", "Result<HarnessSummary>"),
             ("Pr03cIo", "create_raw_partial", "Result<File>"),
             ("Pr03cIo", "create_segment_partial", "Result<File>"),
             ("Pr03cIo", "open", "Result<File>"),

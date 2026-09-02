@@ -16,8 +16,10 @@ V2 executor foundation consuming that seam. Its opaque child capability and
 compiled literal registry are finite current-revision Rust privacy/source-review
 evidence, not a universal or future-source filesystem-I/O proof. It does not
 authorize collection.
-M03-PR03g2 must separately complete collection/report/supervisor infrastructure
-before any collection authorization. Every row in the
+M03-PR03g2 now supplies the separately reviewed structural report/supervisor
+infrastructure and a non-authorizing structural bundle. Its reserved collection
+command fails closed before root creation; no measured collector or acceptance
+context exists. Every row in the
 [M03-PR03b future evidence matrix](#pr03b-evidence-crosswalk)
 remains `UNSATISFIED` until the complete acceptance-candidate measurements and
 fault results exist and the evidence returns through the authority progression
@@ -115,10 +117,12 @@ public opener, decoder, migration, compatibility promise, durable publication
 authority, runtime path, or supported command. V2 fixture bytes are not current
 store bytes and must never be placed in or beside a real V1 store.
 
-Only completed M03-PR03g2 harness review may authorize measured evidence
-collection. The g1 executor foundation does not. A later product
-implementation must run this complete matrix against the actual production call
-path; a harness-only pass cannot be carried forward as product proof.
+Only acceptance of the completed M03-PR03g2 harness review may authorize a
+separate complete measured-collector implementation and later collection. The g1
+executor foundation, g2 structural PASS, and g2 fail-closed command do not. A
+later product implementation must run this complete matrix against the actual
+production call path; a harness-only pass cannot be carried forward as product
+proof.
 
 ## Future V2 transaction state machine
 
@@ -743,10 +747,12 @@ distinct records. No row may cite PR03d as native proof.
    capability subtree. This is finite reviewed-revision evidence, not a universal
    Rust I/O-source proof. It adds no report, collector, all-boundary crash campaign,
    or collection authorization; all crosswalk rows remain `UNSATISFIED`.
-4. **M03-PR03g2 complete harness infrastructure:** must add the closed matrix,
-   nonempty timing/fault reports, every-boundary parent-owned crash/reopen campaign,
-   sanitization, and collection entry point. Only g2 acceptance may authorize
-   collection.
+4. **M03-PR03g2 complete harness infrastructure:** supplies the closed matrix,
+   nonempty bounded structural timing/fault reports, every-boundary parent-owned
+   crash/reopen campaign, sanitization, and a reserved collection command that
+   fails before root creation until a complete measured collector is accepted. Its
+   `STRUCTURAL_SYNTHETIC` PASS satisfies no M row. Only g2 acceptance may authorize
+   later collection.
 5. **Measured native evidence:** the complete Linux x86_64 acceptance-candidate
    bundle is collected from a clean reviewed harness/measured SHA on the approved
    AgentBox. Darwin evidence remains exploratory. No SLO or budget is inferred.
