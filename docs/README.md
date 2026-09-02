@@ -70,7 +70,7 @@ retention, or reclamation state.
   [`docs/evidence/m03-pr03d-linux-x86_64/`](evidence/m03-pr03d-linux-x86_64/).
   None of it proves native writer, open, runtime, or production behavior.
 - [M03-PR03e native execution-evidence plan](m03-pr03e-native-execution-evidence-plan.md)
-  remains the review plan for a later private harness and report.
+  governs the completed private structural harness and later measured report.
 - [M03-PR03f native evidence instrumentation](implementation-brief-m03-pr03f.md)
   is the disabled-by-default current-V1 native prerequisite.
 - [M03-PR03g1 private executor foundation](implementation-brief-m03-pr03g1.md)
@@ -80,6 +80,11 @@ retention, or reclamation state.
   arbitrary or future filesystem I/O. It emits no
   report and does not authorize collection; all M01-M11 rows remain
   `UNSATISFIED` and all native limits remain `UNKNOWN`.
+- [M03-PR03g2 complete private harness](implementation-brief-m03-pr03g2.md)
+  closes the structural matrix, bounded synthetic report, and 173-target
+  parent-owned crash campaign. Its reserved collection command fails before root
+  creation and cannot mint acceptance evidence; all
+  M01-M11 rows remain `UNSATISFIED` and all native limits remain `UNKNOWN`.
 
 ## Historical delivery records
 
@@ -150,6 +155,8 @@ a historical record says otherwise.
   and [continuation](continuation-m03-pr03f.md)
 - **M03-PR03g1:** [private executor-foundation brief](implementation-brief-m03-pr03g1.md)
   and [continuation](continuation-m03-pr03g1.md)
+- **M03-PR03g2:** [complete private harness brief](implementation-brief-m03-pr03g2.md)
+  and [continuation](continuation-m03-pr03g2.md)
 
 ## Future Store Format V2 review material
 
@@ -166,9 +173,11 @@ a historical record says otherwise.
 - [M03-PR03e private-harness/evidence plan](m03-pr03e-native-execution-evidence-plan.md)
 - [M03-PR03f native evidence-instrumentation prerequisite](implementation-brief-m03-pr03f.md)
 - [M03-PR03g1 private executor-foundation boundary](implementation-brief-m03-pr03g1.md)
+- [M03-PR03g2 complete private harness boundary](implementation-brief-m03-pr03g2.md)
 
 The PR03c tooling target and PR03d standalone Linux x86_64 measurements do not set
 a native workspace threshold. PR03f supplies current-V1 instrumentation and
-PR03g1 supplies only its private executor foundation. M03-PR03g2, later measured
-native results, and a fresh owner checkpoint remain prerequisites for any separately
-reviewed V2 product proposal.
+PR03g1 supplies only its private executor foundation and PR03g2 supplies only the
+complete private structural harness plus a reserved fail-closed collection
+command. A separately accepted collector, measured native results, and a fresh
+owner checkpoint remain prerequisites for any V2 product proposal.

@@ -1,6 +1,7 @@
 use crate::error::{EvidenceError, Result};
 use crate::model::valid_case_name;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 mod pr03c_io;
@@ -23,7 +24,25 @@ pub(crate) struct FoundationSummary {
     pub(crate) source_site_count: usize,
     pub(crate) site_executions: usize,
     pub(crate) flow_count: usize,
-    pub(crate) deferred_crash_obligations: usize,
+    pub(crate) registered_g2_crash_targets: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HarnessSummary {
+    pub(crate) schema: &'static str,
+    pub(crate) classification: &'static str,
+    pub(crate) descriptor_count: usize,
+    pub(crate) crash_target_count: usize,
+    pub(crate) matrix_rows: usize,
+    pub(crate) timing_rows: usize,
+    pub(crate) timing_summary_rows: usize,
+    pub(crate) resource_rows: usize,
+    pub(crate) registry_rows: usize,
+    pub(crate) fault_result_rows: usize,
+    pub(crate) bundle_files: usize,
+    pub(crate) bundle_bytes: usize,
+    pub(crate) collection_authorized: bool,
+    pub(crate) measured_native_evidence: bool,
 }
 
 impl EvidenceRoot {
@@ -69,6 +88,11 @@ impl EvidenceRoot {
         v2_io::run_foundation(self)
     }
 
+    pub(crate) fn run_v2_harness(&self) -> Result<HarnessSummary> {
+        self.foundation_layout()?;
+        v2_io::run_harness(self)
+    }
+
     pub(crate) fn run_v1_success_smoke(&self) -> Result<()> {
         self.foundation_layout()?;
         v1_smoke::run_success(self)
@@ -87,10 +111,37 @@ impl EvidenceRoot {
         self.validate_parent_inventory()?;
         self.validate_cases_empty()?;
         for name in ["cases", "control"] {
-            fs::create_dir_all(self.path.join(name)).map_err(|_| EvidenceError::Io)?;
+            self.create_or_validate_direct_directory(name)?;
         }
         self.validate_parent_inventory()?;
         self.validate_cases_empty()
+    }
+
+    fn create_or_validate_direct_directory(&self, name: &str) -> Result<PathBuf> {
+        let path = self.path.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => self.direct_directory(name),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                fs::create_dir(&path).map_err(|_| EvidenceError::Io)?;
+                self.direct_directory(name)
+            }
+            Err(_) => Err(EvidenceError::Io),
+        }
+    }
+
+    fn direct_directory(&self, name: &str) -> Result<PathBuf> {
+        if !matches!(name, "cases" | "control") {
+            return Err(EvidenceError::InvalidHarness);
+        }
+        validate_real_directory(&self.path)?;
+        let path = self.path.join(name);
+        validate_real_directory(&path)?;
+        let canonical = fs::canonicalize(&path).map_err(|_| EvidenceError::Io)?;
+        if canonical != path || canonical.parent() != Some(self.path.as_path()) {
+            return Err(EvidenceError::UnsafeInventory);
+        }
+        validate_real_directory(&path)?;
+        Ok(path)
     }
 
     fn validate_parent_inventory(&self) -> Result<()> {
@@ -116,9 +167,12 @@ impl EvidenceRoot {
 
     fn validate_cases_empty(&self) -> Result<()> {
         let cases = self.path.join("cases");
-        if !cases.exists() {
-            return Ok(());
+        match fs::symlink_metadata(&cases) {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(EvidenceError::Io),
+            Ok(_) => {}
         }
+        let cases = self.direct_directory("cases")?;
         let mut entries = fs::read_dir(cases).map_err(|_| EvidenceError::UnsafeInventory)?;
         if entries
             .next()
@@ -145,6 +199,18 @@ impl EvidenceRoot {
         }
         Ok(true)
     }
+}
+
+fn validate_real_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| EvidenceError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(EvidenceError::UnsafeInventory);
+    }
+    Ok(())
+}
+
+pub(crate) fn hidden_child_command(arguments: &[String]) -> Result<()> {
+    v2_io::hidden_child_command(arguments)
 }
 
 fn validate_case(case: &str) -> Result<()> {
@@ -363,6 +429,74 @@ mod tests {
     }
 
     #[test]
+    fn direct_layout_rejects_replaced_non_directories_without_mutating_them() {
+        for name in ["cases", "control"] {
+            let parent = std::env::temp_dir().join(format!(
+                "och-v2-evidence-direct-file-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&parent);
+            fs::create_dir(&parent).expect("create replacement parent");
+            let evidence = parent.join("evidence");
+            let root = EvidenceRoot::prepare(&evidence).expect("prepare evidence root");
+            fs::create_dir(evidence.join("cases")).expect("create cases");
+            fs::create_dir(evidence.join("control")).expect("create control");
+            fs::remove_dir(evidence.join(name)).expect("remove replaced directory");
+            fs::write(evidence.join(name), b"outside-owned replacement")
+                .expect("write replacement file");
+            assert!(matches!(
+                root.foundation_layout(),
+                Err(EvidenceError::UnsafeInventory)
+            ));
+            assert_eq!(
+                fs::read(evidence.join(name)).expect("read unchanged replacement"),
+                b"outside-owned replacement"
+            );
+            fs::remove_dir_all(parent).expect("remove replacement parent");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_layout_rejects_cases_and_control_symlinks_without_touching_external_targets() {
+        use std::os::unix::fs::symlink;
+
+        for name in ["cases", "control"] {
+            let parent = std::env::temp_dir().join(format!(
+                "och-v2-evidence-direct-symlink-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&parent);
+            fs::create_dir(&parent).expect("create symlink parent");
+            let evidence = parent.join("evidence");
+            let external = parent.join("external");
+            fs::create_dir(&external).expect("create external directory");
+            fs::write(external.join("sentinel"), b"unchanged").expect("write external sentinel");
+            let root = EvidenceRoot::prepare(&evidence).expect("prepare evidence root");
+            fs::create_dir(evidence.join(if name == "cases" { "control" } else { "cases" }))
+                .expect("create other direct directory");
+            symlink(&external, evidence.join(name)).expect("create hostile directory symlink");
+            assert!(matches!(
+                root.foundation_layout(),
+                Err(EvidenceError::UnsafeInventory)
+            ));
+            assert_eq!(
+                fs::read(external.join("sentinel")).expect("read external sentinel"),
+                b"unchanged"
+            );
+            assert_eq!(
+                fs::read_dir(&external)
+                    .expect("read external directory")
+                    .count(),
+                1
+            );
+            fs::remove_dir_all(parent).expect("remove symlink parent");
+        }
+    }
+
+    #[test]
     fn reviewed_root_api_inventory_has_no_path_projection_or_extraction_trait() {
         let root_source = include_str!("root.rs");
         let pr03c_source = include_str!("root/pr03c_io.rs");
@@ -373,6 +507,7 @@ mod tests {
         let mut expected = vec![
             ("EvidenceRoot", "artifact_partials_absent", "Result<bool>"),
             ("EvidenceRoot", "ensure_layout", "Result<()>"),
+            ("EvidenceRoot", "hidden_child_command", "Result<()>"),
             ("EvidenceRoot", "open", "Result<Self>"),
             ("EvidenceRoot", "pr03c_case", "Result<Pr03cCase>"),
             ("EvidenceRoot", "pr03c_set", "Result<Pr03cSet>"),
@@ -384,6 +519,7 @@ mod tests {
                 "run_v2_foundation",
                 "Result<FoundationSummary>",
             ),
+            ("EvidenceRoot", "run_v2_harness", "Result<HarnessSummary>"),
             ("Pr03cIo", "create_raw_partial", "Result<File>"),
             ("Pr03cIo", "create_segment_partial", "Result<File>"),
             ("Pr03cIo", "open", "Result<File>"),

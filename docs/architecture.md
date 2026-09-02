@@ -52,9 +52,10 @@ actual current-V1 source seams. It adds no harness, V2 source site, report,
 measurement, or product authority. M03-PR03g1 extends the existing private
 `och-v2-evidence` package only with a capability-contained disposable V2 executor
 foundation, primitive/SHA-256 oracles, and narrow current-V1 success/pressure seam
-smoke. M03-PR03g2 still owns complete matrix/report/collector/supervisor work. g1
-does not authorize collection; every PR03e row remains unsatisfied and V2 remains
-unimplemented.
+smoke. M03-PR03g2 adds only the complete private closed structural matrix,
+bounded synthetic bundle, every-target parent crash/reap/reopen supervisor, and
+reserved fail-closed collection command. No measured collector or bundle exists; every
+PR03e row remains unsatisfied and V2 remains unimplemented.
 Manifest V1 and Generation Catalog V1 bind immutable raw-Journal generations while the
 same global append sequence continues in deterministic successor active journals:
 
@@ -273,7 +274,12 @@ current-source API inventory checks that topology without reviving the removed
 broad scanner. The compiled registry proves the current 173 literal
 ID/metadata/generated-wrapper bijection. This is finite current-revision Rust
 privacy/source-review evidence, not a universal or future-source filesystem-I/O
-claim. It adds no process supervisor, collector, or report bundle.
+claim. M03-PR03g2 retains that containment while adding the private supervisor,
+closed matrix/report validator, bounded synthetic bundle writer, and reserved
+fail-closed collection command. The supervisor resumes descriptor-successor
+convergence from the immediate killed-child inventory rather than rebuilding it.
+The child worker has no cleanup ownership; parent-only control and reports remain
+out-of-band. No g2 structural result is measured authority.
 Fixture V2 bytes exist only under disposable children and are not accepted product
 bytes. Foundation passes and standalone observations establish no native
 writer/open threshold, budget, SLO, or PR03e crosswalk satisfaction.
@@ -468,4 +474,6 @@ The executable native evidence plan and its still-unsatisfied matrix are recorde
 by [M03-PR03e](continuation-m03-pr03e.md); the separate current-V1-only native
 instrumentation prerequisite is recorded by
 [M03-PR03f](continuation-m03-pr03f.md). The capability-contained executor foundation and
-g2 handoff are recorded by [M03-PR03g1](continuation-m03-pr03g1.md).
+g2 handoff are recorded by [M03-PR03g1](continuation-m03-pr03g1.md). The complete
+private structural harness and measured-evidence handoff are recorded by
+[M03-PR03g2](continuation-m03-pr03g2.md).

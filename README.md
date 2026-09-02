@@ -43,10 +43,11 @@ unimplemented review contract.
 > barriers for possible future work. M03-PR03f adds only a disabled-by-default,
 > rustdoc-hidden current-V1 instrumentation prerequisite. M03-PR03g1 adds only a
 > private capability-contained disposable V2 executor foundation with a compiled
-> 173-site registry. This is finite current-revision evidence, not a universal or
-> future-source filesystem-I/O proof. The later g2 still owns
-> complete reports, collection infrastructure, and crash orchestration; g1 does
-> not authorize collection. Every PR03e crosswalk row remains unsatisfied and all native thresholds remain unknown. Current product code
+> 173-site registry. M03-PR03g2 adds the private closed structural matrix, bounded
+> synthetic report bundle, every-target parent crash/reap/reopen campaign, and a
+> reserved collection command that fails closed before root creation. This is finite current-revision evidence,
+> not a universal or future-source filesystem-I/O proof. No measured Linux bundle
+> was collected; every PR03e crosswalk row remains unsatisfied and all native thresholds remain unknown. Current product code
 > neither accepts nor emits V2 bytes and does not publish Native Segments.
 
 Durability claims are limited to the documented Store Format V1 process,
@@ -84,7 +85,7 @@ the exact development and validation workflow.
 | [`och-store`](crates/och-store/) | native, default member | Store Format V1 persistence/recovery and offline Native Segment V1 candidate/query |
 | [`och-runtime`](crates/och-runtime/) | native, default member | Bounded store-scoped ingress, sole-writer ordering, receipts, and volatile latest observations |
 | [`och-policy`](tools/och-policy/) | private tooling | Repository dependency-policy validation outside the native product closure |
-| [`och-v2-evidence`](tools/och-v2-evidence/) | private tooling | Standalone stream prototype plus unsupported M03-PR03g1 disposable executor foundation outside default members; not a user or product CLI |
+| [`och-v2-evidence`](tools/och-v2-evidence/) | private tooling | Standalone stream prototype plus unsupported M03-PR03g1/g2 disposable executor and structural harness outside default members; not a user or product CLI |
 
 The current product dependency direction is `och-runtime -> och-store ->
 och-core`, while runtime also depends directly on core for canonical types.
