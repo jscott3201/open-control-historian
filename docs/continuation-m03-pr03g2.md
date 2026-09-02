@@ -14,11 +14,14 @@ one parent cleanup attempt. The spawned process has a non-cleaning worker view;
 enters a store child, and successful runs leave only the intended validated
 structural bundle.
 
-Bounded lifecycle handling now carries every observe/kill error through wait/reap;
-unproven reap returns `REPLAN` without parent cleanup under the possibly live
-child. Hidden-child startup independently rejects non-direct, non-directory, or
-symlinked `cases`, `control`, selected-child, request, and ready layouts before
-worker mutation. The structural report replacement keeps a valid prior while it
+Bounded lifecycle handling now carries every observe/kill error through wait/reap.
+After proven reap, any termination error invalidates structural evidence before
+fingerprinting, convergence, witness construction, or report publication; only a
+successful observation with zero termination errors may continue. Unproven reap
+returns `REPLAN` without parent cleanup under the possibly live child. Hidden-child
+startup independently rejects non-direct, non-directory, or symlinked `cases`,
+`control`, selected-child, request, and ready layouts before worker mutation. The
+structural report replacement keeps a valid prior while it
 syncs and validates staging, synchronizes every authority rename/removal, rolls
 handled failures back, and reconciles only unambiguous interrupted states.
 

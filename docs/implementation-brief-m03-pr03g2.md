@@ -80,7 +80,10 @@ The parent and child never combine monotonic clocks and no killed-child stop eve
 is fabricated. Operation errors retain precedence over cleanup errors; successful
 operation plus cleanup failure returns the cleanup failure. Once spawned, a child
 failure still enters bounded termination and reap before the parent's one cleanup
-attempt. Kill/observe errors do not bypass bounded wait/reap; a child whose reap
+attempt. After proven reap, any termination error invalidates structural evidence
+before immediate fingerprinting, convergence, witness construction, or report
+publication; only a successful observation with zero termination errors may
+continue. Kill/observe errors do not bypass bounded wait/reap; a child whose reap
 cannot be proved returns `REPLAN` while retaining its private subtree rather than
 cleaning beneath a possibly live process. The hidden child independently checks
 that `cases`, `control`, its selected store child, and request/ready entries are

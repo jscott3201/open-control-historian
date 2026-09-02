@@ -164,10 +164,7 @@ fn run_target(
         reaped = false;
         let supervision = supervise_worker(&mut process, &ready, &token, id)?;
         reaped = true;
-        if supervision.termination_errors > REAP_WAIT_POLLS + WAIT_RETRIES {
-            return Err(EvidenceError::InvalidHarness);
-        }
-        supervision.observation?;
+        validate_supervision_outcome(&supervision)?;
         child.revalidate()?;
         let immediate = fingerprint(&child)?;
         if classify(&child)? != InventoryClass::ReviewedV2 {
@@ -342,6 +339,13 @@ fn spawn_worker(root: &EvidenceRoot, token: &str, id: FaultId) -> Result<Child> 
 struct SupervisionOutcome {
     observation: Result<()>,
     termination_errors: usize,
+}
+
+fn validate_supervision_outcome(outcome: &SupervisionOutcome) -> Result<()> {
+    if outcome.termination_errors != 0 {
+        return Err(EvidenceError::InvalidHarness);
+    }
+    outcome.observation
 }
 
 fn supervise_worker(
@@ -1105,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_model_reaps_ready_timeout_parse_and_early_exit_paths() {
+    fn zero_error_supervision_accepts_success_and_preserves_observation_errors() {
         for (observation, expected) in [
             (Ok(()), 0_u8),
             (Err(EvidenceError::Bounds), 1),
@@ -1116,13 +1120,11 @@ mod tests {
                 .expect("running model must be killed and reaped");
             child.assert_reaped();
             assert_eq!(outcome.termination_errors, 0);
+            let acceptance = validate_supervision_outcome(&outcome);
             match expected {
-                0 => assert!(outcome.observation.is_ok()),
-                1 => assert!(matches!(outcome.observation, Err(EvidenceError::Bounds))),
-                2 => assert!(matches!(
-                    outcome.observation,
-                    Err(EvidenceError::InvalidHarness)
-                )),
+                0 => assert!(acceptance.is_ok()),
+                1 => assert!(matches!(acceptance, Err(EvidenceError::Bounds))),
+                2 => assert!(matches!(acceptance, Err(EvidenceError::InvalidHarness))),
                 _ => unreachable!(),
             }
         }
@@ -1132,13 +1134,13 @@ mod tests {
             .expect("already-exited model must still be waited");
         exited.assert_reaped();
         assert!(matches!(
-            outcome.observation,
+            validate_supervision_outcome(&outcome),
             Err(EvidenceError::InvalidHarness)
         ));
     }
 
     #[test]
-    fn lifecycle_model_captures_kill_race_and_wait_retry_before_reap() {
+    fn proven_reap_rejects_kill_race_and_wait_retry_errors() {
         let mut kill_race = LifecycleModel::running();
         kill_race.kill_errors = 1;
         kill_race.exit_during_kill_error = true;
@@ -1146,6 +1148,10 @@ mod tests {
             finish_supervision(&mut kill_race, Ok(())).expect("kill race must proceed to wait");
         kill_race.assert_reaped();
         assert_eq!(outcome.termination_errors, 1);
+        assert!(matches!(
+            validate_supervision_outcome(&outcome),
+            Err(EvidenceError::InvalidHarness)
+        ));
 
         let mut wait_retry = LifecycleModel::running();
         wait_retry.try_wait_errors = 1;
@@ -1154,11 +1160,72 @@ mod tests {
             .expect("wait error must retry through a proven reap");
         wait_retry.assert_reaped();
         assert_eq!(outcome.termination_errors, 2);
-        assert!(matches!(outcome.observation, Err(EvidenceError::Bounds)));
+        assert!(matches!(
+            validate_supervision_outcome(&outcome),
+            Err(EvidenceError::InvalidHarness)
+        ));
     }
 
     #[test]
-    fn lifecycle_model_fails_replan_when_reap_cannot_be_proven() {
+    fn every_nonzero_termination_error_count_blocks_witness_semantics() {
+        for termination_errors in [
+            1,
+            REAP_WAIT_POLLS + WAIT_RETRIES,
+            REAP_WAIT_POLLS + WAIT_RETRIES + 1,
+            usize::MAX,
+        ] {
+            let outcome = SupervisionOutcome {
+                observation: Ok(()),
+                termination_errors,
+            };
+            assert!(matches!(
+                validate_supervision_outcome(&outcome),
+                Err(EvidenceError::InvalidHarness)
+            ));
+        }
+
+        let source = include_str!("supervisor.rs");
+        let run_target = source
+            .split("fn run_target(")
+            .nth(1)
+            .and_then(|value| value.split_once("\nfn validate_witness"))
+            .map(|(body, _)| body)
+            .expect("bounded run_target source region");
+        let after_supervision = run_target
+            .split_once("let supervision = supervise_worker")
+            .map(|(_, body)| body)
+            .expect("supervision call");
+        let after_proven_reap = after_supervision
+            .split_once("reaped = true;")
+            .map(|(_, body)| body)
+            .expect("proven reap marker");
+        assert!(
+            after_proven_reap
+                .trim_start()
+                .starts_with("validate_supervision_outcome(&supervision)?;")
+        );
+        let acceptance = after_proven_reap
+            .find("validate_supervision_outcome(&supervision)?;")
+            .expect("acceptance decision");
+        for successor in [
+            "child.revalidate()?;",
+            "let immediate = fingerprint",
+            "reopen_and_converge",
+            "let witness = CrashWitness",
+        ] {
+            assert!(
+                acceptance
+                    < after_proven_reap
+                        .find(successor)
+                        .expect("witness successor"),
+                "{successor} must follow supervision acceptance"
+            );
+        }
+        assert!(!run_target.contains("termination_errors >"));
+    }
+
+    #[test]
+    fn lifecycle_model_fails_replan_and_retains_custody_when_reap_cannot_be_proven() {
         let mut blocked = LifecycleModel::running();
         blocked.kill_errors = REAP_WAIT_POLLS;
         assert!(matches!(
@@ -1167,6 +1234,36 @@ mod tests {
         ));
         assert_eq!(blocked.state, ModelState::Running);
         assert!(!blocked.reaped);
+
+        let source = include_str!("supervisor.rs");
+        let unreaped_branch = source
+            .split_once("if spawned && !reaped {")
+            .map(|(_, body)| body)
+            .expect("unreaped run_target branch");
+        let retain = unreaped_branch
+            .find("child.retain_after_unreaped_child();")
+            .expect("retained child custody");
+        let replan = unreaped_branch
+            .find("return Err(EvidenceError::Replan);")
+            .expect("unproven-reap result");
+        let cleanup = unreaped_branch
+            .find("let cleanup_result = child.cleanup();")
+            .expect("normal cleanup path");
+        assert!(retain < replan && replan < cleanup);
+
+        let temp = TempHiddenRoot::new();
+        let child_path = temp.root.path.join("cases").join(V2_CHILD_NAME);
+        fs::remove_dir(&child_path).expect("remove hidden-worker fixture child");
+        let mut custody = V2StoreChild::acquire(&temp.root).expect("acquire cleanup-owning child");
+        assert_eq!(custody.path(), child_path);
+        fs::write(custody.path().join("custody-sentinel"), b"retained")
+            .expect("write retained-custody sentinel");
+        custody.retain_after_unreaped_child();
+        drop(custody);
+        assert_eq!(
+            fs::read(child_path.join("custody-sentinel")).expect("read retained-custody sentinel"),
+            b"retained"
+        );
     }
 
     #[test]
