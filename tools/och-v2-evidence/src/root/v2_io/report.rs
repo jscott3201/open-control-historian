@@ -84,42 +84,220 @@ pub(super) fn write_and_validate(
     context: &ReportContext,
     witnesses: &[CrashWitness],
 ) -> Result<ReportSummary> {
+    write_and_validate_with_io(root, context, witnesses, &mut StdReportIo)
+}
+
+trait ReportIo {
+    fn create_dir(&mut self, path: &Path) -> Result<()>;
+    fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<()>;
+    fn sync_file(&mut self, path: &Path) -> Result<()>;
+    fn sync_directory(&mut self, path: &Path) -> Result<()>;
+    fn rename(&mut self, from: &Path, to: &Path) -> Result<()>;
+    fn remove_directory(&mut self, path: &Path) -> Result<()>;
+    fn validate_staging(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn validate_final(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct StdReportIo;
+
+impl ReportIo for StdReportIo {
+    fn create_dir(&mut self, path: &Path) -> Result<()> {
+        fs::create_dir(path).map_err(|_| EvidenceError::Io)
+    }
+
+    fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(|_| EvidenceError::Io)?;
+        file.write_all(bytes).map_err(|_| EvidenceError::Io)
+    }
+
+    fn sync_file(&mut self, path: &Path) -> Result<()> {
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| EvidenceError::Io)
+    }
+
+    fn sync_directory(&mut self, path: &Path) -> Result<()> {
+        File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| EvidenceError::Io)
+    }
+
+    fn rename(&mut self, from: &Path, to: &Path) -> Result<()> {
+        fs::rename(from, to).map_err(|_| EvidenceError::Io)
+    }
+
+    fn remove_directory(&mut self, path: &Path) -> Result<()> {
+        fs::remove_dir_all(path).map_err(|_| EvidenceError::Io)
+    }
+}
+
+fn write_and_validate_with_io(
+    root: &EvidenceRoot,
+    context: &ReportContext,
+    witnesses: &[CrashWitness],
+    io: &mut impl ReportIo,
+) -> Result<ReportSummary> {
     let bundle = build_bundle(context, witnesses)?;
     validate_bundle_bytes(&bundle, context, witnesses)?;
     let reports = prepare_reports(root)?;
     let final_path = reports.join(bundle_name(context.classification));
     let staging = reports.join(format!(".{}.staging", bundle_name(context.classification)));
-    if staging.exists() {
+    let prior = reports.join(format!(".{}.prior", bundle_name(context.classification)));
+    reconcile_report_transaction(
+        &reports,
+        &final_path,
+        &staging,
+        &prior,
+        context,
+        witnesses,
+        io,
+        false,
+    )?;
+    let transaction = publish_report_bundle(
+        &bundle,
+        &reports,
+        &final_path,
+        &staging,
+        &prior,
+        context,
+        witnesses,
+        io,
+    );
+    if let Err(primary) = transaction {
+        if reconcile_report_transaction(
+            &reports,
+            &final_path,
+            &staging,
+            &prior,
+            context,
+            witnesses,
+            io,
+            true,
+        )
+        .is_err()
+        {
+            return Err(EvidenceError::Replan);
+        }
+        return Err(primary);
+    }
+    summary(&bundle)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_report_bundle(
+    bundle: &BTreeMap<String, Vec<u8>>,
+    reports: &Path,
+    final_path: &Path,
+    staging: &Path,
+    prior: &Path,
+    context: &ReportContext,
+    witnesses: &[CrashWitness],
+    io: &mut impl ReportIo,
+) -> Result<()> {
+    io.create_dir(staging)?;
+    io.sync_directory(reports)?;
+    for (name, bytes) in bundle {
+        let path = staging.join(name);
+        io.write_file(&path, bytes)?;
+        io.sync_file(&path)?;
+    }
+    io.sync_directory(staging)?;
+    io.validate_staging()?;
+    validate_bundle_path(staging, context, witnesses)?;
+    if checked_report_directory(final_path)? {
+        rename_and_sync(io, final_path, prior, reports)?;
+    }
+    rename_and_sync(io, staging, final_path, reports)?;
+    io.validate_final()?;
+    validate_bundle_path(final_path, context, witnesses)?;
+    if checked_report_directory(prior)? {
+        remove_and_sync(io, prior, reports)?;
+    }
+    validate_bundle_path(final_path, context, witnesses)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_report_transaction(
+    reports: &Path,
+    final_path: &Path,
+    staging: &Path,
+    prior: &Path,
+    context: &ReportContext,
+    witnesses: &[CrashWitness],
+    io: &mut impl ReportIo,
+    prefer_prior: bool,
+) -> Result<()> {
+    let final_present = checked_report_directory(final_path)?;
+    let staging_present = checked_report_directory(staging)?;
+    let prior_present = checked_report_directory(prior)?;
+    if final_present && staging_present && prior_present {
         return Err(EvidenceError::UnsafeInventory);
     }
-    if final_path.exists() {
-        validate_bundle_path(&final_path, context, witnesses)?;
-        fs::remove_dir_all(&final_path).map_err(|_| EvidenceError::Io)?;
-        File::open(&reports)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| EvidenceError::Io)?;
+    let final_valid = final_present && validate_bundle_path(final_path, context, witnesses).is_ok();
+    let prior_valid = prior_present && validate_bundle_path(prior, context, witnesses).is_ok();
+    if prior_present && !prior_valid {
+        return Err(EvidenceError::UnsafeInventory);
     }
-    fs::create_dir(&staging).map_err(|_| EvidenceError::Io)?;
-    for (name, bytes) in &bundle {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(staging.join(name))
-            .map_err(|_| EvidenceError::Io)?;
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|_| EvidenceError::Io)?;
+    if final_present && !final_valid {
+        if !prior_valid || staging_present {
+            return Err(EvidenceError::UnsafeInventory);
+        }
+        remove_and_sync(io, final_path, reports)?;
+        rename_and_sync(io, prior, final_path, reports)?;
+        validate_bundle_path(final_path, context, witnesses)?;
+        return Ok(());
     }
-    File::open(&staging)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| EvidenceError::Io)?;
-    validate_bundle_path(&staging, context, witnesses)?;
-    fs::rename(&staging, &final_path).map_err(|_| EvidenceError::Io)?;
-    File::open(&reports)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| EvidenceError::Io)?;
-    validate_bundle_path(&final_path, context, witnesses)?;
-    summary(&bundle)
+    match (final_present, staging_present, prior_present) {
+        (true, false, true) if prefer_prior => {
+            remove_and_sync(io, final_path, reports)?;
+            rename_and_sync(io, prior, final_path, reports)?;
+        }
+        (true, false, true) => remove_and_sync(io, prior, reports)?,
+        (false, true, true) => {
+            remove_and_sync(io, staging, reports)?;
+            rename_and_sync(io, prior, final_path, reports)?;
+        }
+        (false, false, true) => rename_and_sync(io, prior, final_path, reports)?,
+        (true | false, true, false) => remove_and_sync(io, staging, reports)?,
+        (true | false, false, false) => {}
+        (true, true, true) => unreachable!(),
+    }
+    if checked_report_directory(final_path)? {
+        validate_bundle_path(final_path, context, witnesses)?;
+    }
+    if checked_report_directory(staging)? || checked_report_directory(prior)? {
+        return Err(EvidenceError::InvalidHarness);
+    }
+    Ok(())
+}
+
+fn checked_report_directory(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(true)
+        }
+        Ok(_) => Err(EvidenceError::UnsafeInventory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(EvidenceError::Io),
+    }
+}
+
+fn rename_and_sync(io: &mut impl ReportIo, from: &Path, to: &Path, parent: &Path) -> Result<()> {
+    io.rename(from, to)?;
+    io.sync_directory(parent)
+}
+
+fn remove_and_sync(io: &mut impl ReportIo, path: &Path, parent: &Path) -> Result<()> {
+    io.remove_directory(path)?;
+    io.sync_directory(parent)
 }
 
 pub(super) fn preflight(context: &ReportContext) -> Result<()> {
@@ -160,8 +338,12 @@ fn prepare_reports(root: &EvidenceRoot) -> Result<PathBuf> {
             .file_name()
             .into_string()
             .map_err(|_| EvidenceError::UnsafeInventory)?;
-        if !entry.file_type().map_err(|_| EvidenceError::Io)?.is_dir() || name != STRUCTURAL_BUNDLE
-        {
+        let allowed = [
+            STRUCTURAL_BUNDLE.to_owned(),
+            format!(".{STRUCTURAL_BUNDLE}.staging"),
+            format!(".{STRUCTURAL_BUNDLE}.prior"),
+        ];
+        if !entry.file_type().map_err(|_| EvidenceError::Io)?.is_dir() || !allowed.contains(&name) {
             return Err(EvidenceError::UnsafeInventory);
         }
     }
@@ -990,6 +1172,143 @@ const fn bool_text(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_REPORT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    struct TempReportRoot {
+        parent: PathBuf,
+        root: EvidenceRoot,
+    }
+
+    impl TempReportRoot {
+        fn new() -> Self {
+            let parent = std::env::temp_dir().join(format!(
+                "och-v2-report-transaction-{}-{}",
+                std::process::id(),
+                NEXT_REPORT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&parent);
+            fs::create_dir(&parent).expect("create report transaction parent");
+            let root = EvidenceRoot::prepare(&parent.join("evidence"))
+                .expect("prepare report transaction root");
+            Self { parent, root }
+        }
+
+        fn reports(&self) -> PathBuf {
+            self.root.path.join("reports")
+        }
+
+        fn final_path(&self) -> PathBuf {
+            self.reports().join(STRUCTURAL_BUNDLE)
+        }
+    }
+
+    impl Drop for TempReportRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ReportFault {
+        MidWrite,
+        FileSync,
+        StagingValidation,
+        PriorRename,
+        FinalRename,
+        FinalValidation,
+        Cleanup,
+    }
+
+    struct FaultReportIo {
+        fault: Option<ReportFault>,
+    }
+
+    impl FaultReportIo {
+        const fn new(fault: ReportFault) -> Self {
+            Self { fault: Some(fault) }
+        }
+
+        fn inject(&mut self, point: ReportFault) -> bool {
+            if self.fault == Some(point) {
+                self.fault = None;
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    impl ReportIo for FaultReportIo {
+        fn create_dir(&mut self, path: &Path) -> Result<()> {
+            StdReportIo.create_dir(path)
+        }
+
+        fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
+            if self.inject(ReportFault::MidWrite) {
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(path)
+                    .map_err(|_| EvidenceError::Io)?;
+                file.write_all(&bytes[..bytes.len() / 2])
+                    .map_err(|_| EvidenceError::Io)?;
+                return Err(EvidenceError::Io);
+            }
+            StdReportIo.write_file(path, bytes)
+        }
+
+        fn sync_file(&mut self, path: &Path) -> Result<()> {
+            if self.inject(ReportFault::FileSync) {
+                return Err(EvidenceError::Io);
+            }
+            StdReportIo.sync_file(path)
+        }
+
+        fn sync_directory(&mut self, path: &Path) -> Result<()> {
+            StdReportIo.sync_directory(path)
+        }
+
+        fn rename(&mut self, from: &Path, to: &Path) -> Result<()> {
+            let point = if to.extension().is_some_and(|extension| extension == "prior") {
+                ReportFault::PriorRename
+            } else {
+                ReportFault::FinalRename
+            };
+            if self.inject(point) {
+                return Err(EvidenceError::Io);
+            }
+            StdReportIo.rename(from, to)
+        }
+
+        fn remove_directory(&mut self, path: &Path) -> Result<()> {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "prior")
+                && self.inject(ReportFault::Cleanup)
+            {
+                return Err(EvidenceError::Io);
+            }
+            StdReportIo.remove_directory(path)
+        }
+
+        fn validate_staging(&mut self) -> Result<()> {
+            if self.inject(ReportFault::StagingValidation) {
+                Err(EvidenceError::InvalidHarness)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn validate_final(&mut self) -> Result<()> {
+            if self.inject(ReportFault::FinalValidation) {
+                Err(EvidenceError::InvalidHarness)
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     fn witnesses() -> Vec<CrashWitness> {
         FaultId::ALL
@@ -1091,5 +1410,109 @@ mod tests {
         let source = include_str!("report.rs");
         assert!(!source.contains(&["measured_native_evidence", ": true"].concat()));
         assert!(!source.contains(&["collection_authorized", ": true"].concat()));
+    }
+
+    #[test]
+    fn replacement_faults_preserve_prior_reclaim_transaction_and_allow_retry() {
+        let temp = TempReportRoot::new();
+        let context = ReportContext::structural();
+        let witnesses = witnesses();
+        write_and_validate(&temp.root, &context, &witnesses).expect("publish prior bundle");
+        let prior = read_bundle_for_test(&temp.final_path());
+        for fault in [
+            ReportFault::MidWrite,
+            ReportFault::FileSync,
+            ReportFault::StagingValidation,
+            ReportFault::PriorRename,
+            ReportFault::FinalRename,
+            ReportFault::FinalValidation,
+            ReportFault::Cleanup,
+        ] {
+            #[cfg(unix)]
+            let prior_identity = directory_identity(&temp.final_path());
+            let mut io = FaultReportIo::new(fault);
+            assert!(
+                write_and_validate_with_io(&temp.root, &context, &witnesses, &mut io).is_err(),
+                "fault {fault:?}"
+            );
+            validate_bundle_path(&temp.final_path(), &context, &witnesses)
+                .expect("prior remains valid");
+            assert_eq!(read_bundle_for_test(&temp.final_path()), prior);
+            #[cfg(unix)]
+            assert_eq!(directory_identity(&temp.final_path()), prior_identity);
+            assert_transaction_artifacts_absent(&temp);
+            write_and_validate(&temp.root, &context, &witnesses).expect("same-root retry succeeds");
+            #[cfg(unix)]
+            assert_ne!(directory_identity(&temp.final_path()), prior_identity);
+        }
+    }
+
+    #[test]
+    fn next_open_reconciles_interrupted_states_and_rejects_ambiguous_three_way_state() {
+        let temp = TempReportRoot::new();
+        let context = ReportContext::structural();
+        let witnesses = witnesses();
+        write_and_validate(&temp.root, &context, &witnesses).expect("publish prior bundle");
+        let reports = temp.reports();
+        let final_path = temp.final_path();
+        let prior = reports.join(format!(".{STRUCTURAL_BUNDLE}.prior"));
+        let staging = reports.join(format!(".{STRUCTURAL_BUNDLE}.staging"));
+        fs::rename(&final_path, &prior).expect("simulate prior rename");
+        copy_bundle_for_test(&prior, &staging);
+        write_and_validate(&temp.root, &context, &witnesses)
+            .expect("reconcile backup plus staging and retry");
+        assert_transaction_artifacts_absent(&temp);
+
+        copy_bundle_for_test(&final_path, &prior);
+        copy_bundle_for_test(&final_path, &staging);
+        assert!(matches!(
+            write_and_validate(&temp.root, &context, &witnesses),
+            Err(EvidenceError::UnsafeInventory)
+        ));
+        validate_bundle_path(&final_path, &context, &witnesses)
+            .expect("ambiguous state does not mutate final");
+    }
+
+    fn assert_transaction_artifacts_absent(temp: &TempReportRoot) {
+        for suffix in ["staging", "prior"] {
+            assert!(
+                !temp
+                    .reports()
+                    .join(format!(".{STRUCTURAL_BUNDLE}.{suffix}"))
+                    .exists()
+            );
+        }
+    }
+
+    fn read_bundle_for_test(path: &Path) -> BTreeMap<String, Vec<u8>> {
+        fs::read_dir(path)
+            .expect("read test bundle")
+            .map(|entry| {
+                let entry = entry.expect("read test bundle entry");
+                (
+                    entry
+                        .file_name()
+                        .into_string()
+                        .expect("UTF-8 test report name"),
+                    fs::read(entry.path()).expect("read test report file"),
+                )
+            })
+            .collect()
+    }
+
+    fn copy_bundle_for_test(from: &Path, to: &Path) {
+        fs::create_dir(to).expect("create copied bundle");
+        for entry in fs::read_dir(from).expect("read source bundle") {
+            let entry = entry.expect("read source bundle entry");
+            fs::copy(entry.path(), to.join(entry.file_name())).expect("copy bundle file");
+        }
+    }
+
+    #[cfg(unix)]
+    fn directory_identity(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = fs::symlink_metadata(path).expect("read report directory identity");
+        (metadata.dev(), metadata.ino())
     }
 }

@@ -80,7 +80,14 @@ The parent and child never combine monotonic clocks and no killed-child stop eve
 is fabricated. Operation errors retain precedence over cleanup errors; successful
 operation plus cleanup failure returns the cleanup failure. Once spawned, a child
 failure still enters bounded termination and reap before the parent's one cleanup
-attempt. Each completed command leaves `cases` and `control` empty.
+attempt. Kill/observe errors do not bypass bounded wait/reap; a child whose reap
+cannot be proved returns `REPLAN` while retaining its private subtree rather than
+cleaning beneath a possibly live process. The hidden child independently checks
+that `cases`, `control`, its selected store child, and request/ready entries are
+direct non-symlink objects beneath the canonical evidence root, with another
+check immediately before worker mutation. These checks are finite std-only
+containment checks, not a universal filesystem race guarantee. Each completed
+command leaves `cases` and `control` empty.
 
 ## Bounded report transaction
 
@@ -91,8 +98,12 @@ covering exactly those seven in sorted relative-name order. The writer construct
 and validates the complete bundle before filesystem mutation, writes only to an
 out-of-band staging directory, synchronizes and bounded-rereads every file,
 validates the staging bundle, renames it, synchronizes the report parent, and
-validates the final bundle. A repeated structural run first validates and then
-replaces only that exact private bundle.
+validates the final bundle. A repeated structural run preserves the validated
+final while staging, renames it to one exact private prior directory before final
+selection, and synchronizes the parent after every authority-changing rename or
+removal. Handled failure rolls back to the prior bundle and removes transaction
+artifacts; the next open reconciles only state-machine-reachable staging/prior
+states and rejects invalid or ambiguous combinations.
 
 The validator enforces 64 MiB/bundle, 16 MiB/data file, 4,096-byte physical line,
 1,024-byte scalar, exact files, exact keys/columns/enums/counts, safe relative

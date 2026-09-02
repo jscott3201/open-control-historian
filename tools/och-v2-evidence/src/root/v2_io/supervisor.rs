@@ -4,7 +4,7 @@ use super::schema::{FaultMode, PhaseId, PressureKind, RootClassification};
 use super::{
     FlowKind, SITE_PAYLOAD, SiteResult, V2_CHILD_NAME, V2Io, V2StoreChild, bounded_read, classify,
     clear_root, fingerprint, flow_ids, prepare_eager, prepare_optional_cleanup, prepare_prior,
-    prepare_rollback_derivatives, source_site,
+    prepare_rollback_derivatives, source_site, validate_direct_child_directory,
 };
 use crate::error::{EvidenceError, Result};
 use crate::root::EvidenceRoot;
@@ -13,13 +13,15 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::Duration;
 
 const CHILD_SCHEMA: &str = "m03-pr03g2-child-v1";
 const READY_WAIT_POLLS: usize = 10_000;
 const READY_WAIT_INTERVAL: Duration = Duration::from_millis(1);
+const REAP_WAIT_POLLS: usize = 10_000;
+const WAIT_RETRIES: usize = 3;
 const MAX_CONTROL_BYTES: usize = 4_096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,12 +59,20 @@ pub(super) struct ChildWorkerTarget {
 
 impl ChildWorkerTarget {
     fn open(root: &EvidenceRoot) -> Result<Self> {
-        let cases = fs::canonicalize(root.path.join("cases")).map_err(|_| EvidenceError::Io)?;
-        let path = fs::canonicalize(cases.join(V2_CHILD_NAME)).map_err(|_| EvidenceError::Io)?;
-        if path.parent() != Some(cases.as_path()) || !path.is_dir() {
+        let cases = root.direct_directory("cases")?;
+        let path = validate_direct_child_directory(&cases, V2_CHILD_NAME)?;
+        if root.direct_directory("cases")? != cases {
             return Err(EvidenceError::UnsafeInventory);
         }
         Ok(Self { path })
+    }
+
+    fn revalidate(&self, root: &EvidenceRoot) -> Result<()> {
+        let cases = root.direct_directory("cases")?;
+        if validate_direct_child_directory(&cases, V2_CHILD_NAME)? != self.path {
+            return Err(EvidenceError::UnsafeInventory);
+        }
+        Ok(())
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -80,6 +90,9 @@ pub(super) struct WorkerReady {
 
 impl WorkerReady {
     pub(super) fn publish_and_block<T>(&self, id: FaultId) -> Result<T> {
+        validate_control_directory(&self.control)?;
+        ensure_direct_path_absent(&self.staging, &self.control)?;
+        ensure_direct_path_absent(&self.path, &self.control)?;
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -89,7 +102,11 @@ impl WorkerReady {
         file.write_all(bytes.as_bytes())
             .and_then(|()| file.sync_all())
             .map_err(|_| EvidenceError::Io)?;
+        validate_direct_file(&self.staging, &self.control)?;
+        ensure_direct_path_absent(&self.path, &self.control)?;
         fs::rename(&self.staging, &self.path).map_err(|_| EvidenceError::Io)?;
+        validate_direct_file(&self.path, &self.control)?;
+        validate_control_directory(&self.control)?;
         File::open(&self.control)
             .and_then(|directory| directory.sync_all())
             .map_err(|_| EvidenceError::Io)?;
@@ -135,12 +152,23 @@ fn run_target(
     let ready = control.join(format!("{token}.ready"));
     let ready_staging = control.join(format!("{token}.ready.staging"));
     let mut child = V2StoreChild::acquire(root)?;
+    let mut spawned = false;
+    let mut reaped = true;
     let operation_result = (|| {
         let site = source_site(id)?;
+        child.revalidate()?;
         let plan = prepare_crash_plan(&child, id)?;
         write_request(&request, control, &token, id)?;
         let mut process = spawn_worker(root, &token, id)?;
-        supervise_worker(&mut process, &ready, &token, id)?;
+        spawned = true;
+        reaped = false;
+        let supervision = supervise_worker(&mut process, &ready, &token, id)?;
+        reaped = true;
+        if supervision.termination_errors > REAP_WAIT_POLLS + WAIT_RETRIES {
+            return Err(EvidenceError::InvalidHarness);
+        }
+        supervision.observation?;
+        child.revalidate()?;
         let immediate = fingerprint(&child)?;
         if classify(&child)? != InventoryClass::ReviewedV2 {
             return Err(EvidenceError::InvalidHarness);
@@ -152,6 +180,7 @@ fn run_target(
             CrashFlow::Rollback => protected_committed_finals(&plan.prior),
             CrashFlow::Transaction | CrashFlow::EagerOpen => protected_committed_finals(&immediate),
         };
+        child.revalidate()?;
         let terminal = reopen_and_converge(&child, &plan, site.descriptor.commit_side)?;
         let reopened = fingerprint(&child)?;
         let final_fingerprint = fingerprint(&child)?;
@@ -171,6 +200,10 @@ fn run_target(
         validate_witness(&witness, site.descriptor.commit_side)?;
         Ok(witness)
     })();
+    if spawned && !reaped {
+        child.retain_after_unreaped_child();
+        return Err(EvidenceError::Replan);
+    }
     let cleanup_result = child.cleanup();
     let control_cleanup = cleanup_control(control, [&request, &ready, &ready_staging]);
     match operation_result {
@@ -200,10 +233,7 @@ fn validate_witness(witness: &CrashWitness, side: CommitSide) -> Result<()> {
 }
 
 fn prepare_control(root: &EvidenceRoot) -> Result<PathBuf> {
-    let control = fs::canonicalize(root.path.join("control")).map_err(|_| EvidenceError::Io)?;
-    if control.parent() != Some(root.path.as_path()) {
-        return Err(EvidenceError::UnsafeInventory);
-    }
+    let control = root.direct_directory("control")?;
     if fs::read_dir(&control)
         .map_err(|_| EvidenceError::Io)?
         .next()
@@ -213,10 +243,67 @@ fn prepare_control(root: &EvidenceRoot) -> Result<PathBuf> {
     {
         return Err(EvidenceError::UnsafeInventory);
     }
+    if root.direct_directory("control")? != control {
+        return Err(EvidenceError::UnsafeInventory);
+    }
     Ok(control)
 }
 
+fn validate_control_directory(control: &Path) -> Result<()> {
+    let root = control.parent().ok_or(EvidenceError::UnsafeInventory)?;
+    for directory in [root, control] {
+        let metadata = fs::symlink_metadata(directory).map_err(|_| EvidenceError::Io)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(EvidenceError::UnsafeInventory);
+        }
+        if fs::canonicalize(directory).map_err(|_| EvidenceError::Io)? != directory {
+            return Err(EvidenceError::UnsafeInventory);
+        }
+    }
+    if control.parent() != Some(root) {
+        return Err(EvidenceError::UnsafeInventory);
+    }
+    Ok(())
+}
+
+fn ensure_direct_path_absent(path: &Path, parent: &Path) -> Result<()> {
+    validate_control_directory(parent)?;
+    if path.parent() != Some(parent) {
+        return Err(EvidenceError::UnsafeInventory);
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(EvidenceError::Io),
+        Ok(_) => Err(EvidenceError::UnsafeInventory),
+    }
+}
+
+fn validate_direct_file(path: &Path, parent: &Path) -> Result<()> {
+    validate_control_directory(parent)?;
+    if path.parent() != Some(parent) {
+        return Err(EvidenceError::UnsafeInventory);
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| EvidenceError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(EvidenceError::UnsafeInventory);
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| EvidenceError::Io)?;
+    if canonical != path || canonical.parent() != Some(parent) {
+        return Err(EvidenceError::UnsafeInventory);
+    }
+    Ok(())
+}
+
+fn parse_direct_control(path: &Path, control: &Path) -> Result<BTreeMap<String, String>> {
+    validate_direct_file(path, control)?;
+    let values = parse_control(path)?;
+    validate_direct_file(path, control)?;
+    Ok(values)
+}
+
 fn write_request(path: &Path, control: &Path, token: &str, id: FaultId) -> Result<()> {
+    validate_control_directory(control)?;
+    ensure_direct_path_absent(path, control)?;
     let bytes = request_bytes(token, std::process::id(), id);
     let mut file = OpenOptions::new()
         .create_new(true)
@@ -226,12 +313,17 @@ fn write_request(path: &Path, control: &Path, token: &str, id: FaultId) -> Resul
     file.write_all(bytes.as_bytes())
         .and_then(|()| file.sync_all())
         .map_err(|_| EvidenceError::Io)?;
+    validate_direct_file(path, control)?;
+    validate_control_directory(control)?;
     File::open(control)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| EvidenceError::Io)
 }
 
 fn spawn_worker(root: &EvidenceRoot, token: &str, id: FaultId) -> Result<Child> {
+    root.direct_directory("control")?;
+    let target = ChildWorkerTarget::open(root)?;
+    target.revalidate(root)?;
     Command::new(std::env::current_exe().map_err(|_| EvidenceError::Io)?)
         .arg("__native-child")
         .arg("--root")
@@ -247,46 +339,67 @@ fn spawn_worker(root: &EvidenceRoot, token: &str, id: FaultId) -> Result<Child> 
         .map_err(|_| EvidenceError::Io)
 }
 
-fn supervise_worker(child: &mut Child, ready: &Path, token: &str, id: FaultId) -> Result<()> {
+struct SupervisionOutcome {
+    observation: Result<()>,
+    termination_errors: usize,
+}
+
+fn supervise_worker(
+    child: &mut Child,
+    ready: &Path,
+    token: &str,
+    id: FaultId,
+) -> Result<SupervisionOutcome> {
     let observation = wait_ready(child, ready, token, id);
-    if let Err(error) = observation {
-        let _termination_result = terminate_and_reap(child);
-        return Err(error);
-    }
-    if child.try_wait().map_err(|_| EvidenceError::Io)?.is_some() {
-        let _ = child.wait();
-        return Err(EvidenceError::InvalidHarness);
-    }
-    child.kill().map_err(|_| EvidenceError::Io)?;
-    let status = child.wait().map_err(|_| EvidenceError::Io)?;
-    if status.success() {
-        return Err(EvidenceError::InvalidHarness);
-    }
-    Ok(())
+    finish_supervision(child, observation)
+}
+
+fn finish_supervision(
+    child: &mut impl ChildLifecycle,
+    observation: Result<()>,
+) -> Result<SupervisionOutcome> {
+    let termination = terminate_and_reap(child)?;
+    let observation = match observation {
+        Ok(()) if termination.status.success => Err(EvidenceError::InvalidHarness),
+        other => other,
+    };
+    Ok(SupervisionOutcome {
+        observation,
+        termination_errors: termination.error_count,
+    })
 }
 
 fn wait_ready(child: &mut Child, ready: &Path, token: &str, id: FaultId) -> Result<()> {
+    let control = ready.parent().ok_or(EvidenceError::UnsafeInventory)?;
     for _ in 0..READY_WAIT_POLLS {
-        if ready.is_file() {
-            let values = parse_control(ready)?;
-            if values.get("schema").map(String::as_str) != Some(CHILD_SCHEMA)
-                || values.get("token").map(String::as_str) != Some(token)
-                || values.get("fault_id").map(String::as_str) != Some(id.as_str())
-                || values
-                    .get("parent_pid")
-                    .and_then(|value| value.parse::<u32>().ok())
-                    != Some(std::process::id())
-                || values
-                    .get("worker_pid")
-                    .and_then(|value| value.parse::<u32>().ok())
-                    != Some(child.id())
-                || values.get("state").map(String::as_str) != Some("READY_BLOCKED_BEFORE_RETURN")
-                || values.get("last_successful_boundary").map(String::as_str) != Some(id.as_str())
-                || values.len() != 7
-            {
-                return Err(EvidenceError::InvalidHarness);
+        match fs::symlink_metadata(ready) {
+            Ok(_) => {
+                validate_control_directory(control)?;
+                let values = parse_direct_control(ready, control)?;
+                if values.get("schema").map(String::as_str) != Some(CHILD_SCHEMA)
+                    || values.get("token").map(String::as_str) != Some(token)
+                    || values.get("fault_id").map(String::as_str) != Some(id.as_str())
+                    || values
+                        .get("parent_pid")
+                        .and_then(|value| value.parse::<u32>().ok())
+                        != Some(std::process::id())
+                    || values
+                        .get("worker_pid")
+                        .and_then(|value| value.parse::<u32>().ok())
+                        != Some(child.id())
+                    || values.get("state").map(String::as_str)
+                        != Some("READY_BLOCKED_BEFORE_RETURN")
+                    || values.get("last_successful_boundary").map(String::as_str)
+                        != Some(id.as_str())
+                    || values.len() != 7
+                {
+                    return Err(EvidenceError::InvalidHarness);
+                }
+                validate_direct_file(ready, control)?;
+                return Ok(());
             }
-            return Ok(());
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(EvidenceError::Io),
         }
         if child.try_wait().map_err(|_| EvidenceError::Io)?.is_some() {
             return Err(EvidenceError::InvalidHarness);
@@ -296,21 +409,107 @@ fn wait_ready(child: &mut Child, ready: &Path, token: &str, id: FaultId) -> Resu
     Err(EvidenceError::Bounds)
 }
 
-fn terminate_and_reap(child: &mut Child) -> Result<()> {
-    if child.try_wait().map_err(|_| EvidenceError::Io)?.is_none() {
-        child.kill().map_err(|_| EvidenceError::Io)?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessStatus {
+    success: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReapOutcome {
+    status: ProcessStatus,
+    error_count: usize,
+}
+
+trait ChildLifecycle {
+    fn try_wait_status(&mut self) -> Result<Option<ProcessStatus>>;
+    fn kill_process(&mut self) -> Result<()>;
+    fn wait_status(&mut self) -> Result<ProcessStatus>;
+    fn pause(&mut self);
+}
+
+impl ChildLifecycle for Child {
+    fn try_wait_status(&mut self) -> Result<Option<ProcessStatus>> {
+        self.try_wait()
+            .map(|status| status.map(process_status))
+            .map_err(|_| EvidenceError::Io)
     }
-    child.wait().map_err(|_| EvidenceError::Io)?;
-    Ok(())
+
+    fn kill_process(&mut self) -> Result<()> {
+        self.kill().map_err(|_| EvidenceError::Io)
+    }
+
+    fn wait_status(&mut self) -> Result<ProcessStatus> {
+        self.wait()
+            .map(process_status)
+            .map_err(|_| EvidenceError::Io)
+    }
+
+    fn pause(&mut self) {
+        thread::sleep(READY_WAIT_INTERVAL);
+    }
+}
+
+fn process_status(status: ExitStatus) -> ProcessStatus {
+    ProcessStatus {
+        success: status.success(),
+    }
+}
+
+fn terminate_and_reap(child: &mut impl ChildLifecycle) -> Result<ReapOutcome> {
+    let mut error_count = 0_usize;
+    for _ in 0..REAP_WAIT_POLLS {
+        match child.try_wait_status() {
+            Ok(Some(_)) => return wait_with_retry(child, error_count),
+            Ok(None) => {
+                if child.kill_process().is_err() {
+                    error_count = error_count.checked_add(1).ok_or(EvidenceError::Bounds)?;
+                }
+            }
+            Err(_) => {
+                error_count = error_count.checked_add(1).ok_or(EvidenceError::Bounds)?;
+                if child.kill_process().is_err() {
+                    error_count = error_count.checked_add(1).ok_or(EvidenceError::Bounds)?;
+                }
+            }
+        }
+        child.pause();
+    }
+    Err(EvidenceError::Replan)
+}
+
+fn wait_with_retry(child: &mut impl ChildLifecycle, mut error_count: usize) -> Result<ReapOutcome> {
+    for _ in 0..WAIT_RETRIES {
+        if let Ok(status) = child.wait_status() {
+            return Ok(ReapOutcome {
+                status,
+                error_count,
+            });
+        }
+        error_count = error_count.checked_add(1).ok_or(EvidenceError::Bounds)?;
+        child.pause();
+    }
+    Err(EvidenceError::Replan)
 }
 
 fn cleanup_control<const N: usize>(control: &Path, paths: [&Path; N]) -> Result<()> {
+    validate_control_directory(control)?;
     for path in paths {
+        if path.parent() != Some(control) {
+            return Err(EvidenceError::UnsafeInventory);
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata)
+                if !metadata.file_type().is_symlink() && metadata.file_type().is_file() => {}
+            Ok(_) => return Err(EvidenceError::UnsafeInventory),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(EvidenceError::Io),
+        }
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(EvidenceError::Io),
         }
+        validate_control_directory(control)?;
     }
     File::open(control)
         .and_then(|directory| directory.sync_all())
@@ -587,11 +786,12 @@ pub(super) fn hidden_child_command(arguments: &[String]) -> Result<()> {
     if !valid_token(token) {
         return Err(EvidenceError::Usage);
     }
-    let control = fs::canonicalize(root.path.join("control")).map_err(|_| EvidenceError::Io)?;
+    let cases = root.direct_directory("cases")?;
+    let control = root.direct_directory("control")?;
     let request = control.join(format!("{token}.request"));
     let ready_path = control.join(format!("{token}.ready"));
     let ready_staging = control.join(format!("{token}.ready.staging"));
-    let request_values = parse_control(&request)?;
+    let request_values = parse_direct_control(&request, &control)?;
     let parent_pid = request_values
         .get("parent_pid")
         .and_then(|value| value.parse::<u32>().ok())
@@ -600,12 +800,19 @@ pub(super) fn hidden_child_command(arguments: &[String]) -> Result<()> {
         || request_values.get("token").map(String::as_str) != Some(token)
         || request_values.get("fault_id").map(String::as_str) != Some(id.as_str())
         || request_values.len() != 4
-        || ready_path.exists()
-        || ready_staging.exists()
+        || fs::symlink_metadata(&ready_path).is_ok()
+        || fs::symlink_metadata(&ready_staging).is_ok()
     {
         return Err(EvidenceError::InvalidHarness);
     }
     let target = ChildWorkerTarget::open(&root)?;
+    if root.direct_directory("cases")? != cases || root.direct_directory("control")? != control {
+        return Err(EvidenceError::UnsafeInventory);
+    }
+    target.revalidate(&root)?;
+    validate_direct_file(&request, &control)?;
+    ensure_direct_path_absent(&ready_path, &control)?;
+    ensure_direct_path_absent(&ready_staging, &control)?;
     let ready = WorkerReady {
         path: ready_path,
         staging: ready_staging,
@@ -702,6 +909,150 @@ fn valid_token(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_SUPERVISOR_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    struct TempHiddenRoot {
+        parent: PathBuf,
+        root: EvidenceRoot,
+    }
+
+    impl TempHiddenRoot {
+        fn new() -> Self {
+            let parent = std::env::temp_dir().join(format!(
+                "och-v2-hidden-containment-{}-{}",
+                std::process::id(),
+                NEXT_SUPERVISOR_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&parent);
+            fs::create_dir(&parent).expect("create hidden containment parent");
+            let root = EvidenceRoot::prepare(&parent.join("evidence"))
+                .expect("prepare hidden containment root");
+            root.foundation_layout()
+                .expect("prepare hidden containment layout");
+            fs::create_dir(root.path.join("cases").join(V2_CHILD_NAME))
+                .expect("create hidden worker child");
+            Self { parent, root }
+        }
+
+        fn token() -> String {
+            format!("CRASH-999-{}", std::process::id())
+        }
+
+        fn arguments(&self, token: &str, id: FaultId) -> Vec<String> {
+            vec![
+                "--root".to_owned(),
+                self.root.path.to_string_lossy().into_owned(),
+                "--token".to_owned(),
+                token.to_owned(),
+                "--fault-id".to_owned(),
+                id.as_str().to_owned(),
+            ]
+        }
+
+        fn write_request(&self, token: &str, id: FaultId) {
+            fs::write(
+                self.root
+                    .path
+                    .join("control")
+                    .join(format!("{token}.request")),
+                request_bytes(token, std::process::id(), id),
+            )
+            .expect("write hidden request");
+        }
+    }
+
+    impl Drop for TempHiddenRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ModelState {
+        Running,
+        Exited,
+    }
+
+    struct LifecycleModel {
+        state: ModelState,
+        kill_errors: usize,
+        wait_errors: usize,
+        try_wait_errors: usize,
+        exit_during_kill_error: bool,
+        reaped: bool,
+        pauses: usize,
+    }
+
+    impl LifecycleModel {
+        const fn running() -> Self {
+            Self {
+                state: ModelState::Running,
+                kill_errors: 0,
+                wait_errors: 0,
+                try_wait_errors: 0,
+                exit_during_kill_error: false,
+                reaped: false,
+                pauses: 0,
+            }
+        }
+
+        const fn exited() -> Self {
+            Self {
+                state: ModelState::Exited,
+                kill_errors: 0,
+                wait_errors: 0,
+                try_wait_errors: 0,
+                exit_during_kill_error: false,
+                reaped: false,
+                pauses: 0,
+            }
+        }
+
+        fn assert_reaped(&self) {
+            assert_eq!(self.state, ModelState::Exited);
+            assert!(self.reaped);
+        }
+    }
+
+    impl ChildLifecycle for LifecycleModel {
+        fn try_wait_status(&mut self) -> Result<Option<ProcessStatus>> {
+            if self.try_wait_errors > 0 {
+                self.try_wait_errors -= 1;
+                return Err(EvidenceError::Io);
+            }
+            Ok((self.state == ModelState::Exited).then_some(ProcessStatus { success: false }))
+        }
+
+        fn kill_process(&mut self) -> Result<()> {
+            if self.kill_errors > 0 {
+                self.kill_errors -= 1;
+                if self.exit_during_kill_error {
+                    self.state = ModelState::Exited;
+                }
+                return Err(EvidenceError::Io);
+            }
+            self.state = ModelState::Exited;
+            Ok(())
+        }
+
+        fn wait_status(&mut self) -> Result<ProcessStatus> {
+            if self.wait_errors > 0 {
+                self.wait_errors -= 1;
+                return Err(EvidenceError::Io);
+            }
+            if self.state != ModelState::Exited {
+                return Err(EvidenceError::Io);
+            }
+            self.reaped = true;
+            Ok(ProcessStatus { success: false })
+        }
+
+        fn pause(&mut self) {
+            self.pauses = self.pauses.checked_add(1).expect("bounded model pauses");
+        }
+    }
 
     #[test]
     fn malformed_or_direct_hidden_child_arguments_refuse() {
@@ -751,5 +1102,163 @@ mod tests {
         assert!(convergence.contains("continue_flow"));
         assert!(convergence.contains("validate_committed_immediate"));
         assert!(convergence.contains("validate_protected_finals"));
+    }
+
+    #[test]
+    fn lifecycle_model_reaps_ready_timeout_parse_and_early_exit_paths() {
+        for (observation, expected) in [
+            (Ok(()), 0_u8),
+            (Err(EvidenceError::Bounds), 1),
+            (Err(EvidenceError::InvalidHarness), 2),
+        ] {
+            let mut child = LifecycleModel::running();
+            let outcome = finish_supervision(&mut child, observation)
+                .expect("running model must be killed and reaped");
+            child.assert_reaped();
+            assert_eq!(outcome.termination_errors, 0);
+            match expected {
+                0 => assert!(outcome.observation.is_ok()),
+                1 => assert!(matches!(outcome.observation, Err(EvidenceError::Bounds))),
+                2 => assert!(matches!(
+                    outcome.observation,
+                    Err(EvidenceError::InvalidHarness)
+                )),
+                _ => unreachable!(),
+            }
+        }
+
+        let mut exited = LifecycleModel::exited();
+        let outcome = finish_supervision(&mut exited, Err(EvidenceError::InvalidHarness))
+            .expect("already-exited model must still be waited");
+        exited.assert_reaped();
+        assert!(matches!(
+            outcome.observation,
+            Err(EvidenceError::InvalidHarness)
+        ));
+    }
+
+    #[test]
+    fn lifecycle_model_captures_kill_race_and_wait_retry_before_reap() {
+        let mut kill_race = LifecycleModel::running();
+        kill_race.kill_errors = 1;
+        kill_race.exit_during_kill_error = true;
+        let outcome =
+            finish_supervision(&mut kill_race, Ok(())).expect("kill race must proceed to wait");
+        kill_race.assert_reaped();
+        assert_eq!(outcome.termination_errors, 1);
+
+        let mut wait_retry = LifecycleModel::running();
+        wait_retry.try_wait_errors = 1;
+        wait_retry.wait_errors = 1;
+        let outcome = finish_supervision(&mut wait_retry, Err(EvidenceError::Bounds))
+            .expect("wait error must retry through a proven reap");
+        wait_retry.assert_reaped();
+        assert_eq!(outcome.termination_errors, 2);
+        assert!(matches!(outcome.observation, Err(EvidenceError::Bounds)));
+    }
+
+    #[test]
+    fn lifecycle_model_fails_replan_when_reap_cannot_be_proven() {
+        let mut blocked = LifecycleModel::running();
+        blocked.kill_errors = REAP_WAIT_POLLS;
+        assert!(matches!(
+            finish_supervision(&mut blocked, Err(EvidenceError::Bounds)),
+            Err(EvidenceError::Replan)
+        ));
+        assert_eq!(blocked.state, ModelState::Running);
+        assert!(!blocked.reaped);
+    }
+
+    #[test]
+    fn hidden_child_rejects_replaced_child_and_request_non_files_before_mutation() {
+        let id = FaultId::ALL[0];
+        let temp = TempHiddenRoot::new();
+        let token = TempHiddenRoot::token();
+        temp.write_request(&token, id);
+        let child = temp.root.path.join("cases").join(V2_CHILD_NAME);
+        fs::remove_dir(&child).expect("remove real worker child");
+        fs::write(&child, b"hostile replacement").expect("write hostile child replacement");
+        assert!(hidden_child_command(&temp.arguments(&token, id)).is_err());
+        assert_eq!(
+            fs::read(&child).expect("read unchanged child replacement"),
+            b"hostile replacement"
+        );
+
+        let temp = TempHiddenRoot::new();
+        let token = TempHiddenRoot::token();
+        let request = temp
+            .root
+            .path
+            .join("control")
+            .join(format!("{token}.request"));
+        fs::create_dir(&request).expect("create hostile request directory");
+        assert!(hidden_child_command(&temp.arguments(&token, id)).is_err());
+        assert_eq!(
+            fs::read_dir(temp.root.path.join("cases").join(V2_CHILD_NAME))
+                .expect("read unmutated worker child")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_child_rejects_symlinked_layouts_and_forged_paths_without_external_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let id = FaultId::ALL[0];
+
+        let temp = TempHiddenRoot::new();
+        let token = TempHiddenRoot::token();
+        let external = temp.parent.join("external-request");
+        fs::write(&external, request_bytes(&token, std::process::id(), id))
+            .expect("write external request");
+        let request = temp
+            .root
+            .path
+            .join("control")
+            .join(format!("{token}.request"));
+        symlink(&external, &request).expect("symlink hostile request");
+        let before = fs::read(&external).expect("read external request before");
+        assert!(hidden_child_command(&temp.arguments(&token, id)).is_err());
+        assert_eq!(
+            fs::read(&external).expect("read external request after"),
+            before
+        );
+
+        let temp = TempHiddenRoot::new();
+        let token = TempHiddenRoot::token();
+        temp.write_request(&token, id);
+        let external = temp.parent.join("external-child");
+        fs::create_dir(&external).expect("create external child");
+        fs::write(external.join("sentinel"), b"unchanged").expect("write child sentinel");
+        let child = temp.root.path.join("cases").join(V2_CHILD_NAME);
+        fs::remove_dir(&child).expect("remove direct worker child");
+        symlink(&external, &child).expect("symlink hostile child");
+        assert!(hidden_child_command(&temp.arguments(&token, id)).is_err());
+        assert_eq!(
+            fs::read(external.join("sentinel")).expect("read child sentinel"),
+            b"unchanged"
+        );
+
+        let temp = TempHiddenRoot::new();
+        let token = TempHiddenRoot::token();
+        let external = temp.parent.join("external-control");
+        fs::create_dir(&external).expect("create external control");
+        fs::write(external.join("sentinel"), b"unchanged").expect("write control sentinel");
+        let control = temp.root.path.join("control");
+        fs::remove_dir(&control).expect("remove direct control");
+        symlink(&external, &control).expect("symlink hostile control");
+        assert!(hidden_child_command(&temp.arguments(&token, id)).is_err());
+        assert_eq!(
+            fs::read(external.join("sentinel")).expect("read control sentinel"),
+            b"unchanged"
+        );
+        assert_eq!(
+            fs::read_dir(&external)
+                .expect("read external control")
+                .count(),
+            1
+        );
     }
 }

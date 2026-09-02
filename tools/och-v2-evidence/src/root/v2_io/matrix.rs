@@ -495,6 +495,7 @@ fn validate_tree(sample: &TimingSample) -> Result<()> {
             _ => {}
         }
     }
+    validate_no_parent_cycles(&nodes)?;
     for event in &sample.events {
         if let Some(parent_id) = event.parent_event_id {
             let parent = nodes
@@ -540,6 +541,26 @@ fn validate_tree(sample: &TimingSample) -> Result<()> {
                 return Err(EvidenceError::InvalidHarness);
             }
             manifest_rename_succeeded = true;
+        }
+    }
+    Ok(())
+}
+
+fn validate_no_parent_cycles(nodes: &BTreeMap<(EventId, Option<u8>), &EventRow>) -> Result<()> {
+    for event in nodes.values() {
+        let mut path = BTreeSet::new();
+        let mut current = *event;
+        loop {
+            if !path.insert(current.event_id) {
+                return Err(EvidenceError::InvalidHarness);
+            }
+            let Some(parent_id) = current.parent_event_id else {
+                break;
+            };
+            let Some(parent) = nodes.get(&(parent_id, None)) else {
+                break;
+            };
+            current = parent;
         }
     }
     Ok(())
@@ -1125,13 +1146,27 @@ fn corrupt_fixture(fixture: &str, samples: &mut Vec<TimingSample>) -> Result<()>
         "ELIGIBILITY-REJECT-SUMMARY-INELIGIBLE" => {
             rotation.distribution_eligible = false;
         }
-        "TREE-REJECT-WRONG-PARENT" | "TREE-REJECT-CYCLE" => {
+        "TREE-REJECT-WRONG-PARENT" => {
             let intent = rotation
                 .events
                 .iter_mut()
                 .find(|event| event.event_id == EventId::Intent)
                 .ok_or(EvidenceError::InvalidHarness)?;
             intent.parent_event_id = Some(EventId::Manifest);
+        }
+        "TREE-REJECT-CYCLE" => {
+            let intent = rotation
+                .events
+                .iter_mut()
+                .find(|event| event.event_id == EventId::Intent)
+                .ok_or(EvidenceError::InvalidHarness)?;
+            intent.parent_event_id = Some(EventId::Manifest);
+            let manifest = rotation
+                .events
+                .iter_mut()
+                .find(|event| event.event_id == EventId::Manifest)
+                .ok_or(EvidenceError::InvalidHarness)?;
+            manifest.parent_event_id = Some(EventId::Intent);
         }
         "TREE-REJECT-CROSSING-PARENT-CHILD" => {
             let intent = rotation
@@ -1213,5 +1248,28 @@ mod tests {
                 .len(),
             487
         );
+    }
+
+    #[test]
+    fn cycle_fixture_contains_a_real_cycle_and_hits_the_cycle_validator() {
+        let mut samples = structural_timing_samples().expect("structural timing samples");
+        corrupt_fixture("TREE-REJECT-CYCLE", &mut samples).expect("construct cycle fixture");
+        let sample = samples
+            .iter()
+            .find(|sample| sample.case_id == "ROTATE-PRE-APPEND-FIT")
+            .expect("cycle sample");
+        let nodes = sample
+            .events
+            .iter()
+            .map(|event| ((event.event_id, event.pair_ordinal), event))
+            .collect::<BTreeMap<_, _>>();
+        assert!(validate_no_parent_cycles(&nodes).is_err());
+        let intent = nodes.get(&(EventId::Intent, None)).expect("cycle intent");
+        let manifest = nodes
+            .get(&(EventId::Manifest, None))
+            .expect("cycle manifest");
+        assert_eq!(intent.parent_event_id, Some(EventId::Manifest));
+        assert_eq!(manifest.parent_event_id, Some(EventId::Intent));
+        assert!(validate_tree(sample).is_err());
     }
 }

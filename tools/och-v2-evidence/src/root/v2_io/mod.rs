@@ -35,12 +35,18 @@ struct V2StoreChild {
 
 impl V2StoreChild {
     fn acquire(root: &EvidenceRoot) -> Result<Self> {
-        let cases = fs::canonicalize(root.path.join("cases")).map_err(|_| EvidenceError::Io)?;
+        let cases = root.direct_directory("cases")?;
         let path = cases.join(V2_CHILD_NAME);
-        if path.exists() {
-            return Err(EvidenceError::UnsafeInventory);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Err(EvidenceError::UnsafeInventory),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(EvidenceError::Io),
         }
         fs::create_dir(&path).map_err(|_| EvidenceError::Io)?;
+        if root.direct_directory("cases")? != cases {
+            return Err(EvidenceError::UnsafeInventory);
+        }
+        let path = validate_direct_child_directory(&cases, V2_CHILD_NAME)?;
         Ok(Self {
             cases,
             path,
@@ -52,17 +58,53 @@ impl V2StoreChild {
         &self.path
     }
 
+    fn revalidate(&self) -> Result<()> {
+        if validate_direct_child_directory(&self.cases, V2_CHILD_NAME)? != self.path {
+            return Err(EvidenceError::UnsafeInventory);
+        }
+        Ok(())
+    }
+
     fn cleanup(&mut self) -> Result<()> {
         if self.cleanup_attempted {
             return Err(EvidenceError::InvalidHarness);
         }
         self.cleanup_attempted = true;
-        let canonical = fs::canonicalize(&self.path).map_err(|_| EvidenceError::Io)?;
-        if canonical.parent() != Some(self.cases.as_path()) {
+        let canonical = validate_direct_child_directory(&self.cases, V2_CHILD_NAME)?;
+        if canonical != self.path {
             return Err(EvidenceError::UnsafeInventory);
         }
         fs::remove_dir_all(canonical).map_err(|_| EvidenceError::Io)
     }
+
+    fn retain_after_unreaped_child(&mut self) {
+        self.cleanup_attempted = true;
+    }
+}
+
+fn validate_direct_child_directory(parent: &Path, name: &str) -> Result<PathBuf> {
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|_| EvidenceError::Io)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.file_type().is_dir() {
+        return Err(EvidenceError::UnsafeInventory);
+    }
+    let canonical_parent = fs::canonicalize(parent).map_err(|_| EvidenceError::Io)?;
+    if canonical_parent != parent {
+        return Err(EvidenceError::UnsafeInventory);
+    }
+    let path = parent.join(name);
+    let metadata = fs::symlink_metadata(&path).map_err(|_| EvidenceError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(EvidenceError::UnsafeInventory);
+    }
+    let canonical = fs::canonicalize(&path).map_err(|_| EvidenceError::Io)?;
+    if canonical != path || canonical.parent() != Some(parent) {
+        return Err(EvidenceError::UnsafeInventory);
+    }
+    let metadata = fs::symlink_metadata(&path).map_err(|_| EvidenceError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(EvidenceError::UnsafeInventory);
+    }
+    Ok(path)
 }
 
 impl Drop for V2StoreChild {
